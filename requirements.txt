@@ -1,0 +1,28 @@
+# --- Core ---
+python-dotenv>=1.0.1
+
+# --- Frontend ---
+gradio>=4.44.0
+plotly>=5.24.0
+
+# --- Analytics ---
+pandas>=2.2.0
+numpy>=1.26.0
+scipy>=1.13.0
+
+# --- Data Fetchers ---
+yt-dlp>=2024.8.6
+webvtt-py>=0.4.6
+srt>=3.5.3
+requests>=2.32.0
+
+# --- LLM SDK ---
+litellm>=1.44.0
+openai>=1.40.0
+pydantic>=2.8.0
+tenacity>=8.5.0
+
+# --- Export / DaVinci Resolve ---
+# DaVinciResolveScript is provided by the local Resolve install, not pip.
+# lxml is used for FCPXML generation (safe escaping + pretty printing).
+lxml>=5.2.0

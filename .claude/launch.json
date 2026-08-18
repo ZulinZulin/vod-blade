@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "streamcutter-app",
+      "runtimeExecutable": "E:\\StreamCutter\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": ["E:\\StreamCutter\\app.py"],
+      "port": 7862
+    }
+  ]
+}

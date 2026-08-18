@@ -1,0 +1,477 @@
+"""
+app.py
+
+Gradio front-end tying the whole StreamCutter pipeline together:
+
+    fetchers -> chat_analyzer -> llm_agent -> exporters
+
+Layout:
+    1. Sources        - YouTube/subtitle input, Twitch VOD input, chat offset, local source video path
+    2. Hype timeline   - interactive Plotly graph of chat hype score with detected spikes
+    3. Clip candidates - one card per candidate with editable start/end sliders
+    4. Export          - "Download FCPXML/EDL" and "Inject into DaVinci Resolve"
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import replace
+from functools import partial
+from typing import List
+
+import gradio as gr
+import pandas as pd
+import plotly.graph_objects as go
+
+from config import settings
+from core.chat_analyzer import ChatAnalyzer, ClipCandidate
+from core.fetchers import FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod
+from core.llm_agent import CandidateClip, LLMAgent
+from exporters.davinci_api import DavinciAPIError, inject_into_resolve
+from exporters.davinci_api import is_available as resolve_is_available
+from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
+
+logging.basicConfig(level=settings.log_level)
+logger = logging.getLogger(__name__)
+
+MAX_CLIP_CARDS = 12  # cards rendered per page
+CARD_WINDOW_PADDING_S = 180.0
+
+
+# --------------------------------------------------------------------------- #
+# Chat hype timeline plot
+# --------------------------------------------------------------------------- #
+
+
+def build_hype_timeline_figure(timeline_df: pd.DataFrame, candidates: List[ClipCandidate]) -> go.Figure:
+    fig = go.Figure()
+    if timeline_df.empty:
+        fig.update_layout(title="No chat data yet - run an analysis to populate this graph.", template="plotly_dark")
+        return fig
+
+    fig.add_trace(go.Scatter(
+        x=timeline_df["bin_start"], y=timeline_df["hype_score"],
+        mode="lines", name="Hype score", line=dict(color="#7c5cff", width=1.5),
+    ))
+    fig.add_trace(go.Scatter(
+        x=timeline_df["bin_start"], y=timeline_df["rolling_mean"],
+        mode="lines", name="Rolling baseline", line=dict(color="#888888", width=1, dash="dot"),
+    ))
+    if candidates:
+        fig.add_trace(go.Scatter(
+            x=[c.spike_time for c in candidates], y=[c.peak_hype_score for c in candidates],
+            mode="markers", name="Detected spikes",
+            marker=dict(color="#ff4d6d", size=11, symbol="star"),
+        ))
+        for c in candidates:
+            fig.add_vrect(x0=c.window_start, x1=c.window_end, fillcolor="#ff4d6d", opacity=0.08, line_width=0)
+
+    fig.update_layout(
+        title="Chat Hype Timeline",
+        xaxis_title="Stream time (s)",
+        yaxis_title="Hype score",
+        template="plotly_dark",
+        height=380,
+        margin=dict(l=40, r=20, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Clip candidate cards
+# --------------------------------------------------------------------------- #
+
+
+def _format_hms(seconds: float) -> str:
+    """Formats a raw seconds-into-VOD offset as an absolute HH:MM:SS (or MM:SS) timestamp."""
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
+    if not clip.is_clip_worthy:
+        reason = clip.rejection_reason or "no reason given"
+        body = f"_Rejected by the LLM - statistical spike, but nothing notable found: {reason}_"
+        header = f"**#{rank}. [REJECTED] {clip.title}**"
+    else:
+        fallback_note = " _(fallback - LLM did not return a valid suggestion)_" if clip.used_fallback else ""
+        body = clip.summary
+        header = f"**#{rank}. {clip.title}**{fallback_note}"
+    return (
+        f"{header}\n\n"
+        f"{body}\n\n"
+        f"**{_format_hms(clip.start_time)} -> {_format_hms(clip.end_time)}**  "
+        f"({clip.duration:.1f}s)  |  Viral score: **{clip.viral_score}/10**\n\n"
+        f"Chat spike at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f})"
+    )
+
+
+def _visible_clips(clips: List[CandidateClip], show_rejected: bool) -> List[CandidateClip]:
+    """Rejected clips always live in clips_state; this only controls what's displayed/paginated."""
+    return clips if show_rejected else [c for c in clips if c.is_clip_worthy]
+
+
+def _total_pages(clips: List[CandidateClip]) -> int:
+    return max(1, -(-len(clips) // MAX_CLIP_CARDS))  # ceil division
+
+
+def _clamp_page(page: int, clips: List[CandidateClip]) -> int:
+    return max(0, min(page, _total_pages(clips) - 1))
+
+
+def _page_label(clips: List[CandidateClip], page: int) -> str:
+    if not clips:
+        return "No clips yet - run an analysis."
+    page = _clamp_page(page, clips)
+    lo = page * MAX_CLIP_CARDS + 1
+    hi = min(len(clips), (page + 1) * MAX_CLIP_CARDS)
+    return f"Showing clips **{lo}-{hi}** of **{len(clips)}** (page {page + 1}/{_total_pages(clips)})"
+
+
+def _build_card_updates(clips: List[CandidateClip], page: int):
+    """Returns MAX_CLIP_CARDS * (group, markdown, start_slider, end_slider) gr.update() tuples for one page."""
+    page = _clamp_page(page, clips)
+    start = page * MAX_CLIP_CARDS
+    page_clips = clips[start:start + MAX_CLIP_CARDS]
+
+    updates = []
+    for i in range(MAX_CLIP_CARDS):
+        if i < len(page_clips):
+            clip = page_clips[i]
+            lo = max(0.0, clip.spike_time - CARD_WINDOW_PADDING_S)
+            hi = clip.spike_time + CARD_WINDOW_PADDING_S
+            updates.extend([
+                gr.update(visible=True),
+                gr.update(value=_format_card_markdown(clip, start + i + 1)),
+                gr.update(minimum=lo, maximum=hi, value=clip.start_time, step=0.1),
+                gr.update(minimum=lo, maximum=hi, value=clip.end_time, step=0.1),
+            ])
+        else:
+            updates.extend([gr.update(visible=False), gr.update(value=""), gr.update(), gr.update()])
+    return updates
+
+
+def go_to_page(clips: List[CandidateClip], show_rejected: bool, page: int, delta: int):
+    """
+    Moves `delta` pages (e.g. -1/+1) and returns the new page + refreshed card
+    updates. delta=0 is used to just re-render the current page (e.g. after the
+    "show rejected" toggle changes what's visible, without changing page).
+    """
+    visible = _visible_clips(clips, show_rejected)
+    new_page = _clamp_page(page + delta, visible)
+    return (new_page, _page_label(visible, new_page), *_build_card_updates(visible, new_page))
+
+
+def _sync_bound(
+    clips: List[CandidateClip], show_rejected: bool, page: int, value: float, idx: int, field_name: str
+) -> List[CandidateClip]:
+    """
+    Applies a manual slider edit back into clips_state, guarding against inverted
+    bounds. Resolves the edited card's position within the currently-visible
+    (possibly filtered) list back to its real position in the full clips_state.
+    """
+    visible = _visible_clips(clips, show_rejected)
+    local_pos = _clamp_page(page, visible) * MAX_CLIP_CARDS + idx
+    if local_pos >= len(visible):
+        return clips
+    target = visible[local_pos]
+    if field_name == "start_time" and value >= target.end_time:
+        gr.Warning(f"Start time must be before end time ({target.end_time:.1f}s); edit ignored.")
+        return clips
+    if field_name == "end_time" and value <= target.start_time:
+        gr.Warning(f"End time must be after start time ({target.start_time:.1f}s); edit ignored.")
+        return clips
+    real_idx = next(i for i, c in enumerate(clips) if c is target)
+    updated = list(clips)
+    updated[real_idx] = replace(target, **{field_name: value})
+    return updated
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline
+# --------------------------------------------------------------------------- #
+
+
+def run_pipeline(youtube_source: str, twitch_source: str, chat_offset: float, progress=gr.Progress()):
+    if not youtube_source or not twitch_source:
+        raise gr.Error("Please provide both a subtitle source and a Twitch VOD source.")
+
+    progress(0.05, desc="Fetching subtitles...")
+    try:
+        subtitles = fetch_subtitles(youtube_source)
+    except FetcherError as exc:
+        raise gr.Error(f"Subtitle fetch failed: {exc}")
+
+    progress(0.3, desc="Downloading Twitch chat log...")
+    try:
+        messages = fetch_twitch_chat(twitch_source, chat_offset_seconds=chat_offset)
+    except FetcherError as exc:
+        raise gr.Error(f"Twitch chat fetch failed: {exc}")
+
+    progress(0.55, desc="Scoring chat hype...")
+    candidates, timeline_df = ChatAnalyzer().analyze_with_timeline(messages)
+    if not candidates:
+        gr.Warning(
+            "No chat hype spikes cleared the Z-score threshold. Check the chat offset, or lower "
+            "HypeScoreConfig.z_score_threshold in config.py for a quieter stream."
+        )
+
+    progress(0.75, desc="Asking the LLM to judge and refine clip boundaries...")
+    refined_clips = LLMAgent().refine_candidates(candidates, subtitles)  # accepted + rejected, both kept
+    refined_clips.sort(key=lambda c: c.viral_score, reverse=True)
+    rejected_count = sum(1 for c in refined_clips if not c.is_clip_worthy)
+    kept_count = len(refined_clips) - rejected_count
+
+    progress(1.0, desc="Done")
+    fig = build_hype_timeline_figure(timeline_df, candidates)
+    status = (
+        f"Analyzed {len(messages)} chat messages -> {len(candidates)} chat-spike candidate(s) -> "
+        f"{kept_count} clip(s) kept"
+        + (
+            f", {rejected_count} rejected (toggle 'Show rejected candidates' to review)."
+            if rejected_count else "."
+        )
+    )
+    # Reset the toggle off on every fresh analysis so a stale "show rejected" state
+    # from a previous run doesn't leak into a new one.
+    visible = _visible_clips(refined_clips, show_rejected=False)
+    page_updates = _build_card_updates(visible, page=0)
+    return (fig, refined_clips, status, 0, gr.update(value=False), _page_label(visible, 0), *page_updates)
+
+
+# --------------------------------------------------------------------------- #
+# VOD video download
+# --------------------------------------------------------------------------- #
+
+
+def do_download_vod(twitch_source: str, quality: str):
+    """
+    Downloads the full Twitch VOD video file via TwitchDownloaderCLI, so
+    exports have a local source file to reference. This is deliberately NOT
+    part of run_pipeline: analysis only needs subtitles/chat and is fast,
+    while a VOD download can be a multi-GB, multi-hour operation - you may
+    want to review candidates before committing to it.
+
+    A generator so the UI shows an immediate "in progress" state without
+    needing real progress-percentage tracking: Gradio renders each yielded
+    tuple as it's produced, so the first yield shows up right away and the
+    second lands whenever the (blocking) download actually finishes.
+    """
+    if not twitch_source:
+        raise gr.Error("Please provide a Twitch VOD URL or ID first.")
+
+    yield (
+        "Downloading VOD... this can take a while for long streams (the full VOD is downloaded, "
+        "not a trimmed range, since clip timings are offsets from its start). "
+        "This message will update when the download finishes.",
+        gr.update(interactive=False),
+        gr.update(),
+    )
+
+    try:
+        video_path = fetch_twitch_vod(twitch_source, quality=quality or None)
+    except FetcherError as exc:
+        yield f"VOD download failed: {exc}", gr.update(interactive=True), gr.update()
+        return
+
+    yield (
+        f"VOD downloaded: `{video_path}`. Source video path below has been filled in automatically.",
+        gr.update(interactive=True),
+        gr.update(value=str(video_path)),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Export handlers
+# --------------------------------------------------------------------------- #
+
+
+def do_export_files(clips: List[CandidateClip], source_video_path: str):
+    accepted = [c for c in clips if c.is_clip_worthy]
+    if not accepted:
+        raise gr.Error(
+            "No accepted clips to export yet - run an analysis first. "
+            "(Clips rejected by the LLM are excluded from exports regardless of the review toggle.)"
+        )
+    if not source_video_path:
+        raise gr.Error("Please provide the local source video path (needed by the FCPXML asset reference).")
+    try:
+        fcpxml_path = export_fcpxml_file(accepted, source_video_path)
+        edl_path = export_edl_file(accepted)
+    except ExportError as exc:
+        raise gr.Error(str(exc))
+    return str(fcpxml_path), str(edl_path)
+
+
+def do_inject_resolve(clips: List[CandidateClip], source_video_path: str):
+    accepted = [c for c in clips if c.is_clip_worthy]
+    if not accepted:
+        raise gr.Error(
+            "No accepted clips to inject yet - run an analysis first. "
+            "(Clips rejected by the LLM are excluded from injection regardless of the review toggle.)"
+        )
+    if not source_video_path:
+        raise gr.Error("Please provide the local source video path to import into Resolve's Media Pool.")
+    if not resolve_is_available():
+        raise gr.Error(
+            "DaVinci Resolve isn't reachable. Make sure it's running with Preferences > General > "
+            "'External scripting using' set to Local, or use the FCPXML/EDL download instead."
+        )
+    try:
+        result = inject_into_resolve(accepted, source_video_path)
+    except DavinciAPIError as exc:
+        raise gr.Error(str(exc))
+    return (
+        f"Injected {result.clips_added} clip(s) into timeline **'{result.timeline_name}'** "
+        f"in project **'{result.project_name}'** ({result.clips_failed} failed)."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# UI
+# --------------------------------------------------------------------------- #
+
+
+def build_app() -> gr.Blocks:
+    with gr.Blocks(title="StreamCutter") as demo:
+        gr.Markdown("# StreamCutter\nTurn Twitch chat hype spikes into DaVinci Resolve-ready viral clips.")
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### 1. Sources")
+                youtube_input = gr.Textbox(
+                    label="YouTube URL or local .srt/.vtt/.txt transcript path",
+                    placeholder="https://youtube.com/watch?v=... or C:\\path\\to\\transcript.srt",
+                )
+                twitch_input = gr.Textbox(
+                    label="Twitch VOD URL or ID",
+                    placeholder="https://twitch.tv/videos/123456789",
+                )
+                offset_input = gr.Number(
+                    label="Chat offset (s) - Twitch clock minus YouTube clock",
+                    value=settings.fetcher.default_chat_offset_seconds,
+                )
+                source_video_input = gr.Textbox(
+                    label="Local source video path (used by exports)",
+                    placeholder=r"C:\path\to\downloaded_video.mp4",
+                )
+                with gr.Row():
+                    vod_quality_input = gr.Textbox(
+                        label="VOD download quality",
+                        value=settings.fetcher.twitch_video_quality,
+                        placeholder="best, worst, audio_only, or a resolution like 720p60",
+                    )
+                    download_vod_btn = gr.Button("Download VOD")
+                download_status = gr.Markdown("")
+                run_btn = gr.Button("Analyze Stream", variant="primary")
+                status_box = gr.Markdown("")
+            with gr.Column(scale=2):
+                gr.Markdown("### 2. Chat Hype Timeline")
+                hype_plot = gr.Plot()
+
+        gr.Markdown("### 3. Clip Candidates")
+        clips_state = gr.State([])
+        page_state = gr.State(0)
+
+        show_rejected_checkbox = gr.Checkbox(
+            label="Show rejected candidates (statistical spikes the LLM judged not notable)",
+            value=False,
+        )
+        with gr.Row():
+            prev_page_btn = gr.Button("< Prev", size="sm")
+            page_label = gr.Markdown("No clips yet - run an analysis.")
+            next_page_btn = gr.Button("Next >", size="sm")
+
+        card_components = []
+        for _ in range(MAX_CLIP_CARDS):
+            with gr.Group(visible=False) as card_group:
+                card_md = gr.Markdown()
+                with gr.Row():
+                    start_slider = gr.Slider(label="Start (seconds into VOD)", minimum=0, maximum=1, step=0.1)
+                    end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
+            card_components.append({"group": card_group, "md": card_md, "start": start_slider, "end": end_slider})
+
+        gr.Markdown("### 4. Export")
+        resolve_hint = (
+            "DaVinci Resolve detected and reachable."
+            if resolve_is_available()
+            else "DaVinci Resolve not detected - 'Inject' will fall back to an error; use the file download instead."
+        )
+        gr.Markdown(f"_{resolve_hint}_")
+        with gr.Row():
+            export_files_btn = gr.Button("Download FCPXML/EDL")
+            inject_btn = gr.Button("Inject into DaVinci Resolve")
+        with gr.Row():
+            fcpxml_file = gr.File(label="FCPXML")
+            edl_file = gr.File(label="EDL")
+        inject_status = gr.Markdown("")
+
+        # --- wiring ---
+
+        card_outputs = []
+        for c in card_components:
+            card_outputs.extend([c["group"], c["md"], c["start"], c["end"]])
+
+        run_btn.click(
+            fn=run_pipeline,
+            inputs=[youtube_input, twitch_input, offset_input],
+            outputs=[
+                hype_plot, clips_state, status_box, page_state,
+                show_rejected_checkbox, page_label, *card_outputs,
+            ],
+        )
+
+        download_vod_btn.click(
+            fn=do_download_vod,
+            inputs=[twitch_input, vod_quality_input],
+            outputs=[download_status, download_vod_btn, source_video_input],
+        )
+
+        prev_page_btn.click(
+            fn=partial(go_to_page, delta=-1),
+            inputs=[clips_state, show_rejected_checkbox, page_state],
+            outputs=[page_state, page_label, *card_outputs],
+        )
+        next_page_btn.click(
+            fn=partial(go_to_page, delta=1),
+            inputs=[clips_state, show_rejected_checkbox, page_state],
+            outputs=[page_state, page_label, *card_outputs],
+        )
+        show_rejected_checkbox.change(
+            fn=partial(go_to_page, delta=0),
+            inputs=[clips_state, show_rejected_checkbox, page_state],
+            outputs=[page_state, page_label, *card_outputs],
+        )
+
+        for idx, c in enumerate(card_components):
+            c["start"].release(
+                fn=partial(_sync_bound, idx=idx, field_name="start_time"),
+                inputs=[clips_state, show_rejected_checkbox, page_state, c["start"]],
+                outputs=[clips_state],
+            )
+            c["end"].release(
+                fn=partial(_sync_bound, idx=idx, field_name="end_time"),
+                inputs=[clips_state, show_rejected_checkbox, page_state, c["end"]],
+                outputs=[clips_state],
+            )
+
+        export_files_btn.click(
+            fn=do_export_files,
+            inputs=[clips_state, source_video_input],
+            outputs=[fcpxml_file, edl_file],
+        )
+        inject_btn.click(
+            fn=do_inject_resolve,
+            inputs=[clips_state, source_video_input],
+            outputs=[inject_status],
+        )
+
+    return demo
+
+
+if __name__ == "__main__":
+    app = build_app()
+    app.queue().launch(server_port=7862)
