@@ -8,8 +8,9 @@ Gradio front-end tying the whole StreamCutter pipeline together:
 Layout:
     1. Sources        - YouTube/subtitle input, Twitch VOD input, chat offset, local source video path
     2. Hype timeline   - interactive Plotly graph of chat hype score with detected spikes
-    3. Clip candidates - one card per candidate with editable start/end sliders
-    4. Export          - "Download FCPXML/EDL" and "Inject into DaVinci Resolve"
+    3. Subtitles       - collapsible full transcript preview, for verifying language/content
+    4. Clip candidates - one card per candidate with editable start/end sliders
+    5. Export          - "Download FCPXML/EDL" and "Inject into DaVinci Resolve"
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import plotly.graph_objects as go
 
 from config import settings
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
-from core.fetchers import FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod
+from core.fetchers import FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod
 from core.llm_agent import CandidateClip, LLMAgent
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
@@ -89,6 +90,19 @@ def _format_hms(seconds: float) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def _format_full_transcript(subtitles: List[SubtitleSegment]) -> str:
+    """
+    Renders the whole fetched subtitle track as '[HH:MM:SS -> HH:MM:SS] text' lines,
+    so an operator can eyeball the actual language/content pulled for a stream and
+    scroll to the context around a clip without leaving the app.
+    """
+    if not subtitles:
+        return "(no subtitles loaded yet - run an analysis)"
+    return "\n".join(
+        f"[{_format_hms(seg.start)} -> {_format_hms(seg.end)}] {seg.text}" for seg in subtitles
+    )
 
 
 def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
@@ -239,7 +253,11 @@ def run_pipeline(youtube_source: str, twitch_source: str, chat_offset: float, pr
     # from a previous run doesn't leak into a new one.
     visible = _visible_clips(refined_clips, show_rejected=False)
     page_updates = _build_card_updates(visible, page=0)
-    return (fig, refined_clips, status, 0, gr.update(value=False), _page_label(visible, 0), *page_updates)
+    transcript_text = _format_full_transcript(subtitles)
+    return (
+        fig, refined_clips, status, 0, gr.update(value=False), _page_label(visible, 0),
+        transcript_text, *page_updates,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -372,7 +390,16 @@ def build_app() -> gr.Blocks:
                 gr.Markdown("### 2. Chat Hype Timeline")
                 hype_plot = gr.Plot()
 
-        gr.Markdown("### 3. Clip Candidates")
+        with gr.Accordion("3. Subtitles (verify language / scroll for context around a clip)", open=False):
+            subtitles_display = gr.Textbox(
+                value="(no subtitles loaded yet - run an analysis)",
+                lines=15,
+                max_lines=30,
+                interactive=False,
+                show_label=False,
+            )
+
+        gr.Markdown("### 4. Clip Candidates")
         clips_state = gr.State([])
         page_state = gr.State(0)
 
@@ -394,7 +421,7 @@ def build_app() -> gr.Blocks:
                     end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
             card_components.append({"group": card_group, "md": card_md, "start": start_slider, "end": end_slider})
 
-        gr.Markdown("### 4. Export")
+        gr.Markdown("### 5. Export")
         resolve_hint = (
             "DaVinci Resolve detected and reachable."
             if resolve_is_available()
@@ -420,7 +447,7 @@ def build_app() -> gr.Blocks:
             inputs=[youtube_input, twitch_input, offset_input],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
-                show_rejected_checkbox, page_label, *card_outputs,
+                show_rejected_checkbox, page_label, subtitles_display, *card_outputs,
             ],
         )
 
