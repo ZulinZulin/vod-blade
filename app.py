@@ -27,7 +27,7 @@ import plotly.graph_objects as go
 from config import settings
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod
-from core.llm_agent import CandidateClip, LLMAgent
+from core.llm_agent import DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
 from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
@@ -105,6 +105,9 @@ def _format_full_transcript(subtitles: List[SubtitleSegment]) -> str:
     )
 
 
+_CARD_TRANSCRIPT_MAX_CHARS = 400
+
+
 def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
     if not clip.is_clip_worthy:
         reason = clip.rejection_reason or "no reason given"
@@ -114,12 +117,18 @@ def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
         fallback_note = " _(fallback - LLM did not return a valid suggestion)_" if clip.used_fallback else ""
         body = clip.summary
         header = f"**#{rank}. {clip.title}**{fallback_note}"
+
+    excerpt = clip.transcript_excerpt.replace("\n", " ")
+    if len(excerpt) > _CARD_TRANSCRIPT_MAX_CHARS:
+        excerpt = excerpt[:_CARD_TRANSCRIPT_MAX_CHARS].rstrip() + "..."
+
     return (
         f"{header}\n\n"
         f"{body}\n\n"
         f"**{_format_hms(clip.start_time)} -> {_format_hms(clip.end_time)}**  "
         f"({clip.duration:.1f}s)  |  Viral score: **{clip.viral_score}/10**\n\n"
-        f"Chat spike at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f})"
+        f"Chat spike at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f})\n\n"
+        f"> {excerpt or '(no transcript captured for this range)'}"
     )
 
 
@@ -209,9 +218,27 @@ def _sync_bound(
 # --------------------------------------------------------------------------- #
 
 
-def run_pipeline(youtube_source: str, twitch_source: str, chat_offset: float, progress=gr.Progress()):
+def run_pipeline(
+    youtube_source: str,
+    twitch_source: str,
+    chat_offset: float,
+    z_threshold: float,
+    min_gap: float,
+    pre_spike: float,
+    post_spike: float,
+    min_viral_score: float,
+    content_hint: str,
+    system_prompt: str,
+    progress=gr.Progress(),
+):
     if not youtube_source or not twitch_source:
         raise gr.Error("Please provide both a subtitle source and a Twitch VOD source.")
+    if z_threshold is None or z_threshold <= 0:
+        raise gr.Error("Z-score threshold must be a positive number.")
+    if min_gap is None or min_gap < 0 or pre_spike is None or pre_spike < 0 or post_spike is None or post_spike < 0:
+        raise gr.Error("Spike spacing/window values must be zero or greater.")
+    if min_viral_score is None or not (1 <= min_viral_score <= 10):
+        raise gr.Error("Minimum viral score must be between 1 and 10.")
 
     progress(0.05, desc="Fetching subtitles...")
     try:
@@ -226,15 +253,28 @@ def run_pipeline(youtube_source: str, twitch_source: str, chat_offset: float, pr
         raise gr.Error(f"Twitch chat fetch failed: {exc}")
 
     progress(0.55, desc="Scoring chat hype...")
-    candidates, timeline_df = ChatAnalyzer().analyze_with_timeline(messages)
+    # Only the spike-detection knobs are overridden here; scoring weights/emote lists/bin
+    # width stay at their config.py defaults (those are stable across streams, unlike
+    # sensitivity, which an editor will want to retune per chat's chattiness).
+    hype_cfg = replace(
+        settings.hype,
+        z_score_threshold=z_threshold,
+        min_seconds_between_spikes=min_gap,
+        pre_spike_seconds=pre_spike,
+        post_spike_seconds=post_spike,
+    )
+    candidates, timeline_df = ChatAnalyzer(config=hype_cfg).analyze_with_timeline(messages)
     if not candidates:
         gr.Warning(
-            "No chat hype spikes cleared the Z-score threshold. Check the chat offset, or lower "
-            "HypeScoreConfig.z_score_threshold in config.py for a quieter stream."
+            "No chat hype spikes cleared the Z-score threshold. Try lowering the Z-score threshold "
+            "above for a quieter stream, or double check the chat offset."
         )
 
     progress(0.75, desc="Asking the LLM to judge and refine clip boundaries...")
-    refined_clips = LLMAgent().refine_candidates(candidates, subtitles)  # accepted + rejected, both kept
+    llm_cfg = replace(settings.llm, min_viral_score=int(min_viral_score))
+    # accepted + rejected, both kept
+    agent = LLMAgent(config=llm_cfg, system_prompt=system_prompt)
+    refined_clips = agent.refine_candidates(candidates, subtitles, content_hint=content_hint)
     refined_clips.sort(key=lambda c: c.viral_score, reverse=True)
     rejected_count = sum(1 for c in refined_clips if not c.is_clip_worthy)
     kept_count = len(refined_clips) - rejected_count
@@ -384,6 +424,55 @@ def build_app() -> gr.Blocks:
                     )
                     download_vod_btn = gr.Button("Download VOD")
                 download_status = gr.Markdown("")
+                with gr.Accordion("Hype detection settings (advanced)", open=False):
+                    with gr.Row():
+                        z_threshold_input = gr.Slider(
+                            label="Z-score threshold (higher = fewer, stronger-only spikes)",
+                            minimum=1.0, maximum=6.0, step=0.1,
+                            value=settings.hype.z_score_threshold,
+                        )
+                        min_gap_input = gr.Slider(
+                            label="Min seconds between spikes",
+                            minimum=0, maximum=300, step=5,
+                            value=settings.hype.min_seconds_between_spikes,
+                        )
+                    with gr.Row():
+                        pre_spike_input = gr.Slider(
+                            label="Seconds before spike (window start)",
+                            minimum=0, maximum=180, step=5,
+                            value=settings.hype.pre_spike_seconds,
+                        )
+                        post_spike_input = gr.Slider(
+                            label="Seconds after spike (window end)",
+                            minimum=0, maximum=180, step=5,
+                            value=settings.hype.post_spike_seconds,
+                        )
+                with gr.Accordion("LLM judgment settings (advanced)", open=False):
+                    min_viral_score_input = gr.Slider(
+                        label="Minimum viral score to keep (1-10) - clips the LLM itself scores below "
+                              "this are rejected even if it called them worthy",
+                        minimum=1, maximum=10, step=1,
+                        value=settings.llm.min_viral_score,
+                    )
+                    content_hint_input = gr.Textbox(
+                        label="Stream context hint for the LLM (optional)",
+                        placeholder="e.g. 'podcast, lots of talking - be strict about what counts as "
+                                    "notable' or 'fast-paced gaming stream'",
+                    )
+                with gr.Accordion("System prompt (advanced - edit with care)", open=False):
+                    gr.Markdown(
+                        "_This is the full instruction set the LLM judges every candidate against. "
+                        "Edit it to change how judgment works; leave it as-is otherwise. If your edit "
+                        "breaks the required JSON output format, calls will fail validation and those "
+                        "candidates fall back to their raw chat-spike window instead of crashing._"
+                    )
+                    system_prompt_input = gr.Textbox(
+                        value=DEFAULT_SYSTEM_PROMPT,
+                        lines=20,
+                        max_lines=60,
+                        show_label=False,
+                    )
+                    reset_system_prompt_btn = gr.Button("Reset to default", size="sm")
                 run_btn = gr.Button("Analyze Stream", variant="primary")
                 status_box = gr.Markdown("")
             with gr.Column(scale=2):
@@ -442,9 +531,19 @@ def build_app() -> gr.Blocks:
         for c in card_components:
             card_outputs.extend([c["group"], c["md"], c["start"], c["end"]])
 
+        reset_system_prompt_btn.click(
+            fn=lambda: DEFAULT_SYSTEM_PROMPT,
+            inputs=[],
+            outputs=[system_prompt_input],
+        )
+
         run_btn.click(
             fn=run_pipeline,
-            inputs=[youtube_input, twitch_input, offset_input],
+            inputs=[
+                youtube_input, twitch_input, offset_input,
+                z_threshold_input, min_gap_input, pre_spike_input, post_spike_input,
+                min_viral_score_input, content_hint_input, system_prompt_input,
+            ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
                 show_rejected_checkbox, page_label, subtitles_display, *card_outputs,

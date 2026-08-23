@@ -180,6 +180,13 @@ class LLMConfig:
     min_clip_duration_s: float = float(os.getenv("LLM_MIN_CLIP_DURATION_S", "12"))
     max_clip_duration_s: float = float(os.getenv("LLM_MAX_CLIP_DURATION_S", "90"))
 
+    # A second, independent filter on top of the LLM's own is_clip_worthy veto: even a
+    # candidate the model calls "worthy" gets rejected if its own viral_score is below
+    # this bar. Default of 1 preserves old behavior (no extra filtering); raise it to
+    # actually make use of the confidence signal the model already produces but which
+    # nothing previously consumed.
+    min_viral_score: int = int(os.getenv("LLM_MIN_VIRAL_SCORE", "1"))
+
     # Per-provider defaults applied when the user only sets LLM_PROVIDER.
     provider_model_defaults: Dict[str, str] = field(
         default_factory=lambda: {

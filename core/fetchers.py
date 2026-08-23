@@ -18,6 +18,7 @@ clock as the source (YouTube) video.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import re
@@ -129,26 +130,46 @@ def _parse_timestamp(value: str) -> float:
 
 def _clean_subtitle_text(text: str) -> str:
     text = _TAG_RE.sub("", text)
+    text = html.unescape(text)  # VTT cue text can carry literal entities, e.g. "&gt;&gt;", "&nbsp;"
+    text = text.replace("\xa0", " ")  # &nbsp; unescapes to U+00A0, not a plain space
     text = text.replace("\n", " ").strip()
     return _WHITESPACE_RE.sub(" ", text)
 
 
 def _dedupe_segments(segments: List[SubtitleSegment]) -> List[SubtitleSegment]:
     """
-    YouTube auto-captions frequently repeat the same rolling text across
-    consecutive cues (word-by-word caption scrolling). Collapse consecutive
-    duplicate texts, keeping the earliest start / latest end.
+    YouTube auto-captions render as a rolling 2-line window: consecutive cues
+    overlap rather than repeat exactly, e.g.
+
+        cue N:   "...as a cultural phenomenon,"
+        cue N+1: "as a cultural phenomenon,"                        (old line, no new words)
+        cue N+2: "as a cultural phenomenon, it's a circus that"     (old line + new words)
+
+    Emitting every cue as-is roughly doubles transcript length (and LLM token
+    cost) with zero new information. Since each cue is either a prefix of, a
+    suffix of, or unrelated to its neighbor, keep only the genuinely NEW text
+    each cue adds relative to the previous one, timestamped at that cue's own
+    [start, end] - cues that add nothing (pure re-displays of already-seen
+    text) are dropped entirely.
     """
     if not segments:
         return segments
-    merged: List[SubtitleSegment] = [segments[0]]
-    for seg in segments[1:]:
-        prev = merged[-1]
-        if seg.text and seg.text == prev.text:
-            merged[-1] = SubtitleSegment(start=prev.start, end=seg.end, text=prev.text)
+    cleaned: List[SubtitleSegment] = []
+    prev_text = ""
+    for seg in segments:
+        text = seg.text
+        if not text:
+            continue
+        if prev_text and text.startswith(prev_text):
+            new_part = text[len(prev_text):].strip()
+        elif prev_text and prev_text.endswith(text):
+            new_part = ""  # fully-seen tail re-displayed as the old line scrolls off
         else:
-            merged.append(seg)
-    return merged
+            new_part = text  # no overlap with the previous cue - genuinely new content
+        prev_text = text
+        if new_part:
+            cleaned.append(SubtitleSegment(start=seg.start, end=seg.end, text=new_part))
+    return cleaned
 
 
 # --------------------------------------------------------------------------- #
