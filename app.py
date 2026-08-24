@@ -23,11 +23,12 @@ from typing import List
 import gradio as gr
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 
 from config import settings
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod
-from core.llm_agent import DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent
+from core.llm_agent import DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
 from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
@@ -229,8 +230,22 @@ def run_pipeline(
     min_viral_score: float,
     content_hint: str,
     system_prompt: str,
+    llm_provider: str,
+    llm_model: str,
+    llm_api_base: str,
+    llm_api_key: str,
     progress=gr.Progress(),
 ):
+    # Gradio Textbox/Dropdown components default to value=None (not "") when left
+    # untouched and no explicit `value=""` was set on the component - normalize once
+    # here so nothing downstream has to guard against None on what's conceptually an
+    # optional *string* field.
+    content_hint = content_hint or ""
+    system_prompt = system_prompt or ""
+    llm_model = llm_model or ""
+    llm_api_base = llm_api_base or ""
+    llm_api_key = llm_api_key or ""
+
     if not youtube_source or not twitch_source:
         raise gr.Error("Please provide both a subtitle source and a Twitch VOD source.")
     if z_threshold is None or z_threshold <= 0:
@@ -239,6 +254,11 @@ def run_pipeline(
         raise gr.Error("Spike spacing/window values must be zero or greater.")
     if min_viral_score is None or not (1 <= min_viral_score <= 10):
         raise gr.Error("Minimum viral score must be between 1 and 10.")
+    if llm_provider in ("openai", "deepseek") and not (llm_api_key.strip() or settings.llm.api_key):
+        raise gr.Error(
+            f"No API key configured for provider '{llm_provider}'. Enter one above, or set "
+            "LLM_API_KEY in .env if you'd rather not paste it into the UI each time."
+        )
 
     progress(0.05, desc="Fetching subtitles...")
     try:
@@ -271,10 +291,20 @@ def run_pipeline(
         )
 
     progress(0.75, desc="Asking the LLM to judge and refine clip boundaries...")
-    llm_cfg = replace(settings.llm, min_viral_score=int(min_viral_score))
+    llm_cfg = replace(
+        settings.llm,
+        provider=llm_provider,
+        model=llm_model.strip() or None,
+        api_base=llm_api_base.strip() or None,
+        api_key=llm_api_key.strip() or settings.llm.api_key,
+        min_viral_score=int(min_viral_score),
+    )
     # accepted + rejected, both kept
     agent = LLMAgent(config=llm_cfg, system_prompt=system_prompt)
-    refined_clips = agent.refine_candidates(candidates, subtitles, content_hint=content_hint)
+    try:
+        refined_clips = agent.refine_candidates(candidates, subtitles, content_hint=content_hint)
+    except OllamaGpuOffloadError as exc:
+        raise gr.Error(str(exc))
     refined_clips.sort(key=lambda c: c.viral_score, reverse=True)
     rejected_count = sum(1 for c in refined_clips if not c.is_clip_worthy)
     kept_count = len(refined_clips) - rejected_count
@@ -297,6 +327,69 @@ def run_pipeline(
     return (
         fig, refined_clips, status, 0, gr.update(value=False), _page_label(visible, 0),
         transcript_text, *page_updates,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# LLM provider helpers
+# --------------------------------------------------------------------------- #
+
+
+def do_fetch_models(provider: str, api_base: str, api_key: str):
+    """
+    Queries the selected provider's model-listing endpoint and returns the
+    fetched IDs as Dropdown choices, so the Model field can be picked from a
+    real, current catalog instead of typed blind. Ollama uses its own
+    /api/tags shape; every other provider here follows the OpenAI-compatible
+    GET {base}/models convention (openai, deepseek, openrouter, nanogpt all do).
+    """
+    base = (api_base or "").strip().rstrip("/") or settings.llm.provider_api_base_defaults.get(provider, "")
+    if not base:
+        raise gr.Error(f"No API base URL known for provider '{provider}'. Enter one above first.")
+
+    key = (api_key or "").strip() or settings.llm.api_key
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+
+    try:
+        if provider == "ollama":
+            resp = requests.get(f"{base}/api/tags", timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+            model_ids = sorted({
+                str(entry.get("model") or entry.get("name"))
+                for entry in payload.get("models", [])
+                if entry.get("model") or entry.get("name")
+            })
+        else:
+            resp = requests.get(f"{base}/models", headers=headers, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+            entries = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if not isinstance(entries, list):
+                raise gr.Error(f"Unexpected response shape from {base}/models (expected a list of models).")
+            model_ids = sorted({
+                str(entry.get("id") or entry.get("name"))
+                for entry in entries
+                if isinstance(entry, dict) and (entry.get("id") or entry.get("name"))
+            })
+    except requests.exceptions.RequestException as exc:
+        raise gr.Error(f"Failed to fetch models from {base}: {exc}")
+    except ValueError as exc:  # response body wasn't valid JSON
+        raise gr.Error(f"Provider returned a non-JSON response from {base}/models: {exc}")
+
+    if not model_ids:
+        raise gr.Error(f"No models returned by {base} - check the API base/key above.")
+
+    gr.Info(f"Fetched {len(model_ids)} model(s) from {provider}.")
+    return gr.update(choices=model_ids)
+
+
+def do_provider_changed(provider: str):
+    """Switching providers clears any previously-fetched model list, which wouldn't apply here anyway."""
+    default_base = settings.llm.provider_api_base_defaults.get(provider, "")
+    return (
+        gr.update(choices=[], value=""),
+        gr.update(placeholder=f"e.g. {default_base}" if default_base else None),
     )
 
 
@@ -447,6 +540,43 @@ def build_app() -> gr.Blocks:
                             minimum=0, maximum=180, step=5,
                             value=settings.hype.post_spike_seconds,
                         )
+                with gr.Accordion("LLM provider (advanced)", open=False):
+                    llm_provider_input = gr.Dropdown(
+                        label="LLM provider",
+                        choices=["openai", "deepseek", "ollama", "openrouter", "nanogpt"],
+                        value=settings.llm.provider,
+                    )
+                    with gr.Row():
+                        llm_model_input = gr.Dropdown(
+                            label="Model (optional - blank uses the provider's default; type to search, "
+                                  "or click 'Fetch models' for a live list)",
+                            choices=[settings.llm.model] if settings.llm.model else [],
+                            value=settings.llm.model or "",
+                            allow_custom_value=True,
+                            filterable=True,
+                        )
+                        fetch_models_btn = gr.Button("Fetch models from API", size="sm")
+                    with gr.Row():
+                        llm_api_base_input = gr.Textbox(
+                            label="API base URL (optional - blank uses the provider's default)",
+                            value=settings.llm.api_base or "",
+                            placeholder="e.g. https://nano-gpt.com/api/v1",
+                        )
+                        llm_api_key_input = gr.Textbox(
+                            label="API key (optional - blank uses LLM_API_KEY from .env; ignored for Ollama)",
+                            value="",
+                            type="password",
+                        )
+                    gr.Markdown(
+                        "_openrouter and nanogpt are third-party aggregators exposing many underlying "
+                        "models - 'Fetch models from API' lists what's actually available from whichever "
+                        "provider/API base/key is set above (needs a valid key for most providers). Local "
+                        "Ollama note: the app can detect the model being evicted to CPU/RAM, but not GPU "
+                        "**compute** contention - another GPU-heavy app (image/video generation, games) "
+                        "running at the same time can still make judgment run dramatically slower with no "
+                        "error, even while the model stays fully loaded on the GPU. Close other GPU-heavy "
+                        "applications for best performance._"
+                    )
                 with gr.Accordion("LLM judgment settings (advanced)", open=False):
                     min_viral_score_input = gr.Slider(
                         label="Minimum viral score to keep (1-10) - clips the LLM itself scores below "
@@ -456,6 +586,7 @@ def build_app() -> gr.Blocks:
                     )
                     content_hint_input = gr.Textbox(
                         label="Stream context hint for the LLM (optional)",
+                        value="",
                         placeholder="e.g. 'podcast, lots of talking - be strict about what counts as "
                                     "notable' or 'fast-paced gaming stream'",
                     )
@@ -543,6 +674,7 @@ def build_app() -> gr.Blocks:
                 youtube_input, twitch_input, offset_input,
                 z_threshold_input, min_gap_input, pre_spike_input, post_spike_input,
                 min_viral_score_input, content_hint_input, system_prompt_input,
+                llm_provider_input, llm_model_input, llm_api_base_input, llm_api_key_input,
             ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
@@ -554,6 +686,17 @@ def build_app() -> gr.Blocks:
             fn=do_download_vod,
             inputs=[twitch_input, vod_quality_input],
             outputs=[download_status, download_vod_btn, source_video_input],
+        )
+
+        fetch_models_btn.click(
+            fn=do_fetch_models,
+            inputs=[llm_provider_input, llm_api_base_input, llm_api_key_input],
+            outputs=[llm_model_input],
+        )
+        llm_provider_input.change(
+            fn=do_provider_changed,
+            inputs=[llm_provider_input],
+            outputs=[llm_model_input, llm_api_base_input],
         )
 
         prev_page_btn.click(

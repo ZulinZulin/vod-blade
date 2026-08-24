@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import litellm
+import requests
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from config import LLMConfig, settings
@@ -48,6 +49,16 @@ class LLMAgentError(Exception):
 
 class LLMResponseError(LLMAgentError):
     """Raised when the model's response can't be parsed/validated after all retries."""
+
+
+class OllamaGpuOffloadError(LLMAgentError):
+    """
+    Raised when the configured Ollama model isn't sufficiently VRAM-resident -
+    i.e. it's (partially) offloaded to CPU/RAM, which "works" but can run an
+    order of magnitude slower with no visible indication why. Deliberately NOT
+    caught by the retry/fallback machinery: this should stop the run loudly
+    rather than silently degrade into a very slow one.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -187,7 +198,7 @@ def format_transcript(segments: List[SubtitleSegment]) -> str:
 
 
 def _build_user_prompt(candidate: ClipCandidate, transcript: str, content_hint: str = "") -> str:
-    hint_line = f"\nContext from the operator about this stream: {content_hint}\n" if content_hint.strip() else ""
+    hint_line = f"\nContext from the operator about this stream: {content_hint}\n" if content_hint and content_hint.strip() else ""
     return (
         f"Chat hype spike detected at t={candidate.spike_time:.1f}s "
         f"(peak hype score={candidate.peak_hype_score:.1f}, z-score={candidate.peak_z_score:.2f}).\n"
@@ -228,6 +239,7 @@ class LLMAgent:
         # an empty system prompt to the model, which would break judgment entirely.
         self.system_prompt = system_prompt.strip() if system_prompt and system_prompt.strip() else DEFAULT_SYSTEM_PROMPT
         self._logged_system_prompt = False
+        self._checked_gpu_residency = False
 
     def refine_candidate(
         self,
@@ -247,6 +259,7 @@ class LLMAgent:
         stream's genre/format (e.g. "podcast, lots of talking - be strict about
         what counts as notable"), folded into the prompt as extra context.
         """
+        self._ensure_ollama_ready()
         window_segments = select_subtitle_window(subtitles, candidate.window_start, candidate.window_end)
         transcript = format_transcript(window_segments)
 
@@ -305,11 +318,19 @@ class LLMAgent:
         Returns ALL of them (accepted and rejected alike) - filter on
         `.is_clip_worthy` at the call site for anything that should only use
         accepted clips (exports, injection).
+
+        The Ollama GPU-residency check runs once here, before the loop and
+        outside its per-candidate try/except, so a confirmed CPU offload raises
+        OllamaGpuOffloadError straight out of this call instead of being caught
+        and silently skipped candidate-by-candidate.
         """
+        self._ensure_ollama_ready()
         results: List[CandidateClip] = []
         for candidate in candidates:
             try:
                 results.append(self.refine_candidate(candidate, subtitles, content_hint))
+            except OllamaGpuOffloadError:
+                raise
             except Exception:
                 logger.exception("Unexpected error refining candidate at t=%.1f; skipping.", candidate.spike_time)
         return results
@@ -395,6 +416,75 @@ class LLMAgent:
             end_time = start_time + self.cfg.max_clip_duration_s
 
         return start_time, end_time
+
+    def _ensure_ollama_ready(self) -> None:
+        """
+        Ollama only: refuses to proceed if the model isn't sufficiently VRAM-resident,
+        per config.min_ollama_gpu_ratio (<=0 disables this check). Runs once per
+        LLMAgent instance (guarded by _checked_gpu_residency). Failures in the check
+        itself (Ollama unreachable, API shape changed, etc.) are logged and swallowed -
+        only a CONFIRMED offload raises, since the diagnostic probe failing isn't the
+        same as the model actually being offloaded, and the real litellm call will
+        surface genuine connectivity problems on its own with its own error handling.
+        """
+        if self._checked_gpu_residency:
+            return
+        self._checked_gpu_residency = True
+
+        if self.cfg.provider != "ollama" or self.cfg.min_ollama_gpu_ratio <= 0:
+            return
+
+        bare_model = self.model.split("/", 1)[1] if self.model.startswith("ollama/") else self.model
+        base = (self.api_base or "http://localhost:11434").rstrip("/")
+
+        try:
+            entry = self._find_loaded_ollama_model(base, bare_model)
+            if entry is None:
+                # Not loaded yet - force a load with a minimal generation so there's
+                # something in /api/ps to actually check the residency of.
+                logger.info(
+                    "Ollama model '%s' not yet loaded; sending a warm-up request to check GPU residency.",
+                    bare_model,
+                )
+                requests.post(
+                    f"{base}/api/generate",
+                    json={"model": bare_model, "prompt": " ", "stream": False, "options": {"num_predict": 1}},
+                    timeout=max(120, self.cfg.request_timeout_s * 2),
+                )
+                entry = self._find_loaded_ollama_model(base, bare_model)
+            if entry is None:
+                logger.warning(
+                    "Could not confirm GPU residency for Ollama model '%s' (not found in /api/ps even "
+                    "after a warm-up request); proceeding without the check.", bare_model,
+                )
+                return
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Ollama GPU-residency check failed (%s); proceeding without it.", exc)
+            return
+
+        size = entry.get("size") or 0
+        size_vram = entry.get("size_vram") or 0
+        if size <= 0:
+            return
+        ratio = size_vram / size
+        if ratio < self.cfg.min_ollama_gpu_ratio:
+            raise OllamaGpuOffloadError(
+                f"Ollama model '{bare_model}' is only {ratio:.0%} GPU-resident (needs >= "
+                f"{self.cfg.min_ollama_gpu_ratio:.0%}). It's being partially offloaded to CPU/RAM, most "
+                "likely because something else on this machine is using VRAM right now - this would run "
+                "much slower than usual, so the run is being stopped instead. Close other GPU-heavy "
+                "applications and try again, or set LLM_MIN_OLLAMA_GPU_RATIO=0 in .env to allow this."
+            )
+        logger.info("Ollama model '%s' is %.0f%% GPU-resident - proceeding.", bare_model, ratio * 100)
+
+    @staticmethod
+    def _find_loaded_ollama_model(base: str, bare_model: str) -> Optional[dict]:
+        resp = requests.get(f"{base}/api/ps", timeout=10)
+        resp.raise_for_status()
+        for entry in resp.json().get("models", []):
+            if entry.get("model") == bare_model or entry.get("name") == bare_model:
+                return entry
+        return None
 
     @staticmethod
     def _fallback_clip(candidate: ClipCandidate, transcript: str) -> CandidateClip:
