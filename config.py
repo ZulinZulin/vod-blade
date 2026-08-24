@@ -284,6 +284,7 @@ class ExportConfig:
     default_timeline_height: int = 1080
     export_dir: Path = EXPORTS_DIR
     ffprobe_binary: str = os.getenv("FFPROBE_BINARY", "ffprobe")
+    ffmpeg_binary: str = os.getenv("FFMPEG_BINARY", "ffmpeg")
 
     # DaVinci Resolve scripting API integration paths (per-OS defaults;
     # override via env if Resolve is installed non-standard).

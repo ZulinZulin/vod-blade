@@ -16,6 +16,8 @@ Layout:
 from __future__ import annotations
 
 import logging
+import re
+import sys
 from dataclasses import replace
 from functools import partial
 from typing import List
@@ -29,12 +31,41 @@ from config import settings
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod
 from core.llm_agent import DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError
+from core.preview import PreviewError, extract_preview_clip
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
 from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
 
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
+
+
+class _BenignProactorResetFilter(logging.Filter):
+    """
+    Windows' ProactorEventLoop logs a spurious ERROR (WinError 10054, "connection
+    forcibly closed") whenever a client aborts an HTTP connection mid-transfer -
+    which browsers do constantly while scrubbing/seeking a <video> element, since
+    each seek cancels the in-flight range request and issues a new one. The
+    socket is already gone by the time cleanup runs; this is a known, harmless
+    asyncio/Windows quirk (never fully fixed upstream), not an application bug.
+    Only this exact known-benign case is dropped - any other asyncio error still
+    logs normally.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if not isinstance(exc, ConnectionResetError):
+            return True
+        tb = record.exc_info[2]
+        while tb is not None:
+            if tb.tb_frame.f_code.co_name == "_call_connection_lost":
+                return False
+            tb = tb.tb_next
+        return True
+
+
+if sys.platform == "win32":
+    logging.getLogger("asyncio").addFilter(_BenignProactorResetFilter())
 
 MAX_CLIP_CARDS = 12  # cards rendered per page
 CARD_WINDOW_PADDING_S = 180.0
@@ -106,31 +137,42 @@ def _format_full_transcript(subtitles: List[SubtitleSegment]) -> str:
     )
 
 
-_CARD_TRANSCRIPT_MAX_CHARS = 400
+_TIMECODE_PREFIX_RE = re.compile(r"\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*")
+_CARD_TRANSCRIPT_LINES = 6  # fixed visible height; longer excerpts scroll inside it rather than growing the card
 
 
 def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
     if not clip.is_clip_worthy:
         reason = clip.rejection_reason or "no reason given"
-        body = f"_Rejected by the LLM - statistical spike, but nothing notable found: {reason}_"
+        body = f"_Rejected: {reason}_"
         header = f"**#{rank}. [REJECTED] {clip.title}**"
     else:
         fallback_note = " _(fallback - LLM did not return a valid suggestion)_" if clip.used_fallback else ""
-        body = clip.summary
+        # rejection_reason is deliberately never cleared on manual approval, so a clip
+        # that was flagged (by the LLM or a prior manual reject) before being approved
+        # still surfaces that context here instead of silently losing it.
+        override_note = (
+            f"\n\n_Note: previously flagged before being manually approved - reason: {clip.rejection_reason}_"
+            if clip.rejection_reason else ""
+        )
+        body = f"{clip.summary}{override_note}"
         header = f"**#{rank}. {clip.title}**{fallback_note}"
-
-    excerpt = clip.transcript_excerpt.replace("\n", " ")
-    if len(excerpt) > _CARD_TRANSCRIPT_MAX_CHARS:
-        excerpt = excerpt[:_CARD_TRANSCRIPT_MAX_CHARS].rstrip() + "..."
 
     return (
         f"{header}\n\n"
         f"{body}\n\n"
         f"**{_format_hms(clip.start_time)} -> {_format_hms(clip.end_time)}**  "
         f"({clip.duration:.1f}s)  |  Viral score: **{clip.viral_score}/10**\n\n"
-        f"Chat spike at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f})\n\n"
-        f"> {excerpt or '(no transcript captured for this range)'}"
+        f"Chat spike at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f})"
     )
+
+
+def _format_card_transcript(clip: CandidateClip) -> str:
+    """Full subtitle excerpt for a card, timecodes stripped. Not truncated - the UI
+    renders this in a fixed-height textbox that scrolls internally for longer excerpts,
+    so the card itself doesn't grow but the operator can still read the whole thing."""
+    excerpt = _TIMECODE_PREFIX_RE.sub("", clip.transcript_excerpt.replace("\n", " "))
+    return excerpt or "(no transcript captured for this range)"
 
 
 def _visible_clips(clips: List[CandidateClip], show_rejected: bool) -> List[CandidateClip]:
@@ -155,26 +197,40 @@ def _page_label(clips: List[CandidateClip], page: int) -> str:
     return f"Showing clips **{lo}-{hi}** of **{len(clips)}** (page {page + 1}/{_total_pages(clips)})"
 
 
+_TOGGLE_LABEL_ACCEPTED = "Reject this clip"
+_TOGGLE_LABEL_REJECTED = "Un-reject (restore)"
+
+
 def _build_card_updates(clips: List[CandidateClip], page: int):
-    """Returns MAX_CLIP_CARDS * (group, markdown, start_slider, end_slider) gr.update() tuples for one page."""
+    """Returns MAX_CLIP_CARDS * (group, markdown, transcript, start_slider, end_slider, preview_video, toggle_btn) gr.update() tuples for one page."""
     page = _clamp_page(page, clips)
     start = page * MAX_CLIP_CARDS
     page_clips = clips[start:start + MAX_CLIP_CARDS]
 
     updates = []
     for i in range(MAX_CLIP_CARDS):
+        # A card switching to a different clip (new page, filter toggle, re-run) must drop
+        # any preview clip generated for whatever candidate previously occupied this slot -
+        # otherwise the operator would see a stale preview under the wrong card.
         if i < len(page_clips):
             clip = page_clips[i]
             lo = max(0.0, clip.spike_time - CARD_WINDOW_PADDING_S)
             hi = clip.spike_time + CARD_WINDOW_PADDING_S
+            toggle_label = _TOGGLE_LABEL_ACCEPTED if clip.is_clip_worthy else _TOGGLE_LABEL_REJECTED
             updates.extend([
                 gr.update(visible=True),
                 gr.update(value=_format_card_markdown(clip, start + i + 1)),
+                gr.update(value=_format_card_transcript(clip)),
                 gr.update(minimum=lo, maximum=hi, value=clip.start_time, step=0.1),
                 gr.update(minimum=lo, maximum=hi, value=clip.end_time, step=0.1),
+                gr.update(value=None, visible=False),
+                gr.update(value=toggle_label),
             ])
         else:
-            updates.extend([gr.update(visible=False), gr.update(value=""), gr.update(), gr.update()])
+            updates.extend([
+                gr.update(visible=False), gr.update(value=""), gr.update(value=""), gr.update(), gr.update(),
+                gr.update(value=None, visible=False), gr.update(value=_TOGGLE_LABEL_ACCEPTED),
+            ])
     return updates
 
 
@@ -212,6 +268,71 @@ def _sync_bound(
     updated = list(clips)
     updated[real_idx] = replace(target, **{field_name: value})
     return updated
+
+
+_MANUAL_REJECTION_REASON = "Manually rejected by operator"
+
+
+def do_toggle_worthy(clips: List[CandidateClip], show_rejected: bool, page: int, idx: int):
+    """
+    Manually overrides the LLM's accept/reject verdict for one card. Unlike
+    _sync_bound, this can change which clips are *visible* (a newly-rejected
+    clip vanishes, a newly-approved one appears, whenever "show rejected" is
+    off) - so the whole page is re-rendered afterward instead of patching just
+    this card, keeping pagination and card slots consistent.
+    """
+    visible = _visible_clips(clips, show_rejected)
+    local_pos = _clamp_page(page, visible) * MAX_CLIP_CARDS + idx
+    if local_pos >= len(visible):
+        return (clips, page, _page_label(visible, page), *_build_card_updates(visible, page))
+
+    target = visible[local_pos]
+    real_idx = next(i for i, c in enumerate(clips) if c is target)
+    updated = list(clips)
+    if target.is_clip_worthy:
+        updated[real_idx] = replace(target, is_clip_worthy=False, rejection_reason=_MANUAL_REJECTION_REASON)
+    else:
+        # rejection_reason is deliberately left as-is (see _format_card_markdown) so the
+        # LLM's original call - or a prior manual rejection - stays visible for reference.
+        updated[real_idx] = replace(target, is_clip_worthy=True)
+
+    new_visible = _visible_clips(updated, show_rejected)
+    new_page = _clamp_page(page, new_visible)
+    return (updated, new_page, _page_label(new_visible, new_page), *_build_card_updates(new_visible, new_page))
+
+
+def do_unreject_all_manual(clips: List[CandidateClip], show_rejected: bool, page: int):
+    """
+    Restores every clip the OPERATOR manually rejected, leaving the LLM's own
+    rejections untouched. Distinguished via the sentinel rejection_reason
+    do_toggle_worthy sets on manual rejection - the LLM never produces that
+    exact string on its own, so it's a reliable marker of operator origin.
+    """
+    is_manual_reject = lambda c: not c.is_clip_worthy and c.rejection_reason == _MANUAL_REJECTION_REASON
+    count = sum(1 for c in clips if is_manual_reject(c))
+    updated = [replace(c, is_clip_worthy=True) if is_manual_reject(c) else c for c in clips]
+
+    if count == 0:
+        gr.Warning("No manually-rejected clips to restore.")
+    else:
+        gr.Info(f"Restored {count} manually-rejected clip(s). LLM rejections were left untouched.")
+
+    new_visible = _visible_clips(updated, show_rejected)
+    new_page = _clamp_page(page, new_visible)
+    return (updated, new_page, _page_label(new_visible, new_page), *_build_card_updates(new_visible, new_page))
+
+
+def do_preview_clip(source_video_path: str, start_time: float, end_time: float):
+    """Extracts and plays the card's current start/end range (live slider values,
+    including any manual edits) from the local source video - lets an operator
+    quickly see/hear a candidate beyond its subtitle snippet."""
+    if not source_video_path:
+        raise gr.Error("Please provide the local source video path to preview clips.")
+    try:
+        out_path = extract_preview_clip(source_video_path, start_time, end_time)
+    except PreviewError as exc:
+        raise gr.Error(str(exc))
+    return gr.update(value=str(out_path), visible=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -632,10 +753,12 @@ def build_app() -> gr.Blocks:
         clips_state = gr.State([])
         page_state = gr.State(0)
 
-        show_rejected_checkbox = gr.Checkbox(
-            label="Show rejected candidates (statistical spikes the LLM judged not notable)",
-            value=False,
-        )
+        with gr.Row():
+            show_rejected_checkbox = gr.Checkbox(
+                label="Show rejected candidates (statistical spikes the LLM judged not notable)",
+                value=False,
+            )
+            unreject_all_btn = gr.Button("Un-reject all (manual only)", size="sm")
         with gr.Row():
             prev_page_btn = gr.Button("< Prev", size="sm")
             page_label = gr.Markdown("No clips yet - run an analysis.")
@@ -645,10 +768,22 @@ def build_app() -> gr.Blocks:
         for _ in range(MAX_CLIP_CARDS):
             with gr.Group(visible=False) as card_group:
                 card_md = gr.Markdown()
+                card_transcript = gr.Textbox(
+                    lines=_CARD_TRANSCRIPT_LINES, max_lines=_CARD_TRANSCRIPT_LINES,
+                    interactive=False, show_label=False,
+                )
                 with gr.Row():
                     start_slider = gr.Slider(label="Start (seconds into VOD)", minimum=0, maximum=1, step=0.1)
                     end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
-            card_components.append({"group": card_group, "md": card_md, "start": start_slider, "end": end_slider})
+                with gr.Row():
+                    preview_btn = gr.Button("Preview clip", size="sm")
+                    toggle_btn = gr.Button(_TOGGLE_LABEL_ACCEPTED, size="sm")
+                preview_video = gr.Video(visible=False, height=240)
+            card_components.append({
+                "group": card_group, "md": card_md, "transcript": card_transcript,
+                "start": start_slider, "end": end_slider,
+                "preview_btn": preview_btn, "video": preview_video, "toggle_btn": toggle_btn,
+            })
 
         gr.Markdown("### 5. Export")
         resolve_hint = (
@@ -669,7 +804,9 @@ def build_app() -> gr.Blocks:
 
         card_outputs = []
         for c in card_components:
-            card_outputs.extend([c["group"], c["md"], c["start"], c["end"]])
+            card_outputs.extend([
+                c["group"], c["md"], c["transcript"], c["start"], c["end"], c["video"], c["toggle_btn"],
+            ])
 
         reset_system_prompt_btn.click(
             fn=lambda: DEFAULT_SYSTEM_PROMPT,
@@ -724,6 +861,11 @@ def build_app() -> gr.Blocks:
             inputs=[clips_state, show_rejected_checkbox, page_state],
             outputs=[page_state, page_label, *card_outputs],
         )
+        unreject_all_btn.click(
+            fn=do_unreject_all_manual,
+            inputs=[clips_state, show_rejected_checkbox, page_state],
+            outputs=[clips_state, page_state, page_label, *card_outputs],
+        )
 
         for idx, c in enumerate(card_components):
             c["start"].release(
@@ -735,6 +877,16 @@ def build_app() -> gr.Blocks:
                 fn=partial(_sync_bound, idx=idx, field_name="end_time"),
                 inputs=[clips_state, show_rejected_checkbox, page_state, c["end"]],
                 outputs=[clips_state],
+            )
+            c["preview_btn"].click(
+                fn=do_preview_clip,
+                inputs=[source_video_input, c["start"], c["end"]],
+                outputs=[c["video"]],
+            )
+            c["toggle_btn"].click(
+                fn=partial(do_toggle_worthy, idx=idx),
+                inputs=[clips_state, show_rejected_checkbox, page_state],
+                outputs=[clips_state, page_state, page_label, *card_outputs],
             )
 
         export_files_btn.click(
