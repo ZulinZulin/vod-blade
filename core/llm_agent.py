@@ -218,6 +218,32 @@ def format_transcript(segments: List[SubtitleSegment]) -> str:
     return "\n".join(f"[{seg.start:.1f}-{seg.end:.1f}] {seg.text}" for seg in segments) or "(no transcript available)"
 
 
+def build_stat_only_clip(
+    candidate: ClipCandidate, transcript: str, summary: str, used_fallback: bool,
+) -> CandidateClip:
+    """
+    Builds a CandidateClip straight from the raw chat-spike window, with no LLM
+    involvement at all - shared by the retry-exhaustion fallback path below and
+    by the UI's "skip LLM judging" option (for quickly reviewing/tuning the
+    statistical spike detection itself without waiting on real LLM calls).
+    is_clip_worthy defaults to True either way, since there's no judgment to
+    reject them - the operator uses the existing manual accept/reject tools to
+    curate a raw candidate list by hand instead.
+    """
+    return CandidateClip(
+        start_time=candidate.window_start,
+        end_time=candidate.window_end,
+        title=f"Chat hype spike at {candidate.spike_time:.0f}s",
+        viral_score=min(10, max(1, round(candidate.peak_z_score))),
+        summary=summary,
+        spike_time=candidate.spike_time,
+        peak_hype_score=candidate.peak_hype_score,
+        peak_z_score=candidate.peak_z_score,
+        transcript_excerpt=transcript,
+        used_fallback=used_fallback,
+    )
+
+
 def _build_user_prompt(candidate: ClipCandidate, transcript: str, content_hint: str = "") -> str:
     hint_line = f"\nContext from the operator about this stream: {content_hint}\n" if content_hint and content_hint.strip() else ""
     return (
@@ -288,7 +314,10 @@ class LLMAgent:
 
         suggestion = self._call_llm_with_retries(candidate, transcript, content_hint)
         if suggestion is None:
-            return self._fallback_clip(candidate, transcript)
+            return build_stat_only_clip(
+                candidate, transcript, "Auto-generated fallback clip (LLM refinement unavailable).",
+                used_fallback=True,
+            )
 
         is_clip_worthy = suggestion.is_clip_worthy
         rejection_reason = suggestion.rejection_reason if not is_clip_worthy else None
@@ -519,22 +548,6 @@ class LLMAgent:
             if entry.get("model") == bare_model or entry.get("name") == bare_model:
                 return entry
         return None
-
-    @staticmethod
-    def _fallback_clip(candidate: ClipCandidate, transcript: str) -> CandidateClip:
-        """Used when the LLM never produces a valid response: keep the raw chat-spike window."""
-        return CandidateClip(
-            start_time=candidate.window_start,
-            end_time=candidate.window_end,
-            title=f"Chat hype spike at {candidate.spike_time:.0f}s",
-            viral_score=min(10, max(1, round(candidate.peak_z_score))),
-            summary="Auto-generated fallback clip (LLM refinement unavailable).",
-            spike_time=candidate.spike_time,
-            peak_hype_score=candidate.peak_hype_score,
-            peak_z_score=candidate.peak_z_score,
-            transcript_excerpt=transcript,
-            used_fallback=True,
-        )
 
 
 # --------------------------------------------------------------------------- #

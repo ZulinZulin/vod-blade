@@ -6,11 +6,15 @@ Gradio front-end tying the whole StreamCutter pipeline together:
     fetchers -> chat_analyzer -> llm_agent -> exporters
 
 Layout:
-    1. Sources        - YouTube/subtitle input, Twitch VOD input, chat offset, local source video path
-    2. Hype timeline   - interactive Plotly graph of chat hype score with detected spikes
-    3. Subtitles       - collapsible full transcript preview, for verifying language/content
-    4. Clip candidates - one card per candidate with editable start/end sliders
-    5. Export          - "Download FCPXML/EDL" and "Inject into DaVinci Resolve"
+    Sources & Settings - collapsible accordion at the top (Sources plus all advanced settings
+                          behind their own nested accordions), full-width but collapses down to
+                          a single header line once a run is underway - it doesn't need to stay
+                          expanded, and unlike a side column it costs no permanent horizontal
+                          space either way.
+    Hype timeline      - interactive Plotly graph of chat hype score with detected spikes
+    Subtitles          - collapsible full transcript preview, for verifying language/content
+    Clip candidates    - one card per candidate with editable start/end sliders
+    Export             - "Download FCPXML/EDL" and "Inject into DaVinci Resolve"
 """
 
 from __future__ import annotations
@@ -33,7 +37,10 @@ from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
     FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod, get_twitch_vod_title,
 )
-from core.llm_agent import DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError
+from core.llm_agent import (
+    DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError,
+    build_stat_only_clip, format_transcript, select_subtitle_window,
+)
 from core.preview import PreviewError, extract_preview_clip, extract_thumbnail
 from core.session_store import (
     SessionError, delete_session, list_sessions, load_session, purge_sessions, save_session,
@@ -506,6 +513,7 @@ def run_pipeline(
     llm_model: str,
     llm_api_base: str,
     llm_api_key: str,
+    skip_llm: bool,
     progress=gr.Progress(),
 ):
     # Gradio Textbox/Dropdown components default to value=None (not "") when left
@@ -528,7 +536,7 @@ def run_pipeline(
         raise gr.Error("Max merged candidate duration must be a positive number.")
     if min_viral_score is None or not (1 <= min_viral_score <= 10):
         raise gr.Error("Minimum viral score must be between 1 and 10.")
-    if llm_provider in ("openai", "deepseek") and not (llm_api_key.strip() or settings.llm.api_key):
+    if not skip_llm and llm_provider in ("openai", "deepseek") and not (llm_api_key.strip() or settings.llm.api_key):
         raise gr.Error(
             f"No API key configured for provider '{llm_provider}'. Enter one above, or set "
             "LLM_API_KEY in .env if you'd rather not paste it into the UI each time."
@@ -565,31 +573,45 @@ def run_pipeline(
             "above for a quieter stream, or double check the chat offset."
         )
 
-    progress(0.75, desc="Asking the LLM to judge and refine clip boundaries...")
-    llm_cfg = replace(
-        settings.llm,
-        provider=llm_provider,
-        model=llm_model.strip() or None,
-        api_base=llm_api_base.strip() or None,
-        api_key=llm_api_key.strip() or settings.llm.api_key,
-        min_viral_score=int(min_viral_score),
-    )
-
-    def _report_judging_progress(completed: int, total: int) -> None:
-        # LLM judging is the slowest, most opaque phase of a run (real calls against
-        # a local/cloud model, one per candidate) - a per-candidate readout here
-        # replaces the single static "judging..." message with visible forward motion.
-        fraction = 0.75 + 0.25 * (completed / total if total else 1.0)
-        progress(fraction, desc=f"Judging candidate {completed}/{total}...")
-
-    # accepted + rejected, both kept
-    agent = LLMAgent(config=llm_cfg, system_prompt=system_prompt)
-    try:
-        refined_clips = agent.refine_candidates(
-            candidates, subtitles, content_hint=content_hint, progress_callback=_report_judging_progress,
+    if skip_llm:
+        # Fast path for tuning hype detection or testing the UI without waiting on real LLM
+        # calls: build clips straight from the raw statistical candidates, no judgment at all.
+        # All default to is_clip_worthy=True since nothing has judged them one way or the
+        # other - the operator curates the list by hand with the existing accept/reject tools.
+        progress(0.9, desc="Skipping LLM judging - building candidates from raw statistics...")
+        refined_clips = [
+            build_stat_only_clip(
+                c, format_transcript(select_subtitle_window(subtitles, c.window_start, c.window_end)),
+                "LLM judging skipped - raw statistical candidate, not reviewed.", used_fallback=False,
+            )
+            for c in candidates
+        ]
+    else:
+        progress(0.75, desc="Asking the LLM to judge and refine clip boundaries...")
+        llm_cfg = replace(
+            settings.llm,
+            provider=llm_provider,
+            model=llm_model.strip() or None,
+            api_base=llm_api_base.strip() or None,
+            api_key=llm_api_key.strip() or settings.llm.api_key,
+            min_viral_score=int(min_viral_score),
         )
-    except OllamaGpuOffloadError as exc:
-        raise gr.Error(str(exc))
+
+        def _report_judging_progress(completed: int, total: int) -> None:
+            # LLM judging is the slowest, most opaque phase of a run (real calls against
+            # a local/cloud model, one per candidate) - a per-candidate readout here
+            # replaces the single static "judging..." message with visible forward motion.
+            fraction = 0.75 + 0.25 * (completed / total if total else 1.0)
+            progress(fraction, desc=f"Judging candidate {completed}/{total}...")
+
+        # accepted + rejected, both kept
+        agent = LLMAgent(config=llm_cfg, system_prompt=system_prompt)
+        try:
+            refined_clips = agent.refine_candidates(
+                candidates, subtitles, content_hint=content_hint, progress_callback=_report_judging_progress,
+            )
+        except OllamaGpuOffloadError as exc:
+            raise gr.Error(str(exc))
     refined_clips.sort(key=lambda c: c.viral_score, reverse=True)
     rejected_count = sum(1 for c in refined_clips if not c.is_clip_worthy)
     kept_count = len(refined_clips) - rejected_count
@@ -785,137 +807,178 @@ def do_inject_resolve(clips: List[CandidateClip], source_video_path: str):
 # UI
 # --------------------------------------------------------------------------- #
 
+_CUSTOM_CSS = """
+.gradio-container {
+    max-width: 1500px !important;
+    margin: 0 auto !important;
+    /* overflow-x is a safety net: even if something below still miscalculates,
+       the page clips/scrolls internally instead of the whole UI growing wider. */
+    overflow-x: hidden !important;
+    /* Inherited by all descendants: a long unbroken string (a file path, a VOD
+       title with no spaces) wraps inside its box instead of forcing it wider. */
+    overflow-wrap: anywhere;
+}
+/* Flexbox items default to min-width: auto, meaning a flex child refuses to
+   shrink below its CONTENT's natural width - so one long unbroken line of text,
+   or a Plotly graph's initial intrinsic size, silently drags its entire chain of
+   parent Rows/Columns (and therefore the whole page) wider. This resets that
+   default across the board so width: 100% / wrapping actually take effect;
+   harmless on non-flex-item elements. */
+.gradio-container * {
+    min-width: 0;
+}
+/* Markdown renders a backtick-quoted path as inline <code>, and the theme sets
+   its own explicit white-space/overflow-wrap on code/pre - an explicit value
+   always wins over the inherited one above regardless of selector specificity,
+   so the container-level overflow-wrap alone silently never reaches these. */
+.gradio-container code, .gradio-container pre {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere !important;
+}
+.candidate-grid {
+    flex-wrap: wrap !important;
+}
+.candidate-card {
+    flex: 1 1 calc(50% - 8px) !important;
+    min-width: 380px !important;
+}
+"""
+
 
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="StreamCutter") as demo:
         gr.Markdown("# StreamCutter\nTurn Twitch chat hype spikes into DaVinci Resolve-ready viral clips.")
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown("### 1. Sources")
-                youtube_input = gr.Textbox(
-                    label="YouTube URL or local .srt/.vtt/.txt transcript path",
-                    placeholder="https://youtube.com/watch?v=... or C:\\path\\to\\transcript.srt",
+        with gr.Accordion("Sources & Settings", open=True):
+            gr.Markdown("### Sources")
+            youtube_input = gr.Textbox(
+                label="YouTube URL or local .srt/.vtt/.txt transcript path",
+                placeholder="https://youtube.com/watch?v=... or C:\\path\\to\\transcript.srt",
+            )
+            twitch_input = gr.Textbox(
+                label="Twitch VOD URL or ID",
+                placeholder="https://twitch.tv/videos/123456789",
+            )
+            offset_input = gr.Number(
+                label="Chat offset (s) - Twitch clock minus YouTube clock",
+                value=settings.fetcher.default_chat_offset_seconds,
+            )
+            source_video_input = gr.Textbox(
+                label="Local source video path (used by exports)",
+                placeholder=r"C:\path\to\downloaded_video.mp4",
+            )
+            with gr.Row():
+                vod_quality_input = gr.Textbox(
+                    label="VOD download quality",
+                    value=settings.fetcher.twitch_video_quality,
+                    placeholder="best, worst, audio_only, or a resolution like 720p60",
                 )
-                twitch_input = gr.Textbox(
-                    label="Twitch VOD URL or ID",
-                    placeholder="https://twitch.tv/videos/123456789",
+                download_vod_btn = gr.Button("Download VOD")
+            download_status = gr.Markdown("")
+            with gr.Accordion("Hype detection settings (advanced)", open=False):
+                with gr.Row():
+                    z_threshold_input = gr.Slider(
+                        label="Z-score threshold (higher = fewer, stronger-only spikes)",
+                        minimum=1.0, maximum=6.0, step=0.1,
+                        value=settings.hype.z_score_threshold,
+                    )
+                    min_gap_input = gr.Slider(
+                        label="Min seconds between spikes",
+                        minimum=0, maximum=300, step=5,
+                        value=settings.hype.min_seconds_between_spikes,
+                    )
+                with gr.Row():
+                    pre_spike_input = gr.Slider(
+                        label="Seconds before spike (window start)",
+                        minimum=0, maximum=180, step=5,
+                        value=settings.hype.pre_spike_seconds,
+                    )
+                    post_spike_input = gr.Slider(
+                        label="Seconds after spike (window end)",
+                        minimum=0, maximum=180, step=5,
+                        value=settings.hype.post_spike_seconds,
+                    )
+                max_merged_duration_input = gr.Slider(
+                    label="Max merged candidate duration (s) - caps how many nearby spikes can chain-merge into one window",
+                    minimum=30, maximum=600, step=10,
+                    value=settings.hype.max_merged_duration_seconds,
                 )
-                offset_input = gr.Number(
-                    label="Chat offset (s) - Twitch clock minus YouTube clock",
-                    value=settings.fetcher.default_chat_offset_seconds,
-                )
-                source_video_input = gr.Textbox(
-                    label="Local source video path (used by exports)",
-                    placeholder=r"C:\path\to\downloaded_video.mp4",
+            with gr.Accordion("LLM provider (advanced)", open=False):
+                llm_provider_input = gr.Dropdown(
+                    label="LLM provider",
+                    choices=["openai", "deepseek", "ollama", "openrouter", "nanogpt"],
+                    value=settings.llm.provider,
                 )
                 with gr.Row():
-                    vod_quality_input = gr.Textbox(
-                        label="VOD download quality",
-                        value=settings.fetcher.twitch_video_quality,
-                        placeholder="best, worst, audio_only, or a resolution like 720p60",
+                    llm_model_input = gr.Dropdown(
+                        label="Model (optional - blank uses the provider's default; type to search, "
+                              "or click 'Fetch models' for a live list)",
+                        choices=[settings.llm.model] if settings.llm.model else [],
+                        value=settings.llm.model or "",
+                        allow_custom_value=True,
+                        filterable=True,
                     )
-                    download_vod_btn = gr.Button("Download VOD")
-                download_status = gr.Markdown("")
-                with gr.Accordion("Hype detection settings (advanced)", open=False):
-                    with gr.Row():
-                        z_threshold_input = gr.Slider(
-                            label="Z-score threshold (higher = fewer, stronger-only spikes)",
-                            minimum=1.0, maximum=6.0, step=0.1,
-                            value=settings.hype.z_score_threshold,
-                        )
-                        min_gap_input = gr.Slider(
-                            label="Min seconds between spikes",
-                            minimum=0, maximum=300, step=5,
-                            value=settings.hype.min_seconds_between_spikes,
-                        )
-                    with gr.Row():
-                        pre_spike_input = gr.Slider(
-                            label="Seconds before spike (window start)",
-                            minimum=0, maximum=180, step=5,
-                            value=settings.hype.pre_spike_seconds,
-                        )
-                        post_spike_input = gr.Slider(
-                            label="Seconds after spike (window end)",
-                            minimum=0, maximum=180, step=5,
-                            value=settings.hype.post_spike_seconds,
-                        )
-                    max_merged_duration_input = gr.Slider(
-                        label="Max merged candidate duration (s) - caps how many nearby spikes can chain-merge into one window",
-                        minimum=30, maximum=600, step=10,
-                        value=settings.hype.max_merged_duration_seconds,
+                    fetch_models_btn = gr.Button("Fetch models from API", size="sm")
+                with gr.Row():
+                    llm_api_base_input = gr.Textbox(
+                        label="API base URL (optional - blank uses the provider's default)",
+                        value=settings.llm.api_base or "",
+                        placeholder="e.g. https://nano-gpt.com/api/v1",
                     )
-                with gr.Accordion("LLM provider (advanced)", open=False):
-                    llm_provider_input = gr.Dropdown(
-                        label="LLM provider",
-                        choices=["openai", "deepseek", "ollama", "openrouter", "nanogpt"],
-                        value=settings.llm.provider,
-                    )
-                    with gr.Row():
-                        llm_model_input = gr.Dropdown(
-                            label="Model (optional - blank uses the provider's default; type to search, "
-                                  "or click 'Fetch models' for a live list)",
-                            choices=[settings.llm.model] if settings.llm.model else [],
-                            value=settings.llm.model or "",
-                            allow_custom_value=True,
-                            filterable=True,
-                        )
-                        fetch_models_btn = gr.Button("Fetch models from API", size="sm")
-                    with gr.Row():
-                        llm_api_base_input = gr.Textbox(
-                            label="API base URL (optional - blank uses the provider's default)",
-                            value=settings.llm.api_base or "",
-                            placeholder="e.g. https://nano-gpt.com/api/v1",
-                        )
-                        llm_api_key_input = gr.Textbox(
-                            label="API key (optional - blank uses LLM_API_KEY from .env; ignored for Ollama)",
-                            value="",
-                            type="password",
-                        )
-                    gr.Markdown(
-                        "_openrouter and nanogpt are third-party aggregators exposing many underlying "
-                        "models - 'Fetch models from API' lists what's actually available from whichever "
-                        "provider/API base/key is set above (needs a valid key for most providers). Local "
-                        "Ollama note: the app can detect the model being evicted to CPU/RAM, but not GPU "
-                        "**compute** contention - another GPU-heavy app (image/video generation, games) "
-                        "running at the same time can still make judgment run dramatically slower with no "
-                        "error, even while the model stays fully loaded on the GPU. Close other GPU-heavy "
-                        "applications for best performance._"
-                    )
-                with gr.Accordion("LLM judgment settings (advanced)", open=False):
-                    min_viral_score_input = gr.Slider(
-                        label="Minimum viral score to keep (1-10) - clips the LLM itself scores below "
-                              "this are rejected even if it called them worthy",
-                        minimum=1, maximum=10, step=1,
-                        value=settings.llm.min_viral_score,
-                    )
-                    content_hint_input = gr.Textbox(
-                        label="Stream context hint for the LLM (optional)",
+                    llm_api_key_input = gr.Textbox(
+                        label="API key (optional - blank uses LLM_API_KEY from .env; ignored for Ollama)",
                         value="",
-                        placeholder="e.g. 'podcast, lots of talking - be strict about what counts as "
-                                    "notable' or 'fast-paced gaming stream'",
+                        type="password",
                     )
-                with gr.Accordion("System prompt (advanced - edit with care)", open=False):
-                    gr.Markdown(
-                        "_This is the full instruction set the LLM judges every candidate against. "
-                        "Edit it to change how judgment works; leave it as-is otherwise. If your edit "
-                        "breaks the required JSON output format, calls will fail validation and those "
-                        "candidates fall back to their raw chat-spike window instead of crashing._"
-                    )
-                    system_prompt_input = gr.Textbox(
-                        value=DEFAULT_SYSTEM_PROMPT,
-                        lines=20,
-                        max_lines=60,
-                        show_label=False,
-                    )
-                    reset_system_prompt_btn = gr.Button("Reset to default", size="sm")
-                run_btn = gr.Button("Analyze Stream", variant="primary")
-                status_box = gr.Markdown("")
-            with gr.Column(scale=2):
-                gr.Markdown("### 2. Chat Hype Timeline")
-                hype_plot = gr.Plot()
+                gr.Markdown(
+                    "_openrouter and nanogpt are third-party aggregators exposing many underlying "
+                    "models - 'Fetch models from API' lists what's actually available from whichever "
+                    "provider/API base/key is set above (needs a valid key for most providers). Local "
+                    "Ollama note: the app can detect the model being evicted to CPU/RAM, but not GPU "
+                    "**compute** contention - another GPU-heavy app (image/video generation, games) "
+                    "running at the same time can still make judgment run dramatically slower with no "
+                    "error, even while the model stays fully loaded on the GPU. Close other GPU-heavy "
+                    "applications for best performance._"
+                )
+            with gr.Accordion("LLM judgment settings (advanced)", open=False):
+                min_viral_score_input = gr.Slider(
+                    label="Minimum viral score to keep (1-10) - clips the LLM itself scores below "
+                          "this are rejected even if it called them worthy",
+                    minimum=1, maximum=10, step=1,
+                    value=settings.llm.min_viral_score,
+                )
+                content_hint_input = gr.Textbox(
+                    label="Stream context hint for the LLM (optional)",
+                    value="",
+                    placeholder="e.g. 'podcast, lots of talking - be strict about what counts as "
+                                "notable' or 'fast-paced gaming stream'",
+                )
+            with gr.Accordion("System prompt (advanced - edit with care)", open=False):
+                gr.Markdown(
+                    "_This is the full instruction set the LLM judges every candidate against. "
+                    "Edit it to change how judgment works; leave it as-is otherwise. If your edit "
+                    "breaks the required JSON output format, calls will fail validation and those "
+                    "candidates fall back to their raw chat-spike window instead of crashing._"
+                )
+                system_prompt_input = gr.Textbox(
+                    value=DEFAULT_SYSTEM_PROMPT,
+                    lines=20,
+                    max_lines=60,
+                    show_label=False,
+                )
+                reset_system_prompt_btn = gr.Button("Reset to default", size="sm")
+            skip_llm_checkbox = gr.Checkbox(
+                label="Skip LLM judging (raw statistical candidates only - fast, for tuning "
+                      "hype detection or testing without waiting on real LLM calls)",
+                value=False,
+            )
+            run_btn = gr.Button("Analyze Stream", variant="primary")
+            status_box = gr.Markdown("")
 
-        with gr.Accordion("3. Subtitles (verify language / scroll for context around a clip)", open=False):
+        gr.Markdown("### Chat Hype Timeline")
+        hype_plot = gr.Plot()
+
+        with gr.Accordion("Subtitles (verify language / scroll for context around a clip)", open=False):
             subtitles_display = gr.Textbox(
                 value="(no subtitles loaded yet - run an analysis)",
                 lines=15,
@@ -924,7 +987,7 @@ def build_app() -> gr.Blocks:
                 show_label=False,
             )
 
-        gr.Markdown("### 4. Clip Candidates")
+        gr.Markdown("### Clip Candidates")
         clips_state = gr.State([])
         page_state = gr.State(0)
         session_path_state = gr.State(None)
@@ -957,31 +1020,32 @@ def build_app() -> gr.Blocks:
             next_page_btn = gr.Button("Next >", size="sm")
 
         card_components = []
-        for _ in range(MAX_CLIP_CARDS):
-            with gr.Group(visible=False) as card_group:
-                # Thumbnail and video share the same slot: the thumbnail is a cheap
-                # auto-generated frame shown by default; clicking it (or "Preview clip")
-                # extracts and swaps in the real playable clip in its place.
-                card_thumbnail = gr.Image(visible=False, interactive=False, show_label=False, height=240)
-                preview_video = gr.Video(visible=False, height=240)
-                card_md = gr.Markdown()
-                card_transcript = gr.Textbox(
-                    lines=_CARD_TRANSCRIPT_LINES, max_lines=_CARD_TRANSCRIPT_LINES,
-                    interactive=False, show_label=False,
-                )
-                with gr.Row():
-                    start_slider = gr.Slider(label="Start (seconds into VOD)", minimum=0, maximum=1, step=0.1)
-                    end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
-                with gr.Row():
-                    preview_btn = gr.Button("Preview clip", size="sm")
-                    toggle_btn = gr.Button(_TOGGLE_LABEL_ACCEPTED, size="sm")
-            card_components.append({
-                "group": card_group, "md": card_md, "transcript": card_transcript, "thumbnail": card_thumbnail,
-                "start": start_slider, "end": end_slider,
-                "preview_btn": preview_btn, "video": preview_video, "toggle_btn": toggle_btn,
-            })
+        with gr.Row(elem_classes=["candidate-grid"]):
+            for _ in range(MAX_CLIP_CARDS):
+                with gr.Group(visible=False, elem_classes=["candidate-card"]) as card_group:
+                    # Thumbnail and video share the same slot: the thumbnail is a cheap
+                    # auto-generated frame shown by default; clicking it (or "Preview clip")
+                    # extracts and swaps in the real playable clip in its place.
+                    card_thumbnail = gr.Image(visible=False, interactive=False, show_label=False, height=240)
+                    preview_video = gr.Video(visible=False, height=240)
+                    card_md = gr.Markdown()
+                    card_transcript = gr.Textbox(
+                        lines=_CARD_TRANSCRIPT_LINES, max_lines=_CARD_TRANSCRIPT_LINES,
+                        interactive=False, show_label=False,
+                    )
+                    with gr.Row():
+                        start_slider = gr.Slider(label="Start (seconds into VOD)", minimum=0, maximum=1, step=0.1)
+                        end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
+                    with gr.Row():
+                        preview_btn = gr.Button("Preview clip", size="sm")
+                        toggle_btn = gr.Button(_TOGGLE_LABEL_ACCEPTED, size="sm")
+                card_components.append({
+                    "group": card_group, "md": card_md, "transcript": card_transcript, "thumbnail": card_thumbnail,
+                    "start": start_slider, "end": end_slider,
+                    "preview_btn": preview_btn, "video": preview_video, "toggle_btn": toggle_btn,
+                })
 
-        gr.Markdown("### 5. Export")
+        gr.Markdown("### Export")
         resolve_hint = (
             "DaVinci Resolve detected and reachable."
             if resolve_is_available()
@@ -1019,6 +1083,7 @@ def build_app() -> gr.Blocks:
                 max_merged_duration_input,
                 min_viral_score_input, content_hint_input, system_prompt_input,
                 llm_provider_input, llm_model_input, llm_api_base_input, llm_api_key_input,
+                skip_llm_checkbox,
             ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
@@ -1138,4 +1203,4 @@ def build_app() -> gr.Blocks:
 
 if __name__ == "__main__":
     app = build_app()
-    app.queue().launch(server_port=7862)
+    app.queue().launch(server_port=7862, theme=gr.themes.Soft(), css=_CUSTOM_CSS)
