@@ -227,6 +227,7 @@ def run_pipeline(
     min_gap: float,
     pre_spike: float,
     post_spike: float,
+    max_merged_duration: float,
     min_viral_score: float,
     content_hint: str,
     system_prompt: str,
@@ -252,6 +253,8 @@ def run_pipeline(
         raise gr.Error("Z-score threshold must be a positive number.")
     if min_gap is None or min_gap < 0 or pre_spike is None or pre_spike < 0 or post_spike is None or post_spike < 0:
         raise gr.Error("Spike spacing/window values must be zero or greater.")
+    if max_merged_duration is None or max_merged_duration <= 0:
+        raise gr.Error("Max merged candidate duration must be a positive number.")
     if min_viral_score is None or not (1 <= min_viral_score <= 10):
         raise gr.Error("Minimum viral score must be between 1 and 10.")
     if llm_provider in ("openai", "deepseek") and not (llm_api_key.strip() or settings.llm.api_key):
@@ -282,6 +285,7 @@ def run_pipeline(
         min_seconds_between_spikes=min_gap,
         pre_spike_seconds=pre_spike,
         post_spike_seconds=post_spike,
+        max_merged_duration_seconds=max_merged_duration,
     )
     candidates, timeline_df = ChatAnalyzer(config=hype_cfg).analyze_with_timeline(messages)
     if not candidates:
@@ -451,7 +455,7 @@ def do_export_files(clips: List[CandidateClip], source_video_path: str):
         raise gr.Error("Please provide the local source video path (needed by the FCPXML asset reference).")
     try:
         fcpxml_path = export_fcpxml_file(accepted, source_video_path)
-        edl_path = export_edl_file(accepted)
+        edl_path = export_edl_file(accepted, source_video_path=source_video_path)
     except ExportError as exc:
         raise gr.Error(str(exc))
     return str(fcpxml_path), str(edl_path)
@@ -540,6 +544,11 @@ def build_app() -> gr.Blocks:
                             minimum=0, maximum=180, step=5,
                             value=settings.hype.post_spike_seconds,
                         )
+                    max_merged_duration_input = gr.Slider(
+                        label="Max merged candidate duration (s) - caps how many nearby spikes can chain-merge into one window",
+                        minimum=30, maximum=600, step=10,
+                        value=settings.hype.max_merged_duration_seconds,
+                    )
                 with gr.Accordion("LLM provider (advanced)", open=False):
                     llm_provider_input = gr.Dropdown(
                         label="LLM provider",
@@ -673,6 +682,7 @@ def build_app() -> gr.Blocks:
             inputs=[
                 youtube_input, twitch_input, offset_input,
                 z_threshold_input, min_gap_input, pre_spike_input, post_spike_input,
+                max_merged_duration_input,
                 min_viral_score_input, content_hint_input, system_prompt_input,
                 llm_provider_input, llm_model_input, llm_api_base_input, llm_api_key_input,
             ],

@@ -126,6 +126,13 @@ class HypeScoreConfig:
     pre_spike_seconds: int = 60
     post_spike_seconds: int = 30
 
+    # ChatAnalyzer._merge_overlapping caps how large a chain of nearby-overlapping
+    # spikes can be fused into before it stops merging - without this, a wide
+    # pre/post_spike_seconds can chain-merge several genuinely distinct moments
+    # (e.g. two unrelated topics 10 minutes apart) into one sprawling candidate
+    # that no LLM can meaningfully judge as a single self-contained moment.
+    max_merged_duration_seconds: float = 300.0
+
     # Weighted components of the raw hype score per bin.
     weight_message_volume: float = 1.0
     weight_emote_frequency: float = 1.5
@@ -268,10 +275,15 @@ class LLMConfig:
 @dataclass(frozen=True)
 class ExportConfig:
     fcpxml_version: str = "1.10"  # widely compatible with Resolve Free & Studio
+    # Fallback ONLY - used when the real source file's frame rate can't be read via
+    # ffprobe (missing binary, unreadable file, etc). Exporters always try ffprobe
+    # first, since assuming a fixed rate silently produces wrong frame math whenever
+    # the actual source file differs (e.g. a 30fps VOD download with this at 60).
     default_fps: float = 60.0
     default_timeline_width: int = 1920
     default_timeline_height: int = 1080
     export_dir: Path = EXPORTS_DIR
+    ffprobe_binary: str = os.getenv("FFPROBE_BINARY", "ffprobe")
 
     # DaVinci Resolve scripting API integration paths (per-OS defaults;
     # override via env if Resolve is installed non-standard).

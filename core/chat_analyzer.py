@@ -229,24 +229,34 @@ class ChatAnalyzer:
             )
             for row in selected
         ]
-        return self._merge_overlapping(candidates)
+        return self._merge_overlapping(candidates, self.cfg.max_merged_duration_seconds)
 
     @staticmethod
-    def _merge_overlapping(candidates: List[ClipCandidate]) -> List[ClipCandidate]:
-        """Adjacent/overlapping spike windows collapse into one clip, keeping the stronger peak."""
+    def _merge_overlapping(candidates: List[ClipCandidate], max_duration: float) -> List[ClipCandidate]:
+        """
+        Adjacent/overlapping spike windows collapse into one clip, keeping the
+        stronger peak - but never past max_duration. Without a cap, a wide
+        pre/post_spike_seconds setting can chain-merge several genuinely
+        distinct, unrelated moments (different topics minutes apart) into one
+        sprawling multi-topic candidate that no LLM can judge as a single
+        self-contained moment - it just anchors on the loudest one and silently
+        drops whatever else is riding along in the same window.
+        """
         if not candidates:
             return candidates
         candidates = sorted(candidates, key=lambda c: c.window_start)
         merged: List[ClipCandidate] = [candidates[0]]
         for cand in candidates[1:]:
             last = merged[-1]
-            if cand.window_start > last.window_end:
+            would_be_end = max(last.window_end, cand.window_end)
+            would_be_duration = would_be_end - last.window_start
+            if cand.window_start > last.window_end or would_be_duration > max_duration:
                 merged.append(cand)
                 continue
             stronger = cand if cand.peak_z_score > last.peak_z_score else last
             merged[-1] = ClipCandidate(
                 window_start=last.window_start,
-                window_end=max(last.window_end, cand.window_end),
+                window_end=would_be_end,
                 spike_time=stronger.spike_time,
                 peak_hype_score=stronger.peak_hype_score,
                 peak_z_score=stronger.peak_z_score,

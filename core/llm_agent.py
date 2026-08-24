@@ -128,11 +128,17 @@ class CandidateClip:
 # --------------------------------------------------------------------------- #
 
 DEFAULT_SYSTEM_PROMPT = """You are a viral video clip editor for Twitch/YouTube content. You are given a \
-transcript excerpt covering a moment where CHAT ACTIVITY SPIKED STATISTICALLY, along with the \
-approximate time window chat reacted to.
+transcript excerpt covering a window where CHAT ACTIVITY SPIKED STATISTICALLY at some point.
 
-STEP 1 - Judge whether this moment is actually worth clipping. A chat spike is only a statistical signal; \
-it does not guarantee anything worth watching happened. Apply a HIGH bar: ordinary conversation, routine \
+IMPORTANT: the reported spike timestamp marks when chat's reaction peaked, NOT when the actual \
+noteworthy moment happened. Chat takes time to read, react, and type - the real hook (the joke, the \
+mistake, the reveal) is very often tens of seconds BEFORE the spike timestamp, not at or after it. \
+Treat the spike timestamp as a rough pointer into the window, not the location of the moment itself. \
+Read the ENTIRE transcript window below and judge it as a whole - do not anchor your search on the \
+content immediately surrounding the spike timestamp.
+
+STEP 1 - Judge whether the window as a whole contains a moment actually worth clipping. A chat spike is \
+only a statistical signal; it does not guarantee anything worth watching happened. Apply a HIGH bar: ordinary conversation, routine \
 explanation, or coherent-but-unremarkable discussion is NOT enough on its own, even if articulate or \
 substantive - most of any stream or podcast is exactly that, and none of it is clip-worthy by default. \
 Only call something clip-worthy if it would make a stranger with zero context stop scrolling: a joke that \
@@ -159,6 +165,21 @@ start_time and end_time - never something that only appears in the surrounding t
 range. If the notable moment you identified falls outside your current start_time/end_time, MOVE the \
 boundaries to include it instead of describing something your own chosen range excludes.
 
+STEP 4 - Score "viral_score" honestly across the FULL 1-10 range. Without deliberate effort, rating \
+scales like this tend to collapse toward a "safe" 7-8 regardless of actual quality - resist that. Use \
+these anchors:
+  - 1-2: weak. Barely worth a look; you almost rejected it.
+  - 3-4: mildly amusing or notable, but forgettable - unlikely to grab a stranger's attention.
+  - 5-6: a solid, genuine reaction. Works for viewers who already like this channel, but isn't the kind \
+of thing that gets shared outside that audience.
+  - 7-8: strong. A stranger with zero context would likely stop scrolling for it, and it could plausibly \
+get shared/reposted.
+  - 9-10: exceptional. Genuine highlight-reel material - reserve this for moments you'd bet on.
+If most of what you see across a stream is honestly mid-tier, most of your scores should land in the 4-6 \
+range - do not inflate scores to sound more decisive than the moment actually warrants. A clip can be \
+is_clip_worthy=true with a viral_score as low as 3 or 4 if it clears STEP 1's bar but isn't exceptional; \
+"worth keeping" and "amazing" are different questions.
+
 Write "title" and "summary" in the SAME language as the transcript (e.g. a Russian transcript gets a \
 Russian title and summary) - never translate them to English unless the transcript itself is in English. \
 All JSON field names and the overall structure must stay exactly as specified below regardless of language.
@@ -170,7 +191,7 @@ Respond with ONLY a single JSON object, no markdown fences, no commentary, match
   "start_time": <float, seconds, absolute video timeline>,
   "end_time": <float, seconds, absolute video timeline>,
   "title": "<punchy clip title in the transcript's language, <=100 chars>",
-  "viral_score": <integer 1-10, confidence this clip goes viral>,
+  "viral_score": <integer 1-10 per the STEP 4 anchors above - use the full range, not just 7-8>,
   "summary": "<one or two sentence summary in the transcript's language, <=280 chars>"
 }
 Even when is_clip_worthy is false, still fill in your best-effort start_time/end_time/title/summary \
@@ -200,13 +221,15 @@ def format_transcript(segments: List[SubtitleSegment]) -> str:
 def _build_user_prompt(candidate: ClipCandidate, transcript: str, content_hint: str = "") -> str:
     hint_line = f"\nContext from the operator about this stream: {content_hint}\n" if content_hint and content_hint.strip() else ""
     return (
-        f"Chat hype spike detected at t={candidate.spike_time:.1f}s "
-        f"(peak hype score={candidate.peak_hype_score:.1f}, z-score={candidate.peak_z_score:.2f}).\n"
-        f"Suggested rough window: {candidate.window_start:.1f}s to {candidate.window_end:.1f}s.\n"
+        f"Transcript window to judge: {candidate.window_start:.1f}s to {candidate.window_end:.1f}s.\n"
+        f"Chat's reaction peaked at t={candidate.spike_time:.1f}s within this window "
+        f"(peak hype score={candidate.peak_hype_score:.1f}, z-score={candidate.peak_z_score:.2f}) - "
+        f"remember this is where chat's reaction peaked, not necessarily where the actual moment is; "
+        f"scan the whole window above rather than just the content near this timestamp.\n"
         f"{hint_line}\n"
         f"Transcript covering this window:\n{transcript}\n\n"
-        "Pick start_time/end_time as absolute seconds on this same timeline, ideally within or close to "
-        "the suggested window and snapped to real subtitle-line boundaries shown above. "
+        "Pick start_time/end_time as absolute seconds on this same timeline, snapped to real "
+        "subtitle-line boundaries shown above, wherever in the window the actual best moment is. "
         "Respond with the JSON object only."
     )
 
