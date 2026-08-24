@@ -23,7 +23,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import litellm
 import requests
@@ -335,6 +335,7 @@ class LLMAgent:
         candidates: List[ClipCandidate],
         subtitles: List[SubtitleSegment],
         content_hint: str = "",
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> List[CandidateClip]:
         """
         Refines a batch of candidates; a single failure never aborts the batch.
@@ -346,16 +347,26 @@ class LLMAgent:
         outside its per-candidate try/except, so a confirmed CPU offload raises
         OllamaGpuOffloadError straight out of this call instead of being caught
         and silently skipped candidate-by-candidate.
+
+        `progress_callback`, if given, is called as (completed_count, total)
+        after each candidate finishes (success or failure alike) - lets a
+        caller (e.g. the Gradio UI) report real per-candidate progress during
+        a long batch instead of one static "judging..." message for the
+        whole run. Kept as a plain callable rather than importing Gradio here,
+        since this module has no business knowing about the UI layer.
         """
         self._ensure_ollama_ready()
         results: List[CandidateClip] = []
-        for candidate in candidates:
+        total = len(candidates)
+        for i, candidate in enumerate(candidates, start=1):
             try:
                 results.append(self.refine_candidate(candidate, subtitles, content_hint))
             except OllamaGpuOffloadError:
                 raise
             except Exception:
                 logger.exception("Unexpected error refining candidate at t=%.1f; skipping.", candidate.spike_time)
+            if progress_callback is not None:
+                progress_callback(i, total)
         return results
 
     # --- internals -----------------------------------------------------------

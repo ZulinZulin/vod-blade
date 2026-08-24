@@ -29,9 +29,10 @@ DATA_DIR: Final[Path] = BASE_DIR / "data"
 CACHE_DIR: Final[Path] = DATA_DIR / "cache"
 DOWNLOADS_DIR: Final[Path] = DATA_DIR / "downloads"
 EXPORTS_DIR: Final[Path] = DATA_DIR / "exports"
+SESSIONS_DIR: Final[Path] = DATA_DIR / "sessions"
 BIN_DIR: Final[Path] = BASE_DIR / "bin"
 
-for _dir in (DATA_DIR, CACHE_DIR, DOWNLOADS_DIR, EXPORTS_DIR, BIN_DIR):
+for _dir in (DATA_DIR, CACHE_DIR, DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, BIN_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 

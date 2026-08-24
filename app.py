@@ -20,7 +20,8 @@ import re
 import sys
 from dataclasses import replace
 from functools import partial
-from typing import List
+from pathlib import Path
+from typing import List, Optional
 
 import gradio as gr
 import pandas as pd
@@ -32,6 +33,7 @@ from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod
 from core.llm_agent import DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError
 from core.preview import PreviewError, extract_preview_clip
+from core.session_store import SessionError, list_sessions, load_session, save_session
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
 from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
@@ -322,6 +324,55 @@ def do_unreject_all_manual(clips: List[CandidateClip], show_rejected: bool, page
     return (updated, new_page, _page_label(new_visible, new_page), *_build_card_updates(new_visible, new_page))
 
 
+# --------------------------------------------------------------------------- #
+# Session persistence
+# --------------------------------------------------------------------------- #
+
+
+def _session_choices():
+    """(label, value) pairs for the sessions dropdown, newest first."""
+    return [(p.name, str(p)) for p in list_sessions()]
+
+
+def do_save_session(
+    clips: List[CandidateClip], source_video_path: str, youtube_source: str,
+    twitch_source: str, chat_offset: float, session_path: Optional[str],
+):
+    if not clips:
+        raise gr.Error("No clips to save yet - run an analysis first.")
+    try:
+        out_path = save_session(
+            clips, source_video_path, youtube_source, twitch_source, chat_offset,
+            session_path=session_path or None,
+        )
+    except SessionError as exc:
+        raise gr.Error(str(exc))
+    gr.Info(f"Session saved to {out_path.name}.")
+    return str(out_path), gr.update(choices=_session_choices(), value=str(out_path))
+
+
+def do_load_session(session_path: Optional[str]):
+    if not session_path:
+        raise gr.Error("Select a saved session to load first.")
+    try:
+        data = load_session(session_path)
+    except SessionError as exc:
+        raise gr.Error(str(exc))
+
+    clips = data["clips"]
+    visible = _visible_clips(clips, show_rejected=False)
+    gr.Info(f"Loaded {len(clips)} clip(s) from {Path(session_path).name}.")
+    return (
+        clips, session_path, data["source_video_path"], data["youtube_source"],
+        data["twitch_source"], data["chat_offset"], gr.update(value=False), 0,
+        _page_label(visible, 0), *_build_card_updates(visible, 0),
+    )
+
+
+def do_refresh_sessions():
+    return gr.update(choices=_session_choices())
+
+
 def do_preview_clip(source_video_path: str, start_time: float, end_time: float):
     """Extracts and plays the card's current start/end range (live slider values,
     including any manual edits) from the local source video - lets an operator
@@ -344,6 +395,7 @@ def run_pipeline(
     youtube_source: str,
     twitch_source: str,
     chat_offset: float,
+    source_video_path: str,
     z_threshold: float,
     min_gap: float,
     pre_spike: float,
@@ -424,10 +476,20 @@ def run_pipeline(
         api_key=llm_api_key.strip() or settings.llm.api_key,
         min_viral_score=int(min_viral_score),
     )
+
+    def _report_judging_progress(completed: int, total: int) -> None:
+        # LLM judging is the slowest, most opaque phase of a run (real calls against
+        # a local/cloud model, one per candidate) - a per-candidate readout here
+        # replaces the single static "judging..." message with visible forward motion.
+        fraction = 0.75 + 0.25 * (completed / total if total else 1.0)
+        progress(fraction, desc=f"Judging candidate {completed}/{total}...")
+
     # accepted + rejected, both kept
     agent = LLMAgent(config=llm_cfg, system_prompt=system_prompt)
     try:
-        refined_clips = agent.refine_candidates(candidates, subtitles, content_hint=content_hint)
+        refined_clips = agent.refine_candidates(
+            candidates, subtitles, content_hint=content_hint, progress_callback=_report_judging_progress,
+        )
     except OllamaGpuOffloadError as exc:
         raise gr.Error(str(exc))
     refined_clips.sort(key=lambda c: c.viral_score, reverse=True)
@@ -449,9 +511,21 @@ def run_pipeline(
     visible = _visible_clips(refined_clips, show_rejected=False)
     page_updates = _build_card_updates(visible, page=0)
     transcript_text = _format_full_transcript(subtitles)
+
+    # Auto-save immediately - judging a real VOD can take a long time (dozens of real
+    # LLM calls), so the result is checkpointed to disk before the operator even starts
+    # reviewing it, rather than living only in the browser's in-memory clips_state.
+    try:
+        session_path = save_session(refined_clips, source_video_path, youtube_source, twitch_source, chat_offset)
+        session_update = gr.update(choices=_session_choices(), value=str(session_path))
+    except SessionError as exc:
+        logger.warning("Auto-save of the finished session failed: %s", exc)
+        session_path = None
+        session_update = gr.update()
+
     return (
         fig, refined_clips, status, 0, gr.update(value=False), _page_label(visible, 0),
-        transcript_text, *page_updates,
+        transcript_text, str(session_path) if session_path else None, session_update, *page_updates,
     )
 
 
@@ -752,6 +826,16 @@ def build_app() -> gr.Blocks:
         gr.Markdown("### 4. Clip Candidates")
         clips_state = gr.State([])
         page_state = gr.State(0)
+        session_path_state = gr.State(None)
+
+        with gr.Row():
+            session_dropdown = gr.Dropdown(
+                label="Saved sessions", choices=_session_choices(), value=None,
+                filterable=True,
+            )
+            refresh_sessions_btn = gr.Button("Refresh", size="sm")
+            load_session_btn = gr.Button("Load session", size="sm")
+            save_session_btn = gr.Button("Save session", size="sm")
 
         with gr.Row():
             show_rejected_checkbox = gr.Checkbox(
@@ -817,7 +901,7 @@ def build_app() -> gr.Blocks:
         run_btn.click(
             fn=run_pipeline,
             inputs=[
-                youtube_input, twitch_input, offset_input,
+                youtube_input, twitch_input, offset_input, source_video_input,
                 z_threshold_input, min_gap_input, pre_spike_input, post_spike_input,
                 max_merged_duration_input,
                 min_viral_score_input, content_hint_input, system_prompt_input,
@@ -825,7 +909,8 @@ def build_app() -> gr.Blocks:
             ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
-                show_rejected_checkbox, page_label, subtitles_display, *card_outputs,
+                show_rejected_checkbox, page_label, subtitles_display,
+                session_path_state, session_dropdown, *card_outputs,
             ],
         )
 
@@ -865,6 +950,21 @@ def build_app() -> gr.Blocks:
             fn=do_unreject_all_manual,
             inputs=[clips_state, show_rejected_checkbox, page_state],
             outputs=[clips_state, page_state, page_label, *card_outputs],
+        )
+
+        refresh_sessions_btn.click(fn=do_refresh_sessions, inputs=[], outputs=[session_dropdown])
+        save_session_btn.click(
+            fn=do_save_session,
+            inputs=[clips_state, source_video_input, youtube_input, twitch_input, offset_input, session_path_state],
+            outputs=[session_path_state, session_dropdown],
+        )
+        load_session_btn.click(
+            fn=do_load_session,
+            inputs=[session_dropdown],
+            outputs=[
+                clips_state, session_path_state, source_video_input, youtube_input, twitch_input, offset_input,
+                show_rejected_checkbox, page_state, page_label, *card_outputs,
+            ],
         )
 
         for idx, c in enumerate(card_components):
