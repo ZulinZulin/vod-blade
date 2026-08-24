@@ -146,7 +146,12 @@ class DavinciResolveExporter:
             raise DavinciAPIError("Could not get the current project's Media Pool.")
 
         pool_item = self._import_or_reuse_media(media_pool, source_video_path)
-        fps = self._project_frame_rate()
+        # AppendToTimeline's startFrame/endFrame are frame numbers in the SOURCE CLIP's
+        # own native frame rate, not the project timeline's - using the timeline's rate
+        # here silently points every clip at the wrong place whenever they differ (e.g.
+        # a 60fps Twitch VOD dropped onto a 24fps project: every frame number would be
+        # ~2.5x too small, landing far earlier in the file than intended).
+        fps = self._source_clip_frame_rate(pool_item)
 
         timeline_name = timeline_name or "StreamCutter Clips"
         timeline = media_pool.CreateEmptyTimeline(timeline_name)
@@ -214,13 +219,18 @@ class DavinciResolveExporter:
                 return item
         return None
 
-    def _project_frame_rate(self) -> float:
+    def _source_clip_frame_rate(self, pool_item) -> float:
+        """
+        The source media's OWN frame rate - what AppendToTimeline's startFrame/endFrame
+        are actually counted in, regardless of what the project's timeline is set to.
+        """
         try:
-            return float(self._project.GetSetting("timelineFrameRate"))
-        except (TypeError, ValueError):
+            return float(pool_item.GetClipProperty("FPS"))
+        except (TypeError, ValueError, AttributeError):
             logger.warning(
-                "Could not read project frame rate from Resolve; falling back to config default (%.2f fps).",
-                self.cfg.default_fps,
+                "Could not read the source clip's frame rate from Resolve; falling back to "
+                "config default (%.2f fps). If this is wrong, injected clips will point at "
+                "the wrong place in the file.", self.cfg.default_fps,
             )
             return self.cfg.default_fps
 

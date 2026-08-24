@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
@@ -95,6 +96,65 @@ def _timestamped_path(export_dir: Path, extension: str) -> Path:
     return export_dir / f"streamcutter_clips_{stamp}.{extension}"
 
 
+def _detect_source_fps(source_video_path: Optional[str], cfg: ExportConfig) -> Optional[float]:
+    """
+    Probes the actual source file's video stream frame rate via ffprobe, so
+    exports use the file's real rate instead of a fixed assumption that's
+    silently wrong whenever the actual source differs from it (the same class
+    of bug that made injected Resolve clips land in the wrong place: assuming
+    a rate instead of reading the file's real one). Returns None (caller falls
+    back to cfg.default_fps) if detection fails for any reason - no path given,
+    ffprobe missing, file unreadable, no video stream, unparseable output.
+    """
+    if not source_video_path:
+        return None
+    source_path = Path(source_video_path)
+    if not source_path.exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                cfg.ffprobe_binary, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(source_path),
+            ],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            "Could not run ffprobe ('%s') to detect the source frame rate: %s. "
+            "Falling back to the configured default (%.2f fps).",
+            cfg.ffprobe_binary, exc, cfg.default_fps,
+        )
+        return None
+
+    output = result.stdout.strip()
+    if result.returncode != 0 or not output:
+        logger.warning(
+            "ffprobe couldn't detect the frame rate for '%s' (exit %d): %s. Falling back to %.2f fps.",
+            source_path.name, result.returncode, result.stderr.strip(), cfg.default_fps,
+        )
+        return None
+
+    try:
+        if "/" in output:
+            num_str, den_str = output.split("/", 1)
+            fps = float(num_str) / float(den_str)
+        else:
+            fps = float(output)
+    except (ValueError, ZeroDivisionError) as exc:
+        logger.warning(
+            "Could not parse ffprobe's frame-rate output %r: %s. Falling back to %.2f fps.",
+            output, exc, cfg.default_fps,
+        )
+        return None
+
+    logger.info("Detected source frame rate for '%s': %.3f fps", source_path.name, fps)
+    return fps
+
+
 # --------------------------------------------------------------------------- #
 # FCPXML
 # --------------------------------------------------------------------------- #
@@ -117,7 +177,7 @@ def generate_fcpxml(
     """Returns a complete FCPXML document (UTF-8, pretty-printed) as a string."""
     _validate_clips(clips)
     cfg = export_config or settings.export
-    fps = cfg.default_fps
+    fps = _detect_source_fps(source_video_path, cfg) or cfg.default_fps
 
     source_path = Path(source_video_path)
     if not source_path.exists():
@@ -262,11 +322,18 @@ def generate_edl(
     title: str = "StreamCutter Clips",
     reel_name: str = "AX",
     export_config: Optional[ExportConfig] = None,
+    source_video_path: Optional[str] = None,
 ) -> str:
-    """Returns a CMX 3600 EDL as a string. Clips are laid back-to-back on the record track."""
+    """
+    Returns a CMX 3600 EDL as a string. Clips are laid back-to-back on the
+    record track. `source_video_path`, when given, is probed via ffprobe for
+    the real source frame rate - EDL timecodes are frame-rate-dependent, so
+    without it a source file that isn't actually cfg.default_fps produces
+    timecodes scaled wrong by whatever the ratio is between the two rates.
+    """
     _validate_clips(clips)
     cfg = export_config or settings.export
-    fps = cfg.default_fps
+    fps = _detect_source_fps(source_video_path, cfg) or cfg.default_fps
     reel = _safe_name(reel_name, "AX", max_len=8).upper() or "AX"
 
     lines = [
@@ -299,10 +366,11 @@ def export_edl_file(
     title: str = "StreamCutter Clips",
     reel_name: str = "AX",
     export_config: Optional[ExportConfig] = None,
+    source_video_path: Optional[str] = None,
 ) -> Path:
     """Renders an EDL and writes it to disk, returning the written path."""
     cfg = export_config or settings.export
-    edl_str = generate_edl(clips, title, reel_name, cfg)
+    edl_str = generate_edl(clips, title, reel_name, cfg, source_video_path=source_video_path)
 
     output_path = Path(output_path) if output_path else _timestamped_path(cfg.export_dir, "edl")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,5 +394,5 @@ def export_clips(
     if "fcpxml" in formats:
         written["fcpxml"] = export_fcpxml_file(clips, source_video_path)
     if "edl" in formats:
-        written["edl"] = export_edl_file(clips)
+        written["edl"] = export_edl_file(clips, source_video_path=source_video_path)
     return written
