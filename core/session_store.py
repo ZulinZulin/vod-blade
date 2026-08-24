@@ -26,14 +26,17 @@ from core.llm_agent import CandidateClip
 logger = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 1
-_SLUG_RE = re.compile(r"[^A-Za-z0-9_-]+")
+# \w is Unicode-aware in Python's re (matches Cyrillic, etc, not just ASCII) - only
+# genuinely filesystem-unsafe characters (spaces, brackets, slashes, punctuation) get
+# collapsed to underscores, since stream titles are frequently non-Latin.
+_SLUG_RE = re.compile(r"[^\w-]+", re.UNICODE)
 
 
 class SessionError(Exception):
     """Raised when a session can't be saved or loaded."""
 
 
-def _slugify(text: str, max_len: int = 40) -> str:
+def _slugify(text: str, max_len: int = 60) -> str:
     slug = _SLUG_RE.sub("_", text).strip("_")
     return slug[:max_len] or "session"
 
@@ -45,12 +48,17 @@ def save_session(
     twitch_source: str,
     chat_offset: float,
     session_path: Optional[str] = None,
+    title_hint: str = "",
 ) -> Path:
     """
     Writes the current review state to a JSON file. If session_path is given,
     overwrites that file (checkpointing an existing session in place) instead
     of creating a new one - keeps repeated manual saves during review from
     piling up near-duplicate files.
+
+    `title_hint`, when given, names a fresh file after the stream's own title
+    (e.g. fetched from the Twitch VOD metadata) instead of the raw VOD id/URL -
+    falls back to twitch_source/youtube_source if not provided or empty.
     """
     payload = {
         "schema_version": _SCHEMA_VERSION,
@@ -66,7 +74,7 @@ def save_session(
         out_path = Path(session_path)
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        slug = _slugify(twitch_source or youtube_source or "session")
+        slug = _slugify(title_hint or twitch_source or youtube_source or "session")
         out_path = SESSIONS_DIR / f"{slug}_{stamp}.json"
 
     try:
@@ -101,6 +109,29 @@ def load_session(session_path: str) -> dict:
     }
 
 
+def delete_session(session_path: str) -> None:
+    """Permanently deletes one saved session file."""
+    path = Path(session_path)
+    if not path.exists():
+        raise SessionError(f"Session file not found: {session_path}")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise SessionError(f"Could not delete session file '{path.name}': {exc}") from exc
+
+
 def list_sessions() -> List[Path]:
     """All saved session files, most recently modified first."""
     return sorted(SESSIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def purge_sessions() -> int:
+    """Permanently deletes every saved session file. Returns how many were actually removed."""
+    removed = 0
+    for path in list_sessions():
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            logger.warning("Could not delete session file '%s': %s", path, exc)
+    return removed

@@ -30,10 +30,14 @@ import requests
 
 from config import settings
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
-from core.fetchers import FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod
+from core.fetchers import (
+    FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod, get_twitch_vod_title,
+)
 from core.llm_agent import DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError
-from core.preview import PreviewError, extract_preview_clip
-from core.session_store import SessionError, list_sessions, load_session, save_session
+from core.preview import PreviewError, extract_preview_clip, extract_thumbnail
+from core.session_store import (
+    SessionError, delete_session, list_sessions, load_session, purge_sessions, save_session,
+)
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
 from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
@@ -203,8 +207,25 @@ _TOGGLE_LABEL_ACCEPTED = "Reject this clip"
 _TOGGLE_LABEL_REJECTED = "Un-reject (restore)"
 
 
-def _build_card_updates(clips: List[CandidateClip], page: int):
-    """Returns MAX_CLIP_CARDS * (group, markdown, transcript, start_slider, end_slider, preview_video, toggle_btn) gr.update() tuples for one page."""
+def _card_thumbnail_update(clip: CandidateClip, source_video_path: str) -> "gr.update":
+    """
+    Best-effort thumbnail for one card, taken at the midpoint of the clip's own
+    (possibly manually-edited) start/end range. Never raises - a source video
+    that isn't set yet, or an extraction failure, just leaves the thumbnail
+    hidden rather than breaking the whole page render.
+    """
+    if not source_video_path:
+        return gr.update(value=None, visible=False)
+    try:
+        thumb_path = extract_thumbnail(source_video_path, (clip.start_time + clip.end_time) / 2.0)
+    except PreviewError as exc:
+        logger.debug("Thumbnail generation skipped for candidate at t=%.1f: %s", clip.spike_time, exc)
+        return gr.update(value=None, visible=False)
+    return gr.update(value=str(thumb_path), visible=True)
+
+
+def _build_card_updates(clips: List[CandidateClip], page: int, source_video_path: str = ""):
+    """Returns MAX_CLIP_CARDS * (group, markdown, transcript, thumbnail, start_slider, end_slider, preview_video, toggle_btn) gr.update() tuples for one page."""
     page = _clamp_page(page, clips)
     start = page * MAX_CLIP_CARDS
     page_clips = clips[start:start + MAX_CLIP_CARDS]
@@ -223,6 +244,7 @@ def _build_card_updates(clips: List[CandidateClip], page: int):
                 gr.update(visible=True),
                 gr.update(value=_format_card_markdown(clip, start + i + 1)),
                 gr.update(value=_format_card_transcript(clip)),
+                _card_thumbnail_update(clip, source_video_path),
                 gr.update(minimum=lo, maximum=hi, value=clip.start_time, step=0.1),
                 gr.update(minimum=lo, maximum=hi, value=clip.end_time, step=0.1),
                 gr.update(value=None, visible=False),
@@ -230,13 +252,14 @@ def _build_card_updates(clips: List[CandidateClip], page: int):
             ])
         else:
             updates.extend([
-                gr.update(visible=False), gr.update(value=""), gr.update(value=""), gr.update(), gr.update(),
+                gr.update(visible=False), gr.update(value=""), gr.update(value=""),
+                gr.update(value=None, visible=False), gr.update(), gr.update(),
                 gr.update(value=None, visible=False), gr.update(value=_TOGGLE_LABEL_ACCEPTED),
             ])
     return updates
 
 
-def go_to_page(clips: List[CandidateClip], show_rejected: bool, page: int, delta: int):
+def go_to_page(clips: List[CandidateClip], show_rejected: bool, page: int, source_video_path: str, delta: int):
     """
     Moves `delta` pages (e.g. -1/+1) and returns the new page + refreshed card
     updates. delta=0 is used to just re-render the current page (e.g. after the
@@ -244,7 +267,7 @@ def go_to_page(clips: List[CandidateClip], show_rejected: bool, page: int, delta
     """
     visible = _visible_clips(clips, show_rejected)
     new_page = _clamp_page(page + delta, visible)
-    return (new_page, _page_label(visible, new_page), *_build_card_updates(visible, new_page))
+    return (new_page, _page_label(visible, new_page), *_build_card_updates(visible, new_page, source_video_path))
 
 
 def _sync_bound(
@@ -275,7 +298,9 @@ def _sync_bound(
 _MANUAL_REJECTION_REASON = "Manually rejected by operator"
 
 
-def do_toggle_worthy(clips: List[CandidateClip], show_rejected: bool, page: int, idx: int):
+def do_toggle_worthy(
+    clips: List[CandidateClip], show_rejected: bool, page: int, source_video_path: str, idx: int,
+):
     """
     Manually overrides the LLM's accept/reject verdict for one card. Unlike
     _sync_bound, this can change which clips are *visible* (a newly-rejected
@@ -286,7 +311,7 @@ def do_toggle_worthy(clips: List[CandidateClip], show_rejected: bool, page: int,
     visible = _visible_clips(clips, show_rejected)
     local_pos = _clamp_page(page, visible) * MAX_CLIP_CARDS + idx
     if local_pos >= len(visible):
-        return (clips, page, _page_label(visible, page), *_build_card_updates(visible, page))
+        return (clips, page, _page_label(visible, page), *_build_card_updates(visible, page, source_video_path))
 
     target = visible[local_pos]
     real_idx = next(i for i, c in enumerate(clips) if c is target)
@@ -300,10 +325,13 @@ def do_toggle_worthy(clips: List[CandidateClip], show_rejected: bool, page: int,
 
     new_visible = _visible_clips(updated, show_rejected)
     new_page = _clamp_page(page, new_visible)
-    return (updated, new_page, _page_label(new_visible, new_page), *_build_card_updates(new_visible, new_page))
+    return (
+        updated, new_page, _page_label(new_visible, new_page),
+        *_build_card_updates(new_visible, new_page, source_video_path),
+    )
 
 
-def do_unreject_all_manual(clips: List[CandidateClip], show_rejected: bool, page: int):
+def do_unreject_all_manual(clips: List[CandidateClip], show_rejected: bool, page: int, source_video_path: str):
     """
     Restores every clip the OPERATOR manually rejected, leaving the LLM's own
     rejections untouched. Distinguished via the sentinel rejection_reason
@@ -321,7 +349,10 @@ def do_unreject_all_manual(clips: List[CandidateClip], show_rejected: bool, page
 
     new_visible = _visible_clips(updated, show_rejected)
     new_page = _clamp_page(page, new_visible)
-    return (updated, new_page, _page_label(new_visible, new_page), *_build_card_updates(new_visible, new_page))
+    return (
+        updated, new_page, _page_label(new_visible, new_page),
+        *_build_card_updates(new_visible, new_page, source_video_path),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -343,7 +374,7 @@ def do_save_session(
     try:
         out_path = save_session(
             clips, source_video_path, youtube_source, twitch_source, chat_offset,
-            session_path=session_path or None,
+            session_path=session_path or None, title_hint=get_twitch_vod_title(twitch_source) or "",
         )
     except SessionError as exc:
         raise gr.Error(str(exc))
@@ -365,7 +396,7 @@ def do_load_session(session_path: Optional[str]):
     return (
         clips, session_path, data["source_video_path"], data["youtube_source"],
         data["twitch_source"], data["chat_offset"], gr.update(value=False), 0,
-        _page_label(visible, 0), *_build_card_updates(visible, 0),
+        _page_label(visible, 0), *_build_card_updates(visible, 0, data["source_video_path"]),
     )
 
 
@@ -373,17 +404,84 @@ def do_refresh_sessions():
     return gr.update(choices=_session_choices())
 
 
+def do_reset_delete_arm():
+    """
+    Resets the "Delete selected session" button back to its neutral label and
+    clears the armed-for-delete state the instant the dropdown selection
+    changes. do_delete_session's own armed_path != session_path check already
+    guarantees a stale confirm can never delete the wrong file, but without
+    this the button would keep visually showing "Confirm delete: <old file>"
+    after switching selections until the next click quietly re-arms it.
+    """
+    return gr.update(value=_DELETE_SESSION_LABEL), None
+
+
+def do_purge_sessions(confirmed: bool):
+    """Permanently deletes every saved session file. Gated behind an explicit
+    confirmation checkbox since this is irreversible and can destroy hours of
+    real review work - a stray click on the button alone must not delete anything."""
+    if not confirmed:
+        raise gr.Error("Check the confirmation box first - purging permanently deletes ALL saved sessions.")
+    count = purge_sessions()
+    if count:
+        gr.Info(f"Purged {count} saved session(s).")
+    else:
+        gr.Warning("No saved sessions to purge.")
+    # Reset the confirmation checkbox and drop any tracked session reference so a
+    # subsequent save doesn't try to overwrite a file that no longer exists.
+    return gr.update(value=False), None, gr.update(choices=_session_choices(), value=None)
+
+
+_DELETE_SESSION_LABEL = "Delete selected session"
+
+
+def do_delete_session(session_path: Optional[str], armed_path: Optional[str], active_session_path: Optional[str]):
+    """
+    Deletes one saved session via a click-twice arm/disarm confirmation: the
+    first click on a given selection only arms it (relabels the button), and
+    only a second click against that SAME selection actually deletes - if the
+    dropdown selection changes in between, this just re-arms for the new one
+    instead of deleting the previously-armed file, so a stale confirm can
+    never fire against the wrong session.
+    """
+    if not session_path:
+        raise gr.Error("Select a saved session to delete first.")
+
+    if armed_path != session_path:
+        gr.Warning(f"Click again to permanently delete '{Path(session_path).name}'.")
+        return (
+            gr.update(value=f"Confirm delete: {Path(session_path).name}"),
+            session_path, gr.update(), active_session_path,
+        )
+
+    try:
+        delete_session(session_path)
+    except SessionError as exc:
+        raise gr.Error(str(exc))
+    gr.Info(f"Deleted session {Path(session_path).name}.")
+    # If the deleted file was the currently-loaded/active session, drop that reference
+    # too, so a later "Save session" creates a fresh file instead of quietly reviving
+    # the same path.
+    new_active = None if active_session_path == session_path else active_session_path
+    return (
+        gr.update(value=_DELETE_SESSION_LABEL), None,
+        gr.update(choices=_session_choices(), value=None), new_active,
+    )
+
+
 def do_preview_clip(source_video_path: str, start_time: float, end_time: float):
     """Extracts and plays the card's current start/end range (live slider values,
     including any manual edits) from the local source video - lets an operator
-    quickly see/hear a candidate beyond its subtitle snippet."""
+    quickly see/hear a candidate beyond its subtitle snippet. Triggered either by
+    the "Preview clip" button or by clicking the card's thumbnail directly, both
+    of which swap the static thumbnail out for the video player."""
     if not source_video_path:
         raise gr.Error("Please provide the local source video path to preview clips.")
     try:
         out_path = extract_preview_clip(source_video_path, start_time, end_time)
     except PreviewError as exc:
         raise gr.Error(str(exc))
-    return gr.update(value=str(out_path), visible=True)
+    return gr.update(value=str(out_path), visible=True), gr.update(visible=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -509,14 +607,17 @@ def run_pipeline(
     # Reset the toggle off on every fresh analysis so a stale "show rejected" state
     # from a previous run doesn't leak into a new one.
     visible = _visible_clips(refined_clips, show_rejected=False)
-    page_updates = _build_card_updates(visible, page=0)
+    page_updates = _build_card_updates(visible, page=0, source_video_path=source_video_path)
     transcript_text = _format_full_transcript(subtitles)
 
     # Auto-save immediately - judging a real VOD can take a long time (dozens of real
     # LLM calls), so the result is checkpointed to disk before the operator even starts
     # reviewing it, rather than living only in the browser's in-memory clips_state.
     try:
-        session_path = save_session(refined_clips, source_video_path, youtube_source, twitch_source, chat_offset)
+        session_path = save_session(
+            refined_clips, source_video_path, youtube_source, twitch_source, chat_offset,
+            title_hint=get_twitch_vod_title(twitch_source) or "",
+        )
         session_update = gr.update(choices=_session_choices(), value=str(session_path))
     except SessionError as exc:
         logger.warning("Auto-save of the finished session failed: %s", exc)
@@ -827,6 +928,7 @@ def build_app() -> gr.Blocks:
         clips_state = gr.State([])
         page_state = gr.State(0)
         session_path_state = gr.State(None)
+        delete_armed_state = gr.State(None)
 
         with gr.Row():
             session_dropdown = gr.Dropdown(
@@ -836,6 +938,12 @@ def build_app() -> gr.Blocks:
             refresh_sessions_btn = gr.Button("Refresh", size="sm")
             load_session_btn = gr.Button("Load session", size="sm")
             save_session_btn = gr.Button("Save session", size="sm")
+            delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
+        with gr.Row():
+            confirm_purge_checkbox = gr.Checkbox(
+                label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
+            )
+            purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
 
         with gr.Row():
             show_rejected_checkbox = gr.Checkbox(
@@ -851,6 +959,11 @@ def build_app() -> gr.Blocks:
         card_components = []
         for _ in range(MAX_CLIP_CARDS):
             with gr.Group(visible=False) as card_group:
+                # Thumbnail and video share the same slot: the thumbnail is a cheap
+                # auto-generated frame shown by default; clicking it (or "Preview clip")
+                # extracts and swaps in the real playable clip in its place.
+                card_thumbnail = gr.Image(visible=False, interactive=False, show_label=False, height=240)
+                preview_video = gr.Video(visible=False, height=240)
                 card_md = gr.Markdown()
                 card_transcript = gr.Textbox(
                     lines=_CARD_TRANSCRIPT_LINES, max_lines=_CARD_TRANSCRIPT_LINES,
@@ -862,9 +975,8 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     preview_btn = gr.Button("Preview clip", size="sm")
                     toggle_btn = gr.Button(_TOGGLE_LABEL_ACCEPTED, size="sm")
-                preview_video = gr.Video(visible=False, height=240)
             card_components.append({
-                "group": card_group, "md": card_md, "transcript": card_transcript,
+                "group": card_group, "md": card_md, "transcript": card_transcript, "thumbnail": card_thumbnail,
                 "start": start_slider, "end": end_slider,
                 "preview_btn": preview_btn, "video": preview_video, "toggle_btn": toggle_btn,
             })
@@ -889,7 +1001,8 @@ def build_app() -> gr.Blocks:
         card_outputs = []
         for c in card_components:
             card_outputs.extend([
-                c["group"], c["md"], c["transcript"], c["start"], c["end"], c["video"], c["toggle_btn"],
+                c["group"], c["md"], c["transcript"], c["thumbnail"],
+                c["start"], c["end"], c["video"], c["toggle_btn"],
             ])
 
         reset_system_prompt_btn.click(
@@ -933,22 +1046,22 @@ def build_app() -> gr.Blocks:
 
         prev_page_btn.click(
             fn=partial(go_to_page, delta=-1),
-            inputs=[clips_state, show_rejected_checkbox, page_state],
+            inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[page_state, page_label, *card_outputs],
         )
         next_page_btn.click(
             fn=partial(go_to_page, delta=1),
-            inputs=[clips_state, show_rejected_checkbox, page_state],
+            inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[page_state, page_label, *card_outputs],
         )
         show_rejected_checkbox.change(
             fn=partial(go_to_page, delta=0),
-            inputs=[clips_state, show_rejected_checkbox, page_state],
+            inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[page_state, page_label, *card_outputs],
         )
         unreject_all_btn.click(
             fn=do_unreject_all_manual,
-            inputs=[clips_state, show_rejected_checkbox, page_state],
+            inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[clips_state, page_state, page_label, *card_outputs],
         )
 
@@ -966,6 +1079,21 @@ def build_app() -> gr.Blocks:
                 show_rejected_checkbox, page_state, page_label, *card_outputs,
             ],
         )
+        purge_sessions_btn.click(
+            fn=do_purge_sessions,
+            inputs=[confirm_purge_checkbox],
+            outputs=[confirm_purge_checkbox, session_path_state, session_dropdown],
+        )
+        delete_session_btn.click(
+            fn=do_delete_session,
+            inputs=[session_dropdown, delete_armed_state, session_path_state],
+            outputs=[delete_session_btn, delete_armed_state, session_dropdown, session_path_state],
+        )
+        session_dropdown.change(
+            fn=do_reset_delete_arm,
+            inputs=[],
+            outputs=[delete_session_btn, delete_armed_state],
+        )
 
         for idx, c in enumerate(card_components):
             c["start"].release(
@@ -981,11 +1109,16 @@ def build_app() -> gr.Blocks:
             c["preview_btn"].click(
                 fn=do_preview_clip,
                 inputs=[source_video_input, c["start"], c["end"]],
-                outputs=[c["video"]],
+                outputs=[c["video"], c["thumbnail"]],
+            )
+            c["thumbnail"].select(
+                fn=do_preview_clip,
+                inputs=[source_video_input, c["start"], c["end"]],
+                outputs=[c["video"], c["thumbnail"]],
             )
             c["toggle_btn"].click(
                 fn=partial(do_toggle_worthy, idx=idx),
-                inputs=[clips_state, show_rejected_checkbox, page_state],
+                inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
                 outputs=[clips_state, page_state, page_label, *card_outputs],
             )
 

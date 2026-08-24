@@ -27,12 +27,13 @@ load_dotenv()
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 DATA_DIR: Final[Path] = BASE_DIR / "data"
 CACHE_DIR: Final[Path] = DATA_DIR / "cache"
+THUMBNAILS_DIR: Final[Path] = CACHE_DIR / "thumbnails"
 DOWNLOADS_DIR: Final[Path] = DATA_DIR / "downloads"
 EXPORTS_DIR: Final[Path] = DATA_DIR / "exports"
 SESSIONS_DIR: Final[Path] = DATA_DIR / "sessions"
 BIN_DIR: Final[Path] = BASE_DIR / "bin"
 
-for _dir in (DATA_DIR, CACHE_DIR, DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, BIN_DIR):
+for _dir in (DATA_DIR, CACHE_DIR, THUMBNAILS_DIR, DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, BIN_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 

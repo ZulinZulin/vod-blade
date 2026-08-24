@@ -10,13 +10,14 @@ beyond its subtitle snippet, without waiting on a transcode.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 
-from config import ExportConfig, settings
+from config import ExportConfig, THUMBNAILS_DIR, settings
 
 logger = logging.getLogger(__name__)
 
@@ -71,5 +72,47 @@ def extract_preview_clip(
     if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
         stderr_tail = result.stderr.strip()[-500:] if result.stderr else "(no stderr)"
         raise PreviewError(f"ffmpeg failed to extract preview clip (exit {result.returncode}): {stderr_tail}")
+
+    return out_path
+
+
+def extract_thumbnail(source_video_path: str, timestamp: float, cfg: ExportConfig = None) -> Path:
+    """
+    Extracts a single JPEG frame near `timestamp`, used as a lightweight visual
+    stand-in for a candidate card so an operator can scan a page of cards
+    without playing every preview video. Content-addressed (hash of source
+    path + timestamp) and cached under data/cache/thumbnails/, since - unlike
+    the video preview, which only runs on an explicit button click - this
+    runs every time the card list re-renders (page nav, accept/reject toggle,
+    etc.); without caching, that would re-invoke ffmpeg a dozen times per click.
+    """
+    cfg = cfg or settings.export
+    source_path = Path(source_video_path) if source_video_path else None
+    if not source_path or not source_path.exists():
+        raise PreviewError(f"Source video not found: {source_video_path or '(none set)'}")
+
+    key = hashlib.sha1(f"{source_path.resolve()}|{timestamp:.2f}".encode("utf-8")).hexdigest()[:16]
+    out_path = THUMBNAILS_DIR / f"{key}.jpg"
+    if out_path.exists():
+        return out_path
+
+    try:
+        result = subprocess.run(
+            [
+                cfg.ffmpeg_binary, "-y",
+                "-ss", f"{timestamp:.3f}",
+                "-i", str(source_path),
+                "-frames:v", "1",
+                "-q:v", "4",
+                str(out_path),
+            ],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PreviewError(f"Could not run ffmpeg ('{cfg.ffmpeg_binary}'): {exc}") from exc
+
+    if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        stderr_tail = result.stderr.strip()[-500:] if result.stderr else "(no stderr)"
+        raise PreviewError(f"ffmpeg failed to extract thumbnail (exit {result.returncode}): {stderr_tail}")
 
     return out_path

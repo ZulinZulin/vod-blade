@@ -468,6 +468,35 @@ class TwitchChatFetcher:
         return sorted(messages, key=lambda m: m.timestamp)
 
 
+def get_twitch_vod_title(vod_url_or_id: str, cache_dir: Path = CACHE_DIR) -> Optional[str]:
+    """
+    Best-effort lookup of a VOD's stream title from its already-downloaded chat
+    JSON (TwitchDownloaderCLI embeds a "video" object with the title alongside
+    the comments). Reads only the existing cache file - never triggers a fresh
+    download - since this is meant to be called after fetch_twitch_chat has
+    already run (e.g. for naming a saved session), not as a standalone fetch.
+    Returns None on any failure (no source given, nothing cached yet, unparseable
+    file) rather than raising - a title is a nice-to-have, not load-bearing.
+    """
+    if not vod_url_or_id:
+        return None
+    try:
+        vod_id = extract_twitch_vod_id(vod_url_or_id)
+    except ChatFetchError:
+        return None
+
+    json_path = cache_dir / f"twitch_chat_{vod_id}.json"
+    if not json_path.exists():
+        return None
+    try:
+        raw = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    title = (raw.get("video") or {}).get("title")
+    return title.strip() if isinstance(title, str) and title.strip() else None
+
+
 # --------------------------------------------------------------------------- #
 # Twitch VOD video ingestion
 # --------------------------------------------------------------------------- #
