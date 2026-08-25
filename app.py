@@ -807,42 +807,7 @@ def do_inject_resolve(clips: List[CandidateClip], source_video_path: str):
 # UI
 # --------------------------------------------------------------------------- #
 
-_CUSTOM_CSS = """
-.gradio-container {
-    max-width: 1500px !important;
-    margin: 0 auto !important;
-    /* overflow-x is a safety net: even if something below still miscalculates,
-       the page clips/scrolls internally instead of the whole UI growing wider. */
-    overflow-x: hidden !important;
-    /* Inherited by all descendants: a long unbroken string (a file path, a VOD
-       title with no spaces) wraps inside its box instead of forcing it wider. */
-    overflow-wrap: anywhere;
-}
-/* Flexbox items default to min-width: auto, meaning a flex child refuses to
-   shrink below its CONTENT's natural width - so one long unbroken line of text,
-   or a Plotly graph's initial intrinsic size, silently drags its entire chain of
-   parent Rows/Columns (and therefore the whole page) wider. This resets that
-   default across the board so width: 100% / wrapping actually take effect;
-   harmless on non-flex-item elements. */
-.gradio-container * {
-    min-width: 0;
-}
-/* Markdown renders a backtick-quoted path as inline <code>, and the theme sets
-   its own explicit white-space/overflow-wrap on code/pre - an explicit value
-   always wins over the inherited one above regardless of selector specificity,
-   so the container-level overflow-wrap alone silently never reaches these. */
-.gradio-container code, .gradio-container pre {
-    white-space: pre-wrap !important;
-    overflow-wrap: anywhere !important;
-}
-.candidate-grid {
-    flex-wrap: wrap !important;
-}
-.candidate-card {
-    flex: 1 1 calc(50% - 8px) !important;
-    min-width: 380px !important;
-}
-"""
+_UI_DIR = Path(__file__).resolve().parent / "ui"
 
 
 def build_app() -> gr.Blocks:
@@ -1201,6 +1166,23 @@ def build_app() -> gr.Blocks:
     return demo
 
 
+def _load_custom_css() -> str:
+    """
+    custom.css references its background SVG through Gradio's /gradio_api/file=
+    endpoint, which needs a real absolute filesystem path - substituted here at
+    startup instead of hardcoded in the file, so the project still works after
+    being moved or cloned to a different machine/drive/path.
+    """
+    css = (_UI_DIR / "custom.css").read_text(encoding="utf-8")
+    heart_svg_path = str((_UI_DIR / "heart.svg").resolve()).replace("\\", "/")
+    return css.replace("{{HEART_SVG_PATH}}", heart_svg_path)
+
+
 if __name__ == "__main__":
     app = build_app()
-    app.queue().launch(server_port=7862, theme=gr.themes.Soft(), css=_CUSTOM_CSS)
+    app.queue().launch(
+        server_port=7862,
+        css_paths=[_UI_DIR / "theme.css"],
+        css=_load_custom_css(),
+        allowed_paths=[str(_UI_DIR)],
+    )

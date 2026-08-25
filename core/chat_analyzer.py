@@ -221,8 +221,15 @@ class ChatAnalyzer:
 
         candidates = [
             ClipCandidate(
-                window_start=max(0.0, row["bin_start"] - self.cfg.pre_spike_seconds),
-                window_end=row["bin_end"] + self.cfg.post_spike_seconds,
+                # float(...) matters here, not just style: row[...] is a numpy.float64
+                # (from iterating a pandas DataFrame), which duck-types as a plain float
+                # almost everywhere but not always - it's silently accepted into these
+                # dataclass fields (Python doesn't enforce dataclass type hints at
+                # runtime) and can surface much later as a genuine bug, e.g. Gradio's
+                # slider preprocessing rejecting it after a value round-trip through the
+                # client because it no longer compares as a plain float.
+                window_start=float(max(0.0, row["bin_start"] - self.cfg.pre_spike_seconds)),
+                window_end=float(row["bin_end"] + self.cfg.post_spike_seconds),
                 spike_time=float(row["bin_start"]),
                 peak_hype_score=float(row["hype_score"]),
                 peak_z_score=float(row["z_score"]),

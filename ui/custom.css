@@ -1,0 +1,109 @@
+/*
+ * ui/custom.css
+ *
+ * StreamCutter's own layout/behavior fixes, loaded alongside ui/theme.css via
+ * app.py's launch(css_paths=[...]). Kept separate from theme.css so our own
+ * rules survive independently of any future theme swap.
+ */
+/* overflow-x safety net lives on body, not .gradio-container: a box-shadow
+   extends past its own element's box, and overflow-x: hidden on the SAME
+   element clips that shadow away (setting only overflow-x also forces
+   overflow-y to establish its own clipping context per the CSS spec, so it
+   silently cuts a shadow's top/bottom too, not just left/right). body still
+   gives the same page-level "never scroll horizontally" guarantee. */
+body {
+    overflow-x: hidden;
+}
+.gradio-container {
+    max-width: 1500px !important;
+    margin: 0 auto !important;
+    /* Inherited by all descendants: a long unbroken string (a file path, a VOD
+       title with no spaces) wraps inside its box instead of forcing it wider. */
+    overflow-wrap: anywhere;
+    /* Gradio's own inner wrapper only pads real content 32px in from here before
+       its own opaque block background starts - so the feathered fade further
+       below is invisible past 32px no matter how wide it's configured, always
+       hidden under that opaque content. This adds real room (on top of that
+       existing 32px) for the fade to actually be seen in. This value and the
+       fade width below aren't linked by CSS (no shared variable/calc() ties
+       them together) - they're two independent numbers tuned to complement
+       each other by hand: keep the fade width somewhat less than 32px + this
+       padding, or the fade will get clipped under the opaque content again. */
+    padding: 0 10px !important;
+    /* Thick border + drop shadow framing the whole middle content column,
+       lifting it visually off the patterned background behind it. */
+    border: 6px solid var(--border-color-accent) !important;
+    border-radius: 16px !important;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35) !important;
+}
+/* Flexbox items default to min-width: auto, meaning a flex child refuses to
+   shrink below its CONTENT's natural width - so one long unbroken line of text,
+   or a Plotly graph's initial intrinsic size, silently drags its entire chain of
+   parent Rows/Columns (and therefore the whole page) wider. This resets that
+   default across the board so width: 100% / wrapping actually take effect;
+   harmless on non-flex-item elements. */
+.gradio-container * {
+    min-width: 0;
+}
+/* Markdown renders a backtick-quoted path as inline <code>, and the theme sets
+   its own explicit white-space/overflow-wrap on code/pre - an explicit value
+   always wins over the inherited one above regardless of selector specificity,
+   so the container-level overflow-wrap alone silently never reaches these. */
+.gradio-container code, .gradio-container pre {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere !important;
+}
+.candidate-grid {
+    flex-wrap: wrap !important;
+}
+.candidate-card {
+    flex: 1 1 calc(50% - 8px) !important;
+    min-width: 380px !important;
+}
+
+/* Subtle repeating heart-pattern background, tinted to the theme's pink accent
+   directly in ui/heart.svg (fill/fill-opacity baked into the file, since a
+   file-referenced background-image can't be recolored from CSS the way an
+   inline <svg> could). To swap the pattern, replace ui/heart.svg - tint it the
+   same way if the new file doesn't already carry its own color.
+   {{HEART_SVG_PATH}} is substituted at startup in app.py's build_app() with
+   this machine's actual absolute path - never hardcode a real path here, it
+   won't survive the project being moved or cloned elsewhere.
+
+   Lives on body, not .gradio-container: the container is capped/centered at
+   max-width above, so on a wide window there's empty margin outside it - that
+   margin belongs to body, not the container. Painting the pattern on body
+   makes it show in that outer margin; .gradio-container gets its own solid
+   background-color below so the actual app content sits on a plain backdrop
+   instead of the pattern showing through the gaps between its own blocks.
+   On a narrow window (viewport <= 1500px) the container fills the full width
+   and there's no margin left for the pattern to show in at all - that's an
+   inherent tradeoff of this approach, not a bug. */
+/* Not body: <gradio-app> is a custom element sitting between body and
+   .gradio-container with its own opaque, full-width background-color, which
+   completely covers body regardless of window size - body's background can
+   never actually be seen. gradio-app is the real outermost visible layer. */
+gradio-app {
+    background-image: url("/gradio_api/file={{HEART_SVG_PATH}}") !important;
+    background-repeat: space !important;
+    background-size: 80px 80px !important;
+}
+/* Feathered instead of a hard cutoff: opaque through the middle (masking the
+   pattern behind actual app content, in a color slightly lighter than the
+   pattern's own backdrop via color-mix - see below), fading to fully
+   transparent at the container's own left/right edges over the band set by
+   the two px values below, so the heart pattern on gradio-app bleeds through
+   gradually rather than snapping into view. See the padding rule above for
+   why this fade width and that padding need to be kept complementary by
+   hand when either one changes. */
+.gradio-container {
+    background-color: transparent;
+    background-image: linear-gradient(
+        to right,
+        transparent 0,
+        color-mix(in srgb, var(--body-background-fill) 85%, white 15%) 2px,
+        color-mix(in srgb, var(--body-background-fill) 85%, white 15%) calc(100% - 2px),
+        transparent 100%
+    );
+}
+
