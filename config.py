@@ -28,12 +28,13 @@ BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 DATA_DIR: Final[Path] = BASE_DIR / "data"
 CACHE_DIR: Final[Path] = DATA_DIR / "cache"
 THUMBNAILS_DIR: Final[Path] = CACHE_DIR / "thumbnails"
+AUDIO_RMS_CACHE_DIR: Final[Path] = CACHE_DIR / "audio_rms"
 DOWNLOADS_DIR: Final[Path] = DATA_DIR / "downloads"
 EXPORTS_DIR: Final[Path] = DATA_DIR / "exports"
 SESSIONS_DIR: Final[Path] = DATA_DIR / "sessions"
 BIN_DIR: Final[Path] = BASE_DIR / "bin"
 
-for _dir in (DATA_DIR, CACHE_DIR, THUMBNAILS_DIR, DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, BIN_DIR):
+for _dir in (DATA_DIR, CACHE_DIR, THUMBNAILS_DIR, AUDIO_RMS_CACHE_DIR, DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, BIN_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -159,6 +160,58 @@ class HypeScoreConfig:
 
     caps_min_word_len: int = 3  # ignore short all-caps tokens like "NA", "GG" noise floor
     caps_min_ratio: float = 0.6  # fraction of letters uppercase to count a message as "caps"
+
+
+# --------------------------------------------------------------------------- #
+# Audio peak analysis (core/audio_analyzer.py)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class AudioScoreConfig:
+    """
+    Weights and thresholds for the audio RMS-energy pipeline. Deliberately
+    mirrors HypeScoreConfig's shape (bin -> rolling mean/std -> Z-score -> spike
+    windows) rather than sharing code with it - this stays a fully independent
+    detector so chat-only analysis (no video required) is never affected by
+    whether audio analysis is enabled.
+
+    sample_rate is fixed at 16000 now (not a lower rate that would be "enough"
+    for RMS alone) because Phase 2 (YAMNet sound-event classification, ONNX)
+    requires 16kHz mono input - extracting at that rate from the start means
+    the same decoded waveform can serve both, instead of a second ffmpeg pass
+    once Phase 2 lands.
+    """
+
+    sample_rate: int = 16000
+    bin_seconds: float = 5.0
+    rolling_window_bins: int = 24
+    z_score_threshold: float = 3.0
+    min_seconds_between_spikes: int = 45
+    pre_spike_seconds: int = 60
+    post_spike_seconds: int = 30
+    max_merged_duration_seconds: float = 300.0
+
+    # Generous on purpose: audio-only decode (no video, mono, 16kHz) runs far
+    # faster than realtime, so even an 8+ hour VOD finishes well inside this.
+    extraction_timeout_s: int = 1800
+
+    # How close (seconds) a chat and an audio spike's own spike_time need to be to
+    # count as "the same real-world moment" during merging (core/audio_analyzer.py's
+    # merge_with_chat_candidates). Deliberately NOT based on the two candidates'
+    # padded windows (pre_spike_seconds/post_spike_seconds exist to give the LLM
+    # transcript context, not to define real-world proximity) - with 60s/30s
+    # padding on each side, comparing padded windows would let two editorially
+    # distinct spikes up to ~90s apart falsely "confirm" each other.
+    cross_modal_overlap_tolerance_s: float = 30.0
+
+    # An audio spike whose window doesn't overlap any chat-detected candidate can
+    # either become its own new candidate (True - full Option C) or be dropped
+    # entirely once no overlap is found (False - audio only ever enriches chat
+    # candidates, never creates its own). Kept as a run_pipeline UI toggle in
+    # app.py, not a hardcoded choice, since which behavior is useful depends on
+    # how chat-quiet the stream tends to be during its best moments.
+    allow_new_candidates: bool = True
 
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +382,7 @@ class Settings:
     binaries: BinaryConfig = field(default_factory=BinaryConfig)
     fetcher: FetcherConfig = field(default_factory=FetcherConfig)
     hype: HypeScoreConfig = field(default_factory=HypeScoreConfig)
+    audio: AudioScoreConfig = field(default_factory=AudioScoreConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
 

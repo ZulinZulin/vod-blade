@@ -33,6 +33,7 @@ import plotly.graph_objects as go
 import requests
 
 from config import settings
+from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
     FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod, get_twitch_vod_title,
@@ -103,20 +104,22 @@ def _nearest_rolling_mean(timeline_df: pd.DataFrame, x: float) -> float:
     return float(timeline_df.loc[idx, "rolling_mean"])
 
 
-def build_hype_timeline_figure(timeline_df: pd.DataFrame, candidates: List[ClipCandidate]) -> go.Figure:
-    fig = go.Figure()
-    if timeline_df.empty:
-        fig.update_layout(title="No chat data yet - run an analysis to populate this graph.", template="plotly_dark")
-        return fig
+def _build_skyline_anchors(timeline_df: pd.DataFrame, candidates: List[ClipCandidate]) -> "tuple[list, list]":
+    """
+    Shared "skyline" anchor-point builder for both the chat and audio traces:
+    tracing every raw bin reads as noisy even where nothing notable is
+    happening (both chat volume and audio RMS are bursty at bin resolution).
+    Instead the line is built from a sparse set of anchors - a slowly-drifting
+    floor (rolling_mean, resampled every _HYPE_BASELINE_SAMPLE_INTERVAL_S
+    seconds) plus a sharp rise/settle pair around each real spike, both read
+    from the same rolling_mean the spike detector itself measures deviations
+    against - so a spike's height above the floor stays an honest reflection
+    of real chat/audio volume instead of an arbitrary flat baseline.
 
-    # "Skyline" curve: tracing every raw bin reads as noisy even where nothing
-    # notable is happening, since chat volume is bursty at bin resolution. Instead
-    # the line is built from a sparse set of anchors - a slowly-drifting floor
-    # (rolling_mean, resampled every _HYPE_BASELINE_SAMPLE_INTERVAL_S seconds)
-    # plus a sharp rise/settle pair around each real spike, both read from the
-    # same rolling_mean the spike detector itself measures deviations against -
-    # so a spike's height above the floor stays an honest reflection of real
-    # chat volume instead of an arbitrary flat baseline.
+    `candidates` must already be filtered to ones whose peak_hype_score is on
+    the SAME scale as timeline_df (chat hype score, or audio RMS) - mixing
+    scales here would draw a nonsense-height vertex on the wrong curve.
+    """
     bin_width = float(timeline_df["bin_start"].diff().median() or 5.0)
     step_rows = max(1, round(_HYPE_BASELINE_SAMPLE_INTERVAL_S / bin_width))
     anchors = {
@@ -137,28 +140,85 @@ def build_hype_timeline_figure(timeline_df: pd.DataFrame, candidates: List[ClipC
         anchors[c.spike_time] = c.peak_hype_score  # the real recorded peak, not a smoothed value
 
     xs, ys = zip(*sorted(anchors.items()))
+    return list(xs), list(ys)
+
+
+def build_hype_timeline_figure(
+    timeline_df: pd.DataFrame,
+    candidates: List[ClipCandidate],
+    audio_timeline_df: Optional[pd.DataFrame] = None,
+    audio_candidates: Optional[List[ClipCandidate]] = None,
+) -> go.Figure:
+    """
+    `candidates` is the final, post-merge list (chat/chat+audio/audio_rms all
+    mixed together - see core.audio_analyzer.merge_with_chat_candidates) and is
+    used for the chat skyline/markers. `audio_candidates`, when given, is the
+    ORIGINAL pre-merge audio-detector output - used for the audio skyline/
+    markers instead, since a merged "chat+audio" candidate's peak_hype_score is
+    on chat's scale, not audio's, and would draw a nonsense-height vertex on
+    the audio trace.
+    """
+    fig = go.Figure()
+    if timeline_df.empty:
+        fig.update_layout(title="No chat data yet - run an analysis to populate this graph.", template="plotly_dark")
+        return fig
+
+    chat_line_candidates = [c for c in candidates if c.source != "audio_rms"]
+    xs, ys = _build_skyline_anchors(timeline_df, chat_line_candidates)
     fig.add_trace(go.Scatter(
         x=xs, y=ys,
         mode="lines", name="Hype score", line=dict(color="#7c5cff", width=1.5),
     ))
-    if candidates:
+
+    # Three marker categories so an operator can tell at a glance which detector(s)
+    # flagged a given moment: chat-only (pink circle), chat confirmed by a coincident
+    # audio peak (gold circle - same shape, since it IS a chat candidate), and
+    # audio-only (teal diamond, plotted against the secondary axis below).
+    chat_only = [c for c in candidates if c.source == "chat"]
+    chat_and_audio = [c for c in candidates if c.source == "chat+audio"]
+    audio_only = [c for c in candidates if c.source == "audio_rms"]
+    if chat_only:
         fig.add_trace(go.Scatter(
-            x=[c.spike_time for c in candidates], y=[c.peak_hype_score for c in candidates],
-            mode="markers", name="Detected spikes",
+            x=[c.spike_time for c in chat_only], y=[c.peak_hype_score for c in chat_only],
+            mode="markers", name="Chat spike",
             marker=dict(color="#ff4d6d", size=7, symbol="circle"),
         ))
-        for c in candidates:
-            fig.add_vrect(x0=c.window_start, x1=c.window_end, fillcolor="#ff4d6d", opacity=0.08, line_width=0)
+    if chat_and_audio:
+        fig.add_trace(go.Scatter(
+            x=[c.spike_time for c in chat_and_audio], y=[c.peak_hype_score for c in chat_and_audio],
+            mode="markers", name="Chat+audio confirmed",
+            marker=dict(color="#facc15", size=8, symbol="circle"),
+        ))
+    for c in candidates:
+        fig.add_vrect(x0=c.window_start, x1=c.window_end, fillcolor="#ff4d6d", opacity=0.08, line_width=0)
 
-    fig.update_layout(
+    layout_kwargs = dict(
         title="Chat Hype Timeline",
         xaxis_title="Stream time (s)",
         yaxis_title="Hype score",
         template="plotly_dark",
         height=380,
-        margin=dict(l=40, r=20, t=50, b=40),
+        margin=dict(l=40, r=60, t=50, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
+
+    if audio_timeline_df is not None and not audio_timeline_df.empty:
+        audio_xs, audio_ys = _build_skyline_anchors(audio_timeline_df, audio_candidates or [])
+        fig.add_trace(go.Scatter(
+            x=audio_xs, y=audio_ys, yaxis="y2",
+            mode="lines", name="Audio energy", line=dict(color="#2dd4bf", width=1.5),
+        ))
+        if audio_only:
+            fig.add_trace(go.Scatter(
+                x=[c.spike_time for c in audio_only], y=[c.peak_hype_score for c in audio_only], yaxis="y2",
+                mode="markers", name="Audio-only peak",
+                marker=dict(color="#2dd4bf", size=8, symbol="diamond"),
+            ))
+        layout_kwargs["yaxis2"] = dict(
+            title="Audio RMS energy", overlaying="y", side="right", showgrid=False,
+        )
+
+    fig.update_layout(**layout_kwargs)
     return fig
 
 
@@ -265,12 +325,18 @@ def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
         body = f"{clip.summary}{override_note}"
         header = f"**#{rank}. {clip.title}**{fallback_note}"
 
+    spike_label = {
+        "chat": "Chat spike", "audio_rms": "Audio peak", "chat+audio": "Chat spike",
+    }.get(clip.source, "Spike")
+    audio_confirm_note = (
+        f", audio also peaked here (z={clip.audio_peak_z_score:.2f})" if clip.audio_peak_z_score is not None else ""
+    )
     return (
         f"{header}\n\n"
         f"{body}\n\n"
         f"**{_format_hms(clip.start_time)} -> {_format_hms(clip.end_time)}**  "
         f"({clip.duration:.1f}s)  |  Viral score: **{clip.viral_score}/10**\n\n"
-        f"Chat spike at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f})"
+        f"{spike_label} at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f}){audio_confirm_note}"
     )
 
 
@@ -620,9 +686,8 @@ def do_delete_session(session_path: Optional[str], armed_path: Optional[str], ac
 def do_preview_clip(source_video_path: str, start_time: float, end_time: float):
     """Extracts and plays the card's current start/end range (live slider values,
     including any manual edits) from the local source video - lets an operator
-    quickly see/hear a candidate beyond its subtitle snippet. Triggered either by
-    the "Preview clip" button or by clicking the card's thumbnail directly, both
-    of which swap the static thumbnail out for the video player."""
+    quickly see/hear a candidate beyond its subtitle snippet. Triggered by clicking
+    the card's thumbnail, which swaps the static thumbnail out for the video player."""
     if not source_video_path:
         raise gr.Error("Please provide the local source video path to preview clips.")
     try:
@@ -655,6 +720,9 @@ def run_pipeline(
     llm_api_base: str,
     llm_api_key: str,
     skip_llm: bool,
+    audio_enable: bool,
+    audio_z_threshold: float,
+    audio_allow_new: bool,
     progress=gr.Progress(),
 ):
     # Gradio Textbox/Dropdown components default to value=None (not "") when left
@@ -681,6 +749,11 @@ def run_pipeline(
         raise gr.Error(
             f"No API key configured for provider '{llm_provider}'. Enter one above, or set "
             "LLM_API_KEY in .env if you'd rather not paste it into the UI each time."
+        )
+    if audio_enable and not (source_video_path and Path(source_video_path).exists()):
+        raise gr.Error(
+            "Audio peak analysis is enabled but the local source video path above doesn't point to an "
+            "existing file - download the VOD first, or disable audio peak analysis."
         )
 
     progress(0.05, desc="Fetching subtitles...")
@@ -712,6 +785,24 @@ def run_pipeline(
         gr.Warning(
             "No chat hype spikes cleared the Z-score threshold. Try lowering the Z-score threshold "
             "above for a quieter stream, or double check the chat offset."
+        )
+
+    audio_timeline_df = None
+    audio_candidates: List[ClipCandidate] = []
+    if audio_enable:
+        progress(0.65, desc="Analyzing audio peaks...")
+        audio_cfg = replace(
+            settings.audio, z_score_threshold=audio_z_threshold, allow_new_candidates=audio_allow_new,
+        )
+        try:
+            audio_candidates, audio_timeline_df = AudioAnalyzer(config=audio_cfg).analyze_with_timeline(
+                source_video_path
+            )
+        except AudioAnalysisError as exc:
+            raise gr.Error(f"Audio peak analysis failed: {exc}")
+        candidates = merge_with_chat_candidates(
+            candidates, audio_candidates, audio_allow_new,
+            overlap_tolerance_s=settings.audio.cross_modal_overlap_tolerance_s,
         )
 
     if skip_llm:
@@ -758,9 +849,14 @@ def run_pipeline(
     kept_count = len(refined_clips) - rejected_count
 
     progress(1.0, desc="Done")
-    fig = build_hype_timeline_figure(timeline_df, candidates)
+    fig = build_hype_timeline_figure(timeline_df, candidates, audio_timeline_df, audio_candidates)
+    audio_note = ""
+    if audio_enable:
+        audio_only_count = sum(1 for c in refined_clips if c.source == "audio_rms")
+        confirmed_count = sum(1 for c in refined_clips if c.source == "chat+audio")
+        audio_note = f" ({audio_only_count} audio-only, {confirmed_count} chat+audio-confirmed)"
     status = (
-        f"Analyzed {len(messages)} chat messages -> {len(candidates)} chat-spike candidate(s) -> "
+        f"Analyzed {len(messages)} chat messages -> {len(candidates)} candidate(s){audio_note} -> "
         f"{kept_count} clip(s) kept"
         + (
             f", {rejected_count} rejected (toggle 'Show rejected candidates' to review)."
@@ -1009,6 +1105,24 @@ def build_app() -> gr.Blocks:
                     minimum=30, maximum=600, step=10,
                     value=settings.hype.max_merged_duration_seconds,
                 )
+            with gr.Accordion("Audio peak analysis (advanced)", open=False):
+                gr.Markdown(
+                    "Detects loud moments (shouts, sudden outbursts) from the VOD's own audio track - "
+                    "requires the local source video above to already be downloaded."
+                )
+                audio_enable_checkbox = gr.Checkbox(
+                    label="Enable audio peak analysis", value=False,
+                )
+                with gr.Row():
+                    audio_z_threshold_input = gr.Slider(
+                        label="Audio Z-score threshold (higher = fewer, louder-only peaks)",
+                        minimum=1.0, maximum=6.0, step=0.1,
+                        value=settings.audio.z_score_threshold,
+                    )
+                    audio_allow_new_checkbox = gr.Checkbox(
+                        label="Allow audio-only peaks (no matching chat spike) to become their own candidates",
+                        value=settings.audio.allow_new_candidates,
+                    )
             with gr.Accordion("LLM provider (advanced)", open=False):
                 llm_provider_input = gr.Dropdown(
                     label="LLM provider",
@@ -1137,8 +1251,8 @@ def build_app() -> gr.Blocks:
                     visible=False, elem_classes=["candidate-card"], elem_id=f"candidate-card-slot-{slot_idx}",
                 ) as card_group:
                     # Thumbnail and video share the same slot: the thumbnail is a cheap
-                    # auto-generated frame shown by default; clicking it (or "Preview clip")
-                    # extracts and swaps in the real playable clip in its place.
+                    # auto-generated frame shown by default; clicking it extracts and swaps
+                    # in the real playable clip in its place.
                     card_thumbnail = gr.Image(visible=False, interactive=False, show_label=False, height=240)
                     preview_video = gr.Video(visible=False, height=240)
                     card_md = gr.Markdown()
@@ -1150,13 +1264,11 @@ def build_app() -> gr.Blocks:
                         with gr.Row():
                             start_slider = gr.Slider(label="Start (seconds into VOD)", minimum=0, maximum=1, step=0.1)
                             end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
-                    with gr.Row():
-                        preview_btn = gr.Button("Preview clip", size="sm")
-                        toggle_btn = gr.Button(_TOGGLE_LABEL_ACCEPTED, size="sm")
+                    toggle_btn = gr.Button(_TOGGLE_LABEL_ACCEPTED, size="sm")
                 card_components.append({
                     "group": card_group, "md": card_md, "transcript": card_transcript, "thumbnail": card_thumbnail,
                     "start": start_slider, "end": end_slider,
-                    "preview_btn": preview_btn, "video": preview_video, "toggle_btn": toggle_btn,
+                    "video": preview_video, "toggle_btn": toggle_btn,
                 })
 
         gr.Markdown("### Export")
@@ -1198,6 +1310,7 @@ def build_app() -> gr.Blocks:
                 min_viral_score_input, content_hint_input, system_prompt_input,
                 llm_provider_input, llm_model_input, llm_api_base_input, llm_api_key_input,
                 skip_llm_checkbox,
+                audio_enable_checkbox, audio_z_threshold_input, audio_allow_new_checkbox,
             ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
@@ -1291,11 +1404,6 @@ def build_app() -> gr.Blocks:
                 fn=partial(_sync_bound, idx=idx, field_name="end_time"),
                 inputs=[clips_state, show_rejected_checkbox, page_state, c["end"]],
                 outputs=[clips_state],
-            )
-            c["preview_btn"].click(
-                fn=do_preview_clip,
-                inputs=[source_video_input, c["start"], c["end"]],
-                outputs=[c["video"], c["thumbnail"]],
             )
             c["thumbnail"].select(
                 fn=do_preview_clip,

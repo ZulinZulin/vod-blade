@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -57,13 +57,28 @@ class ChatBin:
 
 @dataclass(frozen=True)
 class ClipCandidate:
-    """A candidate clip window anchored on a detected chat hype spike."""
+    """
+    A candidate clip window anchored on a detected spike. `peak_hype_score` is a
+    generic "peak value of whatever signal flagged this candidate" - chat hype
+    score for chat-sourced candidates, peak RMS for audio-sourced ones (see
+    core/audio_analyzer.py) - kept as one field rather than a parallel type so
+    both detectors' outputs can be merged/sorted/judged identically downstream.
+    """
 
     window_start: float
     window_end: float
     spike_time: float
     peak_hype_score: float
     peak_z_score: float
+    # "chat" | "audio_rms" | "chat+audio" (set by core/audio_analyzer.merge_with_chat_candidates
+    # when a chat and an audio spike overlap). Left as a plain string, not an enum: Phase 2
+    # (YAMNet sound-event classification) is already planned to add more values
+    # (e.g. "audio:laughter"), so locking this to a fixed set now would need revisiting soon.
+    source: str = "chat"
+    # Set only on a chat-sourced candidate that an overlapping audio spike also confirmed -
+    # extra context surfaced to the LLM prompt (see llm_agent._build_user_prompt), not used
+    # for anything else. None when audio analysis is disabled or found no overlap here.
+    audio_peak_z_score: Optional[float] = None
 
     @property
     def duration(self) -> float:

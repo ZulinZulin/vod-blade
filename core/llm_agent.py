@@ -117,6 +117,10 @@ class CandidateClip:
     used_fallback: bool = False
     is_clip_worthy: bool = True
     rejection_reason: Optional[str] = None
+    # Carried through from ClipCandidate unchanged - see that class's docstring
+    # in core/chat_analyzer.py for why this stays a plain string.
+    source: str = "chat"
+    audio_peak_z_score: Optional[float] = None
 
     @property
     def duration(self) -> float:
@@ -230,10 +234,13 @@ def build_stat_only_clip(
     reject them - the operator uses the existing manual accept/reject tools to
     curate a raw candidate list by hand instead.
     """
+    title_label = {"chat": "Chat hype spike", "audio_rms": "Audio peak", "chat+audio": "Chat+audio spike"}.get(
+        candidate.source, "Spike"
+    )
     return CandidateClip(
         start_time=candidate.window_start,
         end_time=candidate.window_end,
-        title=f"Chat hype spike at {candidate.spike_time:.0f}s",
+        title=f"{title_label} at {candidate.spike_time:.0f}s",
         viral_score=min(10, max(1, round(candidate.peak_z_score))),
         summary=summary,
         spike_time=candidate.spike_time,
@@ -241,17 +248,35 @@ def build_stat_only_clip(
         peak_z_score=candidate.peak_z_score,
         transcript_excerpt=transcript,
         used_fallback=used_fallback,
+        source=candidate.source,
+        audio_peak_z_score=candidate.audio_peak_z_score,
     )
 
 
 def _build_user_prompt(candidate: ClipCandidate, transcript: str, content_hint: str = "") -> str:
     hint_line = f"\nContext from the operator about this stream: {content_hint}\n" if content_hint and content_hint.strip() else ""
+    if candidate.source == "audio_rms":
+        signal_line = (
+            f"This window was flagged by a LOUD AUDIO MOMENT at t={candidate.spike_time:.1f}s "
+            f"(peak audio energy z-score={candidate.peak_z_score:.2f}), not by chat activity - chat may have "
+            f"been quiet here even if something notable happened (e.g. viewers too engaged to type).\n"
+        )
+    else:
+        signal_line = (
+            f"Chat's reaction peaked at t={candidate.spike_time:.1f}s within this window "
+            f"(peak hype score={candidate.peak_hype_score:.1f}, z-score={candidate.peak_z_score:.2f}) - "
+            f"remember this is where chat's reaction peaked, not necessarily where the actual moment is; "
+            f"scan the whole window above rather than just the content near this timestamp.\n"
+        )
+    audio_context_line = (
+        f"The audio track also peaked around this same window (energy z-score="
+        f"{candidate.audio_peak_z_score:.2f}), reinforcing that something notable likely happened here.\n"
+        if candidate.audio_peak_z_score is not None else ""
+    )
     return (
         f"Transcript window to judge: {candidate.window_start:.1f}s to {candidate.window_end:.1f}s.\n"
-        f"Chat's reaction peaked at t={candidate.spike_time:.1f}s within this window "
-        f"(peak hype score={candidate.peak_hype_score:.1f}, z-score={candidate.peak_z_score:.2f}) - "
-        f"remember this is where chat's reaction peaked, not necessarily where the actual moment is; "
-        f"scan the whole window above rather than just the content near this timestamp.\n"
+        f"{signal_line}"
+        f"{audio_context_line}"
         f"{hint_line}\n"
         f"Transcript covering this window:\n{transcript}\n\n"
         "Pick start_time/end_time as absolute seconds on this same timeline, snapped to real "
@@ -357,6 +382,8 @@ class LLMAgent:
             used_fallback=False,
             is_clip_worthy=is_clip_worthy,
             rejection_reason=rejection_reason,
+            source=candidate.source,
+            audio_peak_z_score=candidate.audio_peak_z_score,
         )
 
     def refine_candidates(
