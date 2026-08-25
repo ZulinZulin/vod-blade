@@ -10,6 +10,11 @@ pandas>=2.2.0
 numpy>=1.26.0
 scipy>=1.13.0
 
+# --- Audio / sound event classification ---
+# YAMNet ONNX model + class map are not pip-installable - see config.SoundEventConfig
+# and README setup notes for where to get bin/models/yamnet.onnx.
+onnxruntime>=1.29.0
+
 # --- Data Fetchers ---
 yt-dlp>=2024.8.6
 webvtt-py>=0.4.6

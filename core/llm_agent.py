@@ -22,8 +22,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
-from typing import Callable, List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional
 
 import litellm
 import requests
@@ -121,6 +121,7 @@ class CandidateClip:
     # in core/chat_analyzer.py for why this stays a plain string.
     source: str = "chat"
     audio_peak_z_score: Optional[float] = None
+    sound_events: Dict[str, float] = field(default_factory=dict)
 
     @property
     def duration(self) -> float:
@@ -132,17 +133,22 @@ class CandidateClip:
 # --------------------------------------------------------------------------- #
 
 DEFAULT_SYSTEM_PROMPT = """You are a viral video clip editor for Twitch/YouTube content. You are given a \
-transcript excerpt covering a window where CHAT ACTIVITY SPIKED STATISTICALLY at some point.
+transcript excerpt covering a window flagged by one or more automated detectors - a statistical chat \
+activity spike, a loud audio moment, and/or a detected acoustic event (e.g. laughter, screaming, \
+cheering) - the specific signal(s) for this window are described below the transcript.
 
-IMPORTANT: the reported spike timestamp marks when chat's reaction peaked, NOT when the actual \
-noteworthy moment happened. Chat takes time to read, react, and type - the real hook (the joke, the \
-mistake, the reveal) is very often tens of seconds BEFORE the spike timestamp, not at or after it. \
-Treat the spike timestamp as a rough pointer into the window, not the location of the moment itself. \
-Read the ENTIRE transcript window below and judge it as a whole - do not anchor your search on the \
-content immediately surrounding the spike timestamp.
+IMPORTANT: the reported timestamp marks when the detector's signal peaked, NOT necessarily when the \
+actual noteworthy moment happened. For a chat spike especially, chat takes time to read, react, and \
+type - the real hook (the joke, the mistake, the reveal) is very often tens of seconds BEFORE the spike \
+timestamp, not at or after it. Treat the timestamp as a rough pointer into the window, not the location \
+of the moment itself. Read the ENTIRE transcript window below and judge it as a whole - do not anchor \
+your search on the content immediately surrounding the timestamp.
 
-STEP 1 - Judge whether the window as a whole contains a moment actually worth clipping. A chat spike is \
-only a statistical signal; it does not guarantee anything worth watching happened. Apply a HIGH bar: ordinary conversation, routine \
+STEP 1 - Judge whether the window as a whole contains a moment actually worth clipping. A chat or audio \
+spike is only a statistical signal; it does not guarantee anything worth watching happened - a detected \
+acoustic event (laughter, screaming, cheering) is stronger evidence, since it's a direct classification \
+of the reaction itself rather than a correlated proxy, but still confirm it against the transcript rather \
+than accepting it blindly. Apply a HIGH bar: ordinary conversation, routine \
 explanation, or coherent-but-unremarkable discussion is NOT enough on its own, even if articulate or \
 substantive - most of any stream or podcast is exactly that, and none of it is clip-worthy by default. \
 Only call something clip-worthy if it would make a stranger with zero context stop scrolling: a joke that \
@@ -234,13 +240,10 @@ def build_stat_only_clip(
     reject them - the operator uses the existing manual accept/reject tools to
     curate a raw candidate list by hand instead.
     """
-    title_label = {"chat": "Chat hype spike", "audio_rms": "Audio peak", "chat+audio": "Chat+audio spike"}.get(
-        candidate.source, "Spike"
-    )
     return CandidateClip(
         start_time=candidate.window_start,
         end_time=candidate.window_end,
-        title=f"{title_label} at {candidate.spike_time:.0f}s",
+        title=f"{_title_label_for_source(candidate.source)} at {candidate.spike_time:.0f}s",
         viral_score=min(10, max(1, round(candidate.peak_z_score))),
         summary=summary,
         spike_time=candidate.spike_time,
@@ -250,12 +253,36 @@ def build_stat_only_clip(
         used_fallback=used_fallback,
         source=candidate.source,
         audio_peak_z_score=candidate.audio_peak_z_score,
+        sound_events=candidate.sound_events,
     )
+
+
+def _title_label_for_source(source: str) -> str:
+    """source may be a "+"-joined combination (see ClipCandidate.source) - pick the most
+    informative label rather than requiring an exact match for every combination."""
+    tags = source.split("+")
+    if "chat" in tags and "audio" in tags:
+        return "Chat+audio spike"
+    if "chat" in tags:
+        return "Chat hype spike"
+    if "audio" in tags:
+        return "Audio peak"
+    if "sound_event" in tags:
+        return "Sound event"
+    return "Spike"
 
 
 def _build_user_prompt(candidate: ClipCandidate, transcript: str, content_hint: str = "") -> str:
     hint_line = f"\nContext from the operator about this stream: {content_hint}\n" if content_hint and content_hint.strip() else ""
-    if candidate.source == "audio_rms":
+    tags = candidate.source.split("+")
+    if "chat" in tags:
+        signal_line = (
+            f"Chat's reaction peaked at t={candidate.spike_time:.1f}s within this window "
+            f"(peak hype score={candidate.peak_hype_score:.1f}, z-score={candidate.peak_z_score:.2f}) - "
+            f"remember this is where chat's reaction peaked, not necessarily where the actual moment is; "
+            f"scan the whole window above rather than just the content near this timestamp.\n"
+        )
+    elif "audio" in tags:
         signal_line = (
             f"This window was flagged by a LOUD AUDIO MOMENT at t={candidate.spike_time:.1f}s "
             f"(peak audio energy z-score={candidate.peak_z_score:.2f}), not by chat activity - chat may have "
@@ -263,20 +290,32 @@ def _build_user_prompt(candidate: ClipCandidate, transcript: str, content_hint: 
         )
     else:
         signal_line = (
-            f"Chat's reaction peaked at t={candidate.spike_time:.1f}s within this window "
-            f"(peak hype score={candidate.peak_hype_score:.1f}, z-score={candidate.peak_z_score:.2f}) - "
-            f"remember this is where chat's reaction peaked, not necessarily where the actual moment is; "
-            f"scan the whole window above rather than just the content near this timestamp.\n"
+            f"This window was flagged by a detected acoustic event at t={candidate.spike_time:.1f}s (see "
+            f"below), not by chat activity or raw volume - chat may have been quiet and the audio not "
+            f"especially loud, even if something notable happened.\n"
         )
     audio_context_line = (
         f"The audio track also peaked around this same window (energy z-score="
         f"{candidate.audio_peak_z_score:.2f}), reinforcing that something notable likely happened here.\n"
         if candidate.audio_peak_z_score is not None else ""
     )
+    sound_event_line = ""
+    if candidate.sound_events:
+        events_desc = ", ".join(
+            f"{cls} (confidence {conf:.2f})"
+            for cls, conf in sorted(candidate.sound_events.items(), key=lambda kv: kv[1], reverse=True)
+        )
+        # A detected acoustic event is more direct evidence than a statistical proxy: a real
+        # laugh or scream IS the reaction, not just a signal correlated with one.
+        sound_event_line = (
+            f"A distinct acoustic event was detected in this window: {events_desc}. Unlike chat/audio "
+            f"volume, this is direct evidence a real reaction happened here, not just a proxy for one.\n"
+        )
     return (
         f"Transcript window to judge: {candidate.window_start:.1f}s to {candidate.window_end:.1f}s.\n"
         f"{signal_line}"
         f"{audio_context_line}"
+        f"{sound_event_line}"
         f"{hint_line}\n"
         f"Transcript covering this window:\n{transcript}\n\n"
         "Pick start_time/end_time as absolute seconds on this same timeline, snapped to real "
@@ -384,6 +423,7 @@ class LLMAgent:
             rejection_reason=rejection_reason,
             source=candidate.source,
             audio_peak_z_score=candidate.audio_peak_z_score,
+            sound_events=candidate.sound_events,
         )
 
     def refine_candidates(

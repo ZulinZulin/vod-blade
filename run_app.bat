@@ -16,7 +16,7 @@ if not exist "%VENV_PYTHON%" (
 )
 
 echo [StreamCutter] Starting app.py ...
-echo [StreamCutter] Once it's up, open http://localhost:7862 in your browser.
+echo [StreamCutter] Once it's up, open http://localhost:7863 in your browser.
 echo.
 "%VENV_PYTHON%" app.py
 

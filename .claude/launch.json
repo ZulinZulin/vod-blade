@@ -5,7 +5,7 @@
       "name": "streamcutter-app",
       "runtimeExecutable": "E:\\StreamCutter\\.venv\\Scripts\\python.exe",
       "runtimeArgs": ["E:\\StreamCutter\\app.py"],
-      "port": 7862
+      "port": 7863
     }
   ]
 }

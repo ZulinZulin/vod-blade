@@ -29,12 +29,17 @@ DATA_DIR: Final[Path] = BASE_DIR / "data"
 CACHE_DIR: Final[Path] = DATA_DIR / "cache"
 THUMBNAILS_DIR: Final[Path] = CACHE_DIR / "thumbnails"
 AUDIO_RMS_CACHE_DIR: Final[Path] = CACHE_DIR / "audio_rms"
+SOUND_EVENT_CACHE_DIR: Final[Path] = CACHE_DIR / "sound_events"
 DOWNLOADS_DIR: Final[Path] = DATA_DIR / "downloads"
 EXPORTS_DIR: Final[Path] = DATA_DIR / "exports"
 SESSIONS_DIR: Final[Path] = DATA_DIR / "sessions"
 BIN_DIR: Final[Path] = BASE_DIR / "bin"
+MODELS_DIR: Final[Path] = BIN_DIR / "models"
 
-for _dir in (DATA_DIR, CACHE_DIR, THUMBNAILS_DIR, AUDIO_RMS_CACHE_DIR, DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, BIN_DIR):
+for _dir in (
+    DATA_DIR, CACHE_DIR, THUMBNAILS_DIR, AUDIO_RMS_CACHE_DIR, SOUND_EVENT_CACHE_DIR,
+    DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, BIN_DIR, MODELS_DIR,
+):
     _dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -215,6 +220,88 @@ class AudioScoreConfig:
 
 
 # --------------------------------------------------------------------------- #
+# Sound event classification (core/sound_event_classifier.py)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SoundEventConfig:
+    """
+    Thresholds for YAMNet-based acoustic event detection (laughter, screaming,
+    cheering, groaning). A genuinely independent third detector, same as
+    AudioScoreConfig - chat-only and audio-RMS analysis both keep working
+    unaffected if this is disabled or the model file isn't present.
+
+    Detection here is a plain threshold on the model's own per-class confidence,
+    NOT a rolling Z-score like HypeScoreConfig/AudioScoreConfig use: a
+    classifier's confidence output is already normalized to [0, 1] by the model
+    itself, so there's no stream-relative baseline to compute a spike against -
+    unlike raw chat volume or audio energy, which are scale-dependent per stream
+    and only meaningful relative to their own recent history.
+
+    Model files are NOT auto-downloaded, matching BinaryConfig's own convention
+    for TwitchDownloaderCLI - see validate(). sample_rate matches
+    AudioScoreConfig's (16000) since both consume the exact same waveform from
+    core.audio_analyzer.extract_pcm_waveform; no second decode.
+    """
+
+    model_path: Path = field(
+        default_factory=lambda: Path(os.getenv("YAMNET_ONNX_PATH", str(MODELS_DIR / "yamnet.onnx")))
+    )
+    class_map_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("YAMNET_CLASS_MAP_PATH", str(MODELS_DIR / "yamnet_class_map.csv"))
+        )
+    )
+    sample_rate: int = 16000
+
+    # Event names - each is actually a SUM of several related AudioSet classes, not one
+    # class thresholded alone (see core.sound_event_classifier._EVENT_CLASS_GROUPS); an
+    # entry with no known grouping falls back to just that one class map display_name.
+    target_classes: List[str] = field(
+        default_factory=lambda: ["Laughter", "Screaming", "Cheering", "Groan"]
+    )
+    confidence_threshold: float = 0.5
+    # Must stay comfortably under one frame's duration (the model's hop is ~0.48s) - a
+    # value at or above that would reject even a single maximally-confident frame, since
+    # one frame's own run-duration is only ~0.48s. Confirmed against real content where a
+    # genuine laugh registered strongly for exactly one frame before dropping away again.
+    min_event_duration_s: float = 0.3
+
+    # Inference runs in chunks rather than one call over the whole waveform - confirmed
+    # against a real multi-hour VOD that a single call's intermediate conv-layer memory
+    # scales with total input length (an 8.5GB allocation for ~5.7 hours of audio), not
+    # just the final per-frame output size. 300s keeps each call's footprint small with
+    # a reasonable number of calls even for a very long stream.
+    chunk_duration_s: float = 300.0
+
+    min_seconds_between_spikes: int = 45
+    pre_spike_seconds: int = 60
+    post_spike_seconds: int = 30
+    max_merged_duration_seconds: float = 300.0
+
+    # See AudioScoreConfig.cross_modal_overlap_tolerance_s - same reasoning, applied
+    # when merging sound-event candidates into the chat/audio-enriched list.
+    overlap_tolerance_s: float = 30.0
+    allow_new_candidates: bool = True
+
+    def validate(self) -> List[str]:
+        """Return a list of human-readable problems, empty if all is well."""
+        problems = []
+        if not self.model_path.exists():
+            problems.append(
+                f"YAMNet ONNX model not found at '{self.model_path}'. Set YAMNET_ONNX_PATH or place "
+                "yamnet.onnx there (see the setup notes for where to get it)."
+            )
+        if not self.class_map_path.exists():
+            problems.append(
+                f"YAMNet class map not found at '{self.class_map_path}'. Set YAMNET_CLASS_MAP_PATH or "
+                "place yamnet_class_map.csv there."
+            )
+        return problems
+
+
+# --------------------------------------------------------------------------- #
 # LLM agent (core/llm_agent.py)
 # --------------------------------------------------------------------------- #
 
@@ -383,6 +470,7 @@ class Settings:
     fetcher: FetcherConfig = field(default_factory=FetcherConfig)
     hype: HypeScoreConfig = field(default_factory=HypeScoreConfig)
     audio: AudioScoreConfig = field(default_factory=AudioScoreConfig)
+    sound_event: SoundEventConfig = field(default_factory=SoundEventConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
 

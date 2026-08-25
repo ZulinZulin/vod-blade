@@ -185,7 +185,7 @@ class AudioAnalyzer:
                 spike_time=float(row["bin_start"]),
                 peak_hype_score=float(row["rms"]),
                 peak_z_score=float(row["z_score"]),
-                source="audio_rms",
+                source="audio",
             )
             for row in selected
         ]
@@ -216,6 +216,35 @@ class AudioAnalyzer:
         return merged
 
 
+# Fixed display order for ClipCandidate.source combinations - see _add_source_tag. New
+# detectors (e.g. a future third or fourth signal) just add their tag here; nothing else
+# needs to change to keep combined source strings ordered consistently.
+_SOURCE_TAG_ORDER = ["chat", "audio", "sound_event"]
+
+
+def _add_source_tag(existing_source: str, tag: str) -> str:
+    """
+    Adds `tag` to a ClipCandidate.source, keeping the "+"-joined result in a fixed,
+    predictable order regardless of which detector ran first or which merge order
+    was used - e.g. adding "audio" to "chat" always gives "chat+audio", never
+    "audio+chat", so app.py's exact-string checks (and this module's own) stay valid
+    no matter which merge function touched the candidate most recently.
+    """
+    tags = set(existing_source.split("+")) | {tag}
+    return "+".join(t for t in _SOURCE_TAG_ORDER if t in tags)
+
+
+def _same_moment(a: ClipCandidate, b: ClipCandidate, tolerance_s: float) -> bool:
+    """
+    "Same real-world moment" is decided by spike_time proximity, NOT by comparing
+    the two candidates' padded windows - pre_spike_seconds/post_spike_seconds exist
+    to give the LLM transcript context, not to define real-world proximity, and
+    with 60s/30s padding on each side a padded-window overlap check would let two
+    editorially distinct spikes up to ~90s apart falsely "confirm" each other.
+    """
+    return abs(a.spike_time - b.spike_time) <= tolerance_s
+
+
 def merge_with_chat_candidates(
     chat_candidates: List[ClipCandidate],
     audio_candidates: List[ClipCandidate],
@@ -228,37 +257,31 @@ def merge_with_chat_candidates(
     self-contained and independently legible/tunable (chat spike thresholds
     never need retuning because of how sensitive audio is, or vice versa).
 
-    "Same real-world moment" is decided by spike_time proximity (within
-    overlap_tolerance_s), NOT by comparing the two candidates' padded windows -
-    pre_spike_seconds/post_spike_seconds exist to give the LLM transcript
-    context, not to define real-world proximity, and with 60s/30s padding on
-    each side a padded-window overlap check would let two editorially distinct
-    spikes up to ~90s apart falsely "confirm" each other.
-
     An audio spike within tolerance of a chat candidate enriches that candidate
-    (audio_peak_z_score set, source bumped to "chat+audio") instead of creating
-    a near-duplicate entry for the same real moment. An audio spike with no
-    nearby chat candidate becomes its own standalone candidate only if
+    (audio_peak_z_score set, source gains the "audio" tag) instead of creating a
+    near-duplicate entry for the same real moment. An audio spike with no nearby
+    chat candidate becomes its own standalone candidate only if
     allow_new_candidates is True; otherwise it's dropped, since with the toggle
     off audio should only ever add context to what chat already flagged, never
     surface a moment chat missed entirely.
-    """
 
-    def same_moment(a: ClipCandidate, b: ClipCandidate) -> bool:
-        return abs(a.spike_time - b.spike_time) <= overlap_tolerance_s
+    A third detector (e.g. sound-event classification) doesn't extend this
+    function - it composes on top via its own merge_sound_events(), applied to
+    this function's output. See that function's docstring.
+    """
 
     enriched: List[ClipCandidate] = []
     for cc in chat_candidates:
-        nearby = [ac for ac in audio_candidates if same_moment(ac, cc)]
+        nearby = [ac for ac in audio_candidates if _same_moment(ac, cc, overlap_tolerance_s)]
         if nearby:
             best = max(nearby, key=lambda a: a.peak_z_score)
-            cc = replace(cc, source="chat+audio", audio_peak_z_score=best.peak_z_score)
+            cc = replace(cc, source=_add_source_tag(cc.source, "audio"), audio_peak_z_score=best.peak_z_score)
         enriched.append(cc)
 
     result = enriched
     if allow_new_candidates:
         unmatched_audio = [
-            ac for ac in audio_candidates if not any(same_moment(ac, cc) for cc in chat_candidates)
+            ac for ac in audio_candidates if not any(_same_moment(ac, cc, overlap_tolerance_s) for cc in chat_candidates)
         ]
         result = result + unmatched_audio
 

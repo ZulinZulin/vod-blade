@@ -40,8 +40,9 @@ from core.fetchers import (
 )
 from core.llm_agent import (
     DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError,
-    build_stat_only_clip, format_transcript, select_subtitle_window,
+    _title_label_for_source, build_stat_only_clip, format_transcript, select_subtitle_window,
 )
+from core.sound_event_classifier import SoundEventClassifier, SoundEventError, merge_sound_events
 from core.preview import PreviewError, extract_preview_clip, extract_thumbnail
 from core.session_store import (
     SessionError, delete_session, list_sessions, load_session, purge_sessions, save_session,
@@ -150,33 +151,46 @@ def build_hype_timeline_figure(
     audio_candidates: Optional[List[ClipCandidate]] = None,
 ) -> go.Figure:
     """
-    `candidates` is the final, post-merge list (chat/chat+audio/audio_rms all
-    mixed together - see core.audio_analyzer.merge_with_chat_candidates) and is
-    used for the chat skyline/markers. `audio_candidates`, when given, is the
-    ORIGINAL pre-merge audio-detector output - used for the audio skyline/
-    markers instead, since a merged "chat+audio" candidate's peak_hype_score is
-    on chat's scale, not audio's, and would draw a nonsense-height vertex on
-    the audio trace.
+    `candidates` is the final, post-merge list (chat/audio/sound_event tags mixed
+    together in various "+"-joined combinations - see core.audio_analyzer and
+    core.sound_event_classifier's merge functions) and is used for the chat
+    skyline/markers. `audio_candidates`, when given, is the ORIGINAL pre-merge
+    audio-detector output - used for the audio skyline/markers instead, since a
+    candidate enriched with the "audio" tag keeps its ORIGINAL peak_hype_score
+    (chat's scale if it started as a chat candidate), which would draw a
+    nonsense-height vertex on the audio trace.
+
+    Marker categories are decided by which tags are present, not by an exact
+    match on the whole (growing) set of possible source strings - a candidate
+    tagged "chat+audio+sound_event" is still fundamentally a chat candidate for
+    plotting purposes, just one every detector agrees on.
     """
     fig = go.Figure()
     if timeline_df.empty:
         fig.update_layout(title="No chat data yet - run an analysis to populate this graph.", template="plotly_dark")
         return fig
 
-    chat_line_candidates = [c for c in candidates if c.source != "audio_rms"]
+    def tags(c: ClipCandidate) -> List[str]:
+        return c.source.split("+")
+
+    chat_line_candidates = [c for c in candidates if "chat" in tags(c)]
     xs, ys = _build_skyline_anchors(timeline_df, chat_line_candidates)
     fig.add_trace(go.Scatter(
         x=xs, y=ys,
         mode="lines", name="Hype score", line=dict(color="#7c5cff", width=1.5),
     ))
 
-    # Three marker categories so an operator can tell at a glance which detector(s)
-    # flagged a given moment: chat-only (pink circle), chat confirmed by a coincident
-    # audio peak (gold circle - same shape, since it IS a chat candidate), and
-    # audio-only (teal diamond, plotted against the secondary axis below).
-    chat_only = [c for c in candidates if c.source == "chat"]
-    chat_and_audio = [c for c in candidates if c.source == "chat+audio"]
-    audio_only = [c for c in candidates if c.source == "audio_rms"]
+    # Marker categories so an operator can tell at a glance which detector(s) flagged a
+    # given moment: chat-only (pink circle), chat confirmed by a coincident audio peak
+    # (gold circle - same shape, since it IS a chat candidate), audio-only (teal diamond,
+    # plotted against the secondary axis below), and a rare sound-event-only candidate
+    # neither chat nor audio-RMS caught (purple star, plotted on the primary axis using
+    # the chat timeline's own value at that time - its real peak_hype_score is a [0, 1]
+    # model confidence, not a chat-scale number, so it can't be plotted at face value).
+    chat_only = [c for c in candidates if "chat" in tags(c) and "audio" not in tags(c)]
+    chat_and_audio = [c for c in candidates if "chat" in tags(c) and "audio" in tags(c)]
+    audio_only = [c for c in candidates if "audio" in tags(c) and "chat" not in tags(c)]
+    sound_event_only = [c for c in candidates if tags(c) == ["sound_event"]]
     if chat_only:
         fig.add_trace(go.Scatter(
             x=[c.spike_time for c in chat_only], y=[c.peak_hype_score for c in chat_only],
@@ -189,8 +203,30 @@ def build_hype_timeline_figure(
             mode="markers", name="Chat+audio confirmed",
             marker=dict(color="#facc15", size=8, symbol="circle"),
         ))
+    if sound_event_only:
+        fig.add_trace(go.Scatter(
+            x=[c.spike_time for c in sound_event_only],
+            y=[_nearest_rolling_mean(timeline_df, c.spike_time) for c in sound_event_only],
+            mode="markers", name="Sound event (unconfirmed)",
+            marker=dict(color="#c084fc", size=9, symbol="star"),
+        ))
     for c in candidates:
         fig.add_vrect(x0=c.window_start, x1=c.window_end, fillcolor="#ff4d6d", opacity=0.08, line_width=0)
+
+    # A sound event can attach to a chat or audio candidate too (not just show up on its
+    # own as sound_event_only above) - a hollow star "halo" drawn over that candidate's
+    # existing marker flags this without inventing a new category per combination (chat+
+    # event, audio+event, chat+audio+event, ...). Split by axis for the same reason the
+    # primary marker groups are: a chat-tagged candidate's peak_hype_score is only valid
+    # on the primary axis, an audio-only one only on the secondary.
+    primary_axis_events = [c for c in candidates if c.sound_events and "chat" in tags(c)]
+    secondary_axis_events = [c for c in candidates if c.sound_events and "audio" in tags(c) and "chat" not in tags(c)]
+    if primary_axis_events:
+        fig.add_trace(go.Scatter(
+            x=[c.spike_time for c in primary_axis_events], y=[c.peak_hype_score for c in primary_axis_events],
+            mode="markers", name="Sound event detected",
+            marker=dict(color="#c084fc", size=16, symbol="star-open", line=dict(width=2)),
+        ))
 
     layout_kwargs = dict(
         title="Chat Hype Timeline",
@@ -213,6 +249,13 @@ def build_hype_timeline_figure(
                 x=[c.spike_time for c in audio_only], y=[c.peak_hype_score for c in audio_only], yaxis="y2",
                 mode="markers", name="Audio-only peak",
                 marker=dict(color="#2dd4bf", size=8, symbol="diamond"),
+            ))
+        if secondary_axis_events:
+            fig.add_trace(go.Scatter(
+                x=[c.spike_time for c in secondary_axis_events],
+                y=[c.peak_hype_score for c in secondary_axis_events], yaxis="y2",
+                mode="markers", name="Sound event detected", showlegend=not primary_axis_events,
+                marker=dict(color="#c084fc", size=16, symbol="star-open", line=dict(width=2)),
             ))
         layout_kwargs["yaxis2"] = dict(
             title="Audio RMS energy", overlaying="y", side="right", showgrid=False,
@@ -325,18 +368,24 @@ def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
         body = f"{clip.summary}{override_note}"
         header = f"**#{rank}. {clip.title}**{fallback_note}"
 
-    spike_label = {
-        "chat": "Chat spike", "audio_rms": "Audio peak", "chat+audio": "Chat spike",
-    }.get(clip.source, "Spike")
+    spike_label = _title_label_for_source(clip.source)
     audio_confirm_note = (
         f", audio also peaked here (z={clip.audio_peak_z_score:.2f})" if clip.audio_peak_z_score is not None else ""
+    )
+    sound_event_note = (
+        ", detected: " + ", ".join(
+            f"{cls} ({conf:.2f})"
+            for cls, conf in sorted(clip.sound_events.items(), key=lambda kv: kv[1], reverse=True)
+        )
+        if clip.sound_events else ""
     )
     return (
         f"{header}\n\n"
         f"{body}\n\n"
         f"**{_format_hms(clip.start_time)} -> {_format_hms(clip.end_time)}**  "
         f"({clip.duration:.1f}s)  |  Viral score: **{clip.viral_score}/10**\n\n"
-        f"{spike_label} at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f}){audio_confirm_note}"
+        f"{spike_label} at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f})"
+        f"{audio_confirm_note}{sound_event_note}"
     )
 
 
@@ -723,6 +772,10 @@ def run_pipeline(
     audio_enable: bool,
     audio_z_threshold: float,
     audio_allow_new: bool,
+    sound_event_enable: bool,
+    sound_event_classes: List[str],
+    sound_event_confidence: float,
+    sound_event_allow_new: bool,
     progress=gr.Progress(),
 ):
     # Gradio Textbox/Dropdown components default to value=None (not "") when left
@@ -754,6 +807,11 @@ def run_pipeline(
         raise gr.Error(
             "Audio peak analysis is enabled but the local source video path above doesn't point to an "
             "existing file - download the VOD first, or disable audio peak analysis."
+        )
+    if sound_event_enable and not (source_video_path and Path(source_video_path).exists()):
+        raise gr.Error(
+            "Sound event detection is enabled but the local source video path above doesn't point to an "
+            "existing file - download the VOD first, or disable sound event detection."
         )
 
     progress(0.05, desc="Fetching subtitles...")
@@ -805,6 +863,24 @@ def run_pipeline(
             overlap_tolerance_s=settings.audio.cross_modal_overlap_tolerance_s,
         )
 
+    if sound_event_enable:
+        progress(0.68, desc="Classifying acoustic events...")
+        sound_event_cfg = replace(
+            settings.sound_event,
+            target_classes=sound_event_classes or settings.sound_event.target_classes,
+            confidence_threshold=sound_event_confidence,
+            allow_new_candidates=sound_event_allow_new,
+        )
+        try:
+            classifier = SoundEventClassifier(config=sound_event_cfg)
+            sound_event_candidates, _sound_event_timeline = classifier.analyze_with_timeline(source_video_path)
+        except SoundEventError as exc:
+            raise gr.Error(f"Sound event classification failed: {exc}")
+        candidates = merge_sound_events(
+            candidates, sound_event_candidates, sound_event_allow_new,
+            overlap_tolerance_s=settings.sound_event.overlap_tolerance_s,
+        )
+
     if skip_llm:
         # Fast path for tuning hype detection or testing the UI without waiting on real LLM
         # calls: build clips straight from the raw statistical candidates, no judgment at all.
@@ -852,11 +928,15 @@ def run_pipeline(
     fig = build_hype_timeline_figure(timeline_df, candidates, audio_timeline_df, audio_candidates)
     audio_note = ""
     if audio_enable:
-        audio_only_count = sum(1 for c in refined_clips if c.source == "audio_rms")
-        confirmed_count = sum(1 for c in refined_clips if c.source == "chat+audio")
+        audio_only_count = sum(1 for c in refined_clips if "audio" in c.source.split("+") and "chat" not in c.source.split("+"))
+        confirmed_count = sum(1 for c in refined_clips if "chat" in c.source.split("+") and "audio" in c.source.split("+"))
         audio_note = f" ({audio_only_count} audio-only, {confirmed_count} chat+audio-confirmed)"
+    sound_event_note = ""
+    if sound_event_enable:
+        event_count = sum(1 for c in refined_clips if c.sound_events)
+        sound_event_note = f" ({event_count} with a detected acoustic event)"
     status = (
-        f"Analyzed {len(messages)} chat messages -> {len(candidates)} candidate(s){audio_note} -> "
+        f"Analyzed {len(messages)} chat messages -> {len(candidates)} candidate(s){audio_note}{sound_event_note} -> "
         f"{kept_count} clip(s) kept"
         + (
             f", {rejected_count} rejected (toggle 'Show rejected candidates' to review)."
@@ -1123,6 +1203,34 @@ def build_app() -> gr.Blocks:
                         label="Allow audio-only peaks (no matching chat spike) to become their own candidates",
                         value=settings.audio.allow_new_candidates,
                     )
+            with gr.Accordion("Sound event detection (advanced)", open=False):
+                _sound_event_problems = settings.sound_event.validate()
+                gr.Markdown(
+                    "Detects specific acoustic events (laughter, screaming, cheering, groaning) via a "
+                    "YAMNet model - also requires the local source video above.\n\n"
+                    + (
+                        f"_Model not ready: {' '.join(_sound_event_problems)}_"
+                        if _sound_event_problems else "_YAMNet model found and ready._"
+                    )
+                )
+                sound_event_enable_checkbox = gr.Checkbox(
+                    label="Enable sound event detection", value=False,
+                )
+                sound_event_classes_input = gr.CheckboxGroup(
+                    label="Event types to detect",
+                    choices=settings.sound_event.target_classes,
+                    value=settings.sound_event.target_classes,
+                )
+                with gr.Row():
+                    sound_event_confidence_input = gr.Slider(
+                        label="Confidence threshold (higher = fewer, more certain events)",
+                        minimum=0.05, maximum=0.95, step=0.05,
+                        value=settings.sound_event.confidence_threshold,
+                    )
+                    sound_event_allow_new_checkbox = gr.Checkbox(
+                        label="Allow event-only peaks (no matching chat/audio spike) to become their own candidates",
+                        value=settings.sound_event.allow_new_candidates,
+                    )
             with gr.Accordion("LLM provider (advanced)", open=False):
                 llm_provider_input = gr.Dropdown(
                     label="LLM provider",
@@ -1311,6 +1419,8 @@ def build_app() -> gr.Blocks:
                 llm_provider_input, llm_model_input, llm_api_base_input, llm_api_key_input,
                 skip_llm_checkbox,
                 audio_enable_checkbox, audio_z_threshold_input, audio_allow_new_checkbox,
+                sound_event_enable_checkbox, sound_event_classes_input,
+                sound_event_confidence_input, sound_event_allow_new_checkbox,
             ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
@@ -1445,7 +1555,7 @@ def _load_custom_css() -> str:
 if __name__ == "__main__":
     app = build_app()
     app.queue().launch(
-        server_port=7862,
+        server_port=7863,
         css_paths=[_UI_DIR / "theme.css"],
         css=_load_custom_css(),
         allowed_paths=[str(_UI_DIR)],

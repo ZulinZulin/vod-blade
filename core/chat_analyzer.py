@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -70,15 +70,21 @@ class ClipCandidate:
     spike_time: float
     peak_hype_score: float
     peak_z_score: float
-    # "chat" | "audio_rms" | "chat+audio" (set by core/audio_analyzer.merge_with_chat_candidates
-    # when a chat and an audio spike overlap). Left as a plain string, not an enum: Phase 2
-    # (YAMNet sound-event classification) is already planned to add more values
-    # (e.g. "audio:laughter"), so locking this to a fixed set now would need revisiting soon.
+    # "+"-joined combination of one or more of "chat" | "audio" | "sound_event", always in
+    # that fixed order (see core/audio_analyzer._add_source_tag) - e.g. "chat", "audio",
+    # "chat+audio", "chat+audio+sound_event". Left as a plain string, not an enum, since
+    # this tag set has already grown once (audio, then sound_event) and is expected to
+    # keep growing as more detectors are added.
     source: str = "chat"
-    # Set only on a chat-sourced candidate that an overlapping audio spike also confirmed -
-    # extra context surfaced to the LLM prompt (see llm_agent._build_user_prompt), not used
-    # for anything else. None when audio analysis is disabled or found no overlap here.
+    # Set when an overlapping audio-RMS spike also confirmed this candidate - extra context
+    # surfaced to the LLM prompt (see llm_agent._build_user_prompt). None if audio analysis
+    # is disabled or found no overlap here.
     audio_peak_z_score: Optional[float] = None
+    # Sound-event class name -> peak confidence (e.g. {"Laughter": 0.88}) for any YAMNet
+    # classes detected at/near this candidate, regardless of whether this candidate
+    # originated from chat, audio-RMS, or the sound-event detector itself. Empty when sound
+    # event detection is disabled or found nothing here.
+    sound_events: Dict[str, float] = field(default_factory=dict)
 
     @property
     def duration(self) -> float:
