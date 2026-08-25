@@ -89,25 +89,63 @@ CARD_WINDOW_PADDING_S = 180.0
 # --------------------------------------------------------------------------- #
 
 
+# How often (seconds) the skyline's floor resamples rolling_mean between spikes -
+# coarser than bin resolution on purpose, since rolling_mean is already smooth by
+# construction and a sparse sample is enough to show real drift without redrawing
+# every noisy raw bin.
+_HYPE_BASELINE_SAMPLE_INTERVAL_S = 60.0
+# How many bin-widths before/after each spike the sharp rise/fall happens.
+_HYPE_SETTLE_BIN_MULTIPLE = 1.5
+
+
+def _nearest_rolling_mean(timeline_df: pd.DataFrame, x: float) -> float:
+    idx = (timeline_df["bin_start"] - x).abs().idxmin()
+    return float(timeline_df.loc[idx, "rolling_mean"])
+
+
 def build_hype_timeline_figure(timeline_df: pd.DataFrame, candidates: List[ClipCandidate]) -> go.Figure:
     fig = go.Figure()
     if timeline_df.empty:
         fig.update_layout(title="No chat data yet - run an analysis to populate this graph.", template="plotly_dark")
         return fig
 
+    # "Skyline" curve: tracing every raw bin reads as noisy even where nothing
+    # notable is happening, since chat volume is bursty at bin resolution. Instead
+    # the line is built from a sparse set of anchors - a slowly-drifting floor
+    # (rolling_mean, resampled every _HYPE_BASELINE_SAMPLE_INTERVAL_S seconds)
+    # plus a sharp rise/settle pair around each real spike, both read from the
+    # same rolling_mean the spike detector itself measures deviations against -
+    # so a spike's height above the floor stays an honest reflection of real
+    # chat volume instead of an arbitrary flat baseline.
+    bin_width = float(timeline_df["bin_start"].diff().median() or 5.0)
+    step_rows = max(1, round(_HYPE_BASELINE_SAMPLE_INTERVAL_S / bin_width))
+    anchors = {
+        float(row.bin_start): float(row.rolling_mean)
+        for row in timeline_df.iloc[::step_rows].itertuples(index=False)
+    }
+    last_row = timeline_df.iloc[-1]
+    anchors[float(last_row["bin_start"])] = float(last_row["rolling_mean"])  # always reach the true end
+
+    t_min = float(timeline_df["bin_start"].min())
+    t_max = float(timeline_df["bin_start"].max())
+    settle_offset = _HYPE_SETTLE_BIN_MULTIPLE * bin_width
+    for c in candidates:
+        pre_x = max(t_min, c.spike_time - settle_offset)
+        post_x = min(t_max, c.spike_time + settle_offset)
+        anchors[pre_x] = _nearest_rolling_mean(timeline_df, pre_x)
+        anchors[post_x] = _nearest_rolling_mean(timeline_df, post_x)
+        anchors[c.spike_time] = c.peak_hype_score  # the real recorded peak, not a smoothed value
+
+    xs, ys = zip(*sorted(anchors.items()))
     fig.add_trace(go.Scatter(
-        x=timeline_df["bin_start"], y=timeline_df["hype_score"],
+        x=xs, y=ys,
         mode="lines", name="Hype score", line=dict(color="#7c5cff", width=1.5),
-    ))
-    fig.add_trace(go.Scatter(
-        x=timeline_df["bin_start"], y=timeline_df["rolling_mean"],
-        mode="lines", name="Rolling baseline", line=dict(color="#888888", width=1, dash="dot"),
     ))
     if candidates:
         fig.add_trace(go.Scatter(
             x=[c.spike_time for c in candidates], y=[c.peak_hype_score for c in candidates],
             mode="markers", name="Detected spikes",
-            marker=dict(color="#ff4d6d", size=11, symbol="star"),
+            marker=dict(color="#ff4d6d", size=7, symbol="circle"),
         ))
         for c in candidates:
             fig.add_vrect(x0=c.window_start, x1=c.window_end, fillcolor="#ff4d6d", opacity=0.08, line_width=0)
@@ -122,6 +160,62 @@ def build_hype_timeline_figure(timeline_df: pd.DataFrame, candidates: List[ClipC
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     return fig
+
+
+# Fed to hype_plot.change(js=...) so a click on the rendered Plotly chart reaches
+# a Python callback. gr.Plot has no click/select event of its own, so this listens
+# for Plotly's own native 'plotly_click' directly on the chart's div and forwards
+# the clicked point's x (time) through a visible="hidden" bridge textbox + button -
+# visible=False would unmount them from the DOM entirely, leaving nothing for this
+# script to write into. The clicked point's x is forwarded as-is rather than
+# resolved to a specific candidate here, because a click landing exactly on a
+# marker can get attributed to the underlying line trace instead (same x/y,
+# different curveNumber) - matching by x-distance in Python, against the full
+# precision spike_time list it already has in memory, sidesteps that ambiguity.
+_HYPE_CLICK_BRIDGE_JS = """
+() => {
+    // hype_plot.change() fires the instant Gradio's value updates, which is before
+    // Plotly's own async rendering has actually inserted .js-plotly-plot into the
+    // DOM - so the div isn't there yet on the first attempt. Poll briefly instead
+    // of assuming it already exists.
+    let attempts = 0;
+    const tryBind = () => {
+        const plotDiv = document.querySelector('#hype_plot .js-plotly-plot');
+        if (!plotDiv) {
+            if (attempts++ < 40) setTimeout(tryBind, 100);
+            return;
+        }
+        if (plotDiv._scHypeClickBound) return;
+        plotDiv._scHypeClickBound = true;
+        plotDiv.on('plotly_click', (data) => {
+            const point = data.points && data.points[0];
+            if (!point || typeof point.x !== 'number') return;
+            const hiddenInput = document.querySelector('#hype_click_bridge textarea, #hype_click_bridge input');
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+            nativeSetter.call(hiddenInput, String(point.x));
+            hiddenInput.dispatchEvent(new Event('input', { bubbles: true }));
+            document.querySelector('#hype_click_bridge_button').click();
+        });
+    };
+    tryBind();
+}
+"""
+
+# Fed to the click-handling button's .then(js=...). Runs after the page/card
+# updates from do_hype_plot_click have rendered, and reads the slot index that
+# callback wrote into hype_highlight_signal (empty string = no match, do nothing).
+_HYPE_HIGHLIGHT_SCROLL_JS = """
+() => {
+    const sig = document.querySelector('#hype_highlight_signal textarea, #hype_highlight_signal input');
+    const slot = sig ? sig.value : '';
+    if (!slot) return;
+    const card = document.getElementById('candidate-card-slot-' + slot);
+    if (!card) return;
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.add('candidate-card-highlight');
+    setTimeout(() => card.classList.remove('candidate-card-highlight'), 2000);
+}
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +369,53 @@ def go_to_page(clips: List[CandidateClip], show_rejected: bool, page: int, sourc
     visible = _visible_clips(clips, show_rejected)
     new_page = _clamp_page(page + delta, visible)
     return (new_page, _page_label(visible, new_page), *_build_card_updates(visible, new_page, source_video_path))
+
+
+# How close a click needs to land (in seconds of stream time) to count as hitting a
+# spike marker rather than an empty stretch of the line - generous enough to forgive
+# imprecise clicks on a long timeline, tight enough not to jump to a distant spike.
+_HYPE_CLICK_TOLERANCE_S = 15.0
+
+
+def do_hype_plot_click(
+    clips: List[CandidateClip], show_rejected: bool, page: int, source_video_path: str, clicked_x: str,
+):
+    """
+    Handles a hype-plot click forwarded by _HYPE_CLICK_BRIDGE_JS. Finds the clip
+    whose spike_time is nearest the clicked x; if it's within tolerance and not
+    rejected, jumps to its page and signals which card slot to scroll to and
+    highlight. Anywhere else on the graph, or a rejected clip's own spike, is a
+    silent no-op - the last output (hype_highlight_signal) is left empty either way.
+    """
+    no_op = (gr.update(), gr.update(), *([gr.update()] * (MAX_CLIP_CARDS * 8)), "")
+
+    x = None
+    try:
+        if clicked_x:
+            x = float(clicked_x)
+    except (TypeError, ValueError):
+        x = None
+
+    if x is None or not clips:
+        return no_op
+
+    nearest = min(clips, key=lambda c: abs(c.spike_time - x))
+    if abs(nearest.spike_time - x) > _HYPE_CLICK_TOLERANCE_S or not nearest.is_clip_worthy:
+        return no_op
+
+    visible = _visible_clips(clips, show_rejected)
+    target_index = next((i for i, c in enumerate(visible) if c is nearest), None)
+    if target_index is None:
+        return no_op  # an is_clip_worthy clip is always in `visible`; stay defensive anyway
+
+    target_page = target_index // MAX_CLIP_CARDS
+    slot = target_index % MAX_CLIP_CARDS
+    return (
+        target_page,
+        _page_label(visible, target_page),
+        *_build_card_updates(visible, target_page, source_video_path),
+        str(slot),
+    )
 
 
 def _sync_bound(
@@ -941,7 +1082,12 @@ def build_app() -> gr.Blocks:
             status_box = gr.Markdown("")
 
         gr.Markdown("### Chat Hype Timeline")
-        hype_plot = gr.Plot()
+        hype_plot = gr.Plot(elem_id="hype_plot")
+        # Bridge components for _HYPE_CLICK_BRIDGE_JS / _HYPE_HIGHLIGHT_SCROLL_JS - visible="hidden"
+        # (not visible=False) so they stay mounted in the DOM for the JS to reach.
+        hype_click_bridge = gr.Textbox(elem_id="hype_click_bridge", visible="hidden")
+        hype_click_bridge_button = gr.Button(elem_id="hype_click_bridge_button", visible="hidden")
+        hype_highlight_signal = gr.Textbox(elem_id="hype_highlight_signal", visible="hidden")
 
         with gr.Accordion("Subtitles (verify language / scroll for context around a clip)", open=False):
             subtitles_display = gr.Textbox(
@@ -986,8 +1132,10 @@ def build_app() -> gr.Blocks:
 
         card_components = []
         with gr.Row(elem_classes=["candidate-grid"]):
-            for _ in range(MAX_CLIP_CARDS):
-                with gr.Group(visible=False, elem_classes=["candidate-card"]) as card_group:
+            for slot_idx in range(MAX_CLIP_CARDS):
+                with gr.Group(
+                    visible=False, elem_classes=["candidate-card"], elem_id=f"candidate-card-slot-{slot_idx}",
+                ) as card_group:
                     # Thumbnail and video share the same slot: the thumbnail is a cheap
                     # auto-generated frame shown by default; clicking it (or "Preview clip")
                     # extracts and swaps in the real playable clip in its place.
@@ -1074,6 +1222,13 @@ def build_app() -> gr.Blocks:
             inputs=[llm_provider_input],
             outputs=[llm_model_input, llm_api_base_input],
         )
+
+        hype_plot.change(fn=None, inputs=None, outputs=None, js=_HYPE_CLICK_BRIDGE_JS)
+        hype_click_bridge_button.click(
+            fn=do_hype_plot_click,
+            inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input, hype_click_bridge],
+            outputs=[page_state, page_label, *card_outputs, hype_highlight_signal],
+        ).then(fn=None, inputs=None, outputs=None, js=_HYPE_HIGHLIGHT_SCROLL_JS)
 
         prev_page_btn.click(
             fn=partial(go_to_page, delta=-1),

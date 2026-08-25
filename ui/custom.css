@@ -61,6 +61,21 @@ body {
     min-width: 380px !important;
 }
 
+/* Briefly flashes the card a clicking a hype-plot spike marker scrolls to (see
+   app.py's _HYPE_HIGHLIGHT_SCROLL_JS). The class is added and removed by that
+   script, not by :target or similar, since several different cards reuse the
+   same fixed slot elements across pages. Blue is a deliberate, explicit choice
+   (not the theme's own pink accent) - hardcoded rather than a theme variable
+   since the equivalent --button-secondary-border-color-hover flips to a muted
+   pink/gray in the theme's dark-mode block, not blue. */
+@keyframes candidate-card-highlight-pulse {
+    0% { box-shadow: 0 0 0 3px #38bdf8, 0 0 28px 10px rgba(56, 189, 248, 0.65); }
+    100% { box-shadow: 0 0 0 3px transparent, 0 0 28px 10px rgba(56, 189, 248, 0); }
+}
+.candidate-card-highlight {
+    animation: candidate-card-highlight-pulse 2s ease-out;
+}
+
 /* Subtle repeating heart-pattern background, tinted to the theme's pink accent
    directly in ui/heart.svg (fill/fill-opacity baked into the file, since a
    file-referenced background-image can't be recolored from CSS the way an
