@@ -121,7 +121,9 @@ class CandidateClip:
     # in core/chat_analyzer.py for why this stays a plain string.
     source: str = "chat"
     audio_peak_z_score: Optional[float] = None
+    audio_peak_time: Optional[float] = None
     sound_events: Dict[str, float] = field(default_factory=dict)
+    sound_event_time: Optional[float] = None
 
     @property
     def duration(self) -> float:
@@ -253,7 +255,9 @@ def build_stat_only_clip(
         used_fallback=used_fallback,
         source=candidate.source,
         audio_peak_z_score=candidate.audio_peak_z_score,
+        audio_peak_time=candidate.audio_peak_time,
         sound_events=candidate.sound_events,
+        sound_event_time=candidate.sound_event_time,
     )
 
 
@@ -423,7 +427,9 @@ class LLMAgent:
             rejection_reason=rejection_reason,
             source=candidate.source,
             audio_peak_z_score=candidate.audio_peak_z_score,
+            audio_peak_time=candidate.audio_peak_time,
             sound_events=candidate.sound_events,
+            sound_event_time=candidate.sound_event_time,
         )
 
     def refine_candidates(

@@ -258,7 +258,7 @@ def merge_with_chat_candidates(
     never need retuning because of how sensitive audio is, or vice versa).
 
     An audio spike within tolerance of a chat candidate enriches that candidate
-    (audio_peak_z_score set, source gains the "audio" tag) instead of creating a
+    (audio_peak_z_score/audio_peak_time set, source gains the "audio" tag) instead of creating a
     near-duplicate entry for the same real moment. An audio spike with no nearby
     chat candidate becomes its own standalone candidate only if
     allow_new_candidates is True; otherwise it's dropped, since with the toggle
@@ -275,7 +275,10 @@ def merge_with_chat_candidates(
         nearby = [ac for ac in audio_candidates if _same_moment(ac, cc, overlap_tolerance_s)]
         if nearby:
             best = max(nearby, key=lambda a: a.peak_z_score)
-            cc = replace(cc, source=_add_source_tag(cc.source, "audio"), audio_peak_z_score=best.peak_z_score)
+            cc = replace(
+                cc, source=_add_source_tag(cc.source, "audio"),
+                audio_peak_z_score=best.peak_z_score, audio_peak_time=best.spike_time,
+            )
         enriched.append(cc)
 
     result = enriched

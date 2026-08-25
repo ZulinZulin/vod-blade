@@ -259,6 +259,7 @@ class SoundEventClassifier:
             peak_z_score=peak_confidence,
             source="sound_event",
             sound_events={cls: peak_confidence},
+            sound_event_time=spike_time,
         )
 
     def _merge_overlapping(self, candidates: List[ClipCandidate]) -> List[ClipCandidate]:
@@ -289,6 +290,7 @@ class SoundEventClassifier:
                 peak_hype_score=stronger.peak_hype_score,
                 peak_z_score=stronger.peak_z_score,
                 sound_events=combined_events,
+                sound_event_time=stronger.spike_time,
             )
         return merged
 
@@ -316,7 +318,11 @@ def merge_sound_events(
             for ec in nearby:
                 for cls, conf in ec.sound_events.items():
                     combined_events[cls] = max(combined_events.get(cls, 0.0), conf)
-            cc = replace(cc, source=_add_source_tag(cc.source, "sound_event"), sound_events=combined_events)
+            best = max(nearby, key=lambda ec: ec.peak_z_score)
+            cc = replace(
+                cc, source=_add_source_tag(cc.source, "sound_event"),
+                sound_events=combined_events, sound_event_time=best.spike_time,
+            )
         enriched.append(cc)
 
     result = enriched

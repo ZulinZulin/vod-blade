@@ -80,11 +80,20 @@ class ClipCandidate:
     # surfaced to the LLM prompt (see llm_agent._build_user_prompt). None if audio analysis
     # is disabled or found no overlap here.
     audio_peak_z_score: Optional[float] = None
+    # The enriching audio spike's OWN spike_time (absolute VOD seconds), kept separately
+    # from audio_peak_z_score so a UI can point at exactly when it happened, not just how
+    # strong it was - this candidate's own spike_time may be a different moment (e.g. a
+    # chat spike a few seconds later than the audio that caused it).
+    audio_peak_time: Optional[float] = None
     # Sound-event class name -> peak confidence (e.g. {"Laughter": 0.88}) for any YAMNet
     # classes detected at/near this candidate, regardless of whether this candidate
     # originated from chat, audio-RMS, or the sound-event detector itself. Empty when sound
     # event detection is disabled or found nothing here.
     sound_events: Dict[str, float] = field(default_factory=dict)
+    # The strongest contributing sound event's OWN spike_time (absolute VOD seconds) - one
+    # representative timestamp for the whole sound_events dict, not one per class, since a
+    # UI showing "detected: X, Y" only needs a single point to direct attention to.
+    sound_event_time: Optional[float] = None
 
     @property
     def duration(self) -> float:

@@ -334,6 +334,19 @@ def _format_hms(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
+def _relative_offset_label(event_time: Optional[float], clip_start: float, clip_end: float) -> str:
+    """
+    " (MM:SS into this clip)" if event_time falls within [clip_start, clip_end], else "".
+    The LLM's final chosen start/end is often a tighter, different range than the padded
+    detection window an audio/event candidate's own timestamp was found in - deliberately
+    silent rather than showing a confusing negative/out-of-range offset when it falls
+    outside the clip actually being previewed.
+    """
+    if event_time is None or not (clip_start <= event_time <= clip_end):
+        return ""
+    return f" ({_format_hms(event_time - clip_start)} into this clip)"
+
+
 def _format_full_transcript(subtitles: List[SubtitleSegment]) -> str:
     """
     Renders the whole fetched subtitle track as '[HH:MM:SS -> HH:MM:SS] text' lines,
@@ -370,13 +383,15 @@ def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
 
     spike_label = _title_label_for_source(clip.source)
     audio_confirm_note = (
-        f", audio also peaked here (z={clip.audio_peak_z_score:.2f})" if clip.audio_peak_z_score is not None else ""
+        f", audio also peaked here (z={clip.audio_peak_z_score:.2f})"
+        f"{_relative_offset_label(clip.audio_peak_time, clip.start_time, clip.end_time)}"
+        if clip.audio_peak_z_score is not None else ""
     )
     sound_event_note = (
         ", detected: " + ", ".join(
             f"{cls} ({conf:.2f})"
             for cls, conf in sorted(clip.sound_events.items(), key=lambda kv: kv[1], reverse=True)
-        )
+        ) + _relative_offset_label(clip.sound_event_time, clip.start_time, clip.end_time)
         if clip.sound_events else ""
     )
     return (
