@@ -998,9 +998,10 @@ def build_app() -> gr.Blocks:
                         lines=_CARD_TRANSCRIPT_LINES, max_lines=_CARD_TRANSCRIPT_LINES,
                         interactive=False, show_label=False,
                     )
-                    with gr.Row():
-                        start_slider = gr.Slider(label="Start (seconds into VOD)", minimum=0, maximum=1, step=0.1)
-                        end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
+                    with gr.Accordion("Adjust boundaries", open=False):
+                        with gr.Row():
+                            start_slider = gr.Slider(label="Start (seconds into VOD)", minimum=0, maximum=1, step=0.1)
+                            end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
                     with gr.Row():
                         preview_btn = gr.Button("Preview clip", size="sm")
                         toggle_btn = gr.Button(_TOGGLE_LABEL_ACCEPTED, size="sm")
