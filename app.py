@@ -1153,7 +1153,10 @@ def do_export_files(clips: List[CandidateClip], source_video_path: str):
         edl_path = export_edl_file(accepted, source_video_path=source_video_path)
     except ExportError as exc:
         raise gr.Error(str(exc))
-    return str(fcpxml_path), str(edl_path)
+    # Stay hidden (see fcpxml_file/edl_file's own visible=False) until there's an
+    # actual file to show - an empty gr.File renders as a big dashed dropzone-looking
+    # box with no indication it's an output, not something to upload into.
+    return gr.update(value=str(fcpxml_path), visible=True), gr.update(value=str(edl_path), visible=True)
 
 
 def do_inject_resolve(clips: List[CandidateClip], source_video_path: str):
@@ -1511,8 +1514,8 @@ def build_app() -> gr.Blocks:
             export_files_btn = gr.Button("Download FCPXML/EDL")
             inject_btn = gr.Button("Inject into DaVinci Resolve")
         with gr.Row():
-            fcpxml_file = gr.File(label="FCPXML")
-            edl_file = gr.File(label="EDL")
+            fcpxml_file = gr.File(label="FCPXML", visible=False)
+            edl_file = gr.File(label="EDL", visible=False)
         inject_status = gr.Markdown("")
 
         # --- wiring ---
