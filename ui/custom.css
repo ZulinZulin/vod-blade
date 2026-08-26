@@ -248,3 +248,18 @@ gradio-app {
     border-radius: 10px;
 }
 
+/* Saved-sessions dropdown, scoped via elem_classes so this doesn't also shrink
+   the other dropdowns (LLM provider/model pickers) that share the same base
+   component. Real saved-session labels are a date plus a full VOD title, which
+   at Gradio's default 14px option-list font wraps across 2-3 lines per entry -
+   confirmed via live DOM inspection, since Dropdown-*.css hardcodes .options
+   .item's font-size with no exposed theme variable to override instead. */
+.vb-session-dropdown .options .item {
+    font-size: 12px !important;
+    line-height: 1.35 !important;
+    padding: 6px 8px !important;
+}
+.vb-session-dropdown input {
+    font-size: 12px !important;
+}
+

@@ -23,6 +23,7 @@ import logging
 import re
 import sys
 from dataclasses import replace
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import List, Optional
@@ -32,7 +33,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 
-from config import settings
+from config import SESSIONS_DIR, settings
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
@@ -638,9 +639,38 @@ def do_unreject_all_manual(clips: List[CandidateClip], show_rejected: bool, page
 # --------------------------------------------------------------------------- #
 
 
+_AUTOSAVE_PATH = SESSIONS_DIR / "_autosave.json"
+
+# Matches the '{slug}_{YYYYMMDD}_{HHMMSS}' stem save_session() builds for a fresh,
+# manually-named file - used only to prettify the dropdown label, never to
+# construct or validate an actual path.
+_SESSION_FILENAME_RE = re.compile(r"^(?P<slug>.+)_(?P<date>\d{8})_(?P<time>\d{6})$")
+
+
+def _prettify_session_label(path: Path, max_title_len: int = 42) -> str:
+    """Turns an on-disk session filename into a short display label - real
+    filenames are built from a VOD's own title and routinely run 60+ characters,
+    overflowing the dropdown cell. Only the label changes; the underlying file
+    and the dropdown's value (still the real path) are untouched."""
+    if path == _AUTOSAVE_PATH:
+        return "\U0001F504 Latest run (auto-saved)"
+    match = _SESSION_FILENAME_RE.match(path.stem)
+    if not match:
+        return path.stem
+    try:
+        stamp = datetime.strptime(f"{match['date']}_{match['time']}", "%Y%m%d_%H%M%S")
+    except ValueError:
+        return path.stem
+    title = match["slug"].replace("_", " ").strip()
+    if len(title) > max_title_len:
+        title = title[:max_title_len].rstrip() + "…"
+    date_label = stamp.strftime("%b %d, %H:%M")
+    return f"{date_label} · {title}" if title else date_label
+
+
 def _session_choices():
     """(label, value) pairs for the sessions dropdown, newest first."""
-    return [(p.name, str(p)) for p in list_sessions()]
+    return [(_prettify_session_label(p), str(p)) for p in list_sessions()]
 
 
 def do_save_session(
@@ -661,8 +691,15 @@ def do_save_session(
 
 
 def do_load_session(session_path: Optional[str]):
+    """
+    Fires automatically off the dropdown's own select event (see build_app's
+    wiring), not a dedicated "Load" button - session_path can legitimately be
+    empty here (e.g. the filter box gets cleared without picking anything), in
+    which case this just does nothing rather than surfacing an error for what
+    is normal incidental interaction with the widget.
+    """
     if not session_path:
-        raise gr.Error("Select a saved session to load first.")
+        return gr.skip()
     try:
         data = load_session(session_path)
     except SessionError as exc:
@@ -678,18 +715,17 @@ def do_load_session(session_path: Optional[str]):
     )
 
 
-def do_refresh_sessions():
-    return gr.update(choices=_session_choices())
-
-
 def do_reset_delete_arm():
     """
     Resets the "Delete selected session" button back to its neutral label and
-    clears the armed-for-delete state the instant the dropdown selection
-    changes. do_delete_session's own armed_path != session_path check already
-    guarantees a stale confirm can never delete the wrong file, but without
-    this the button would keep visually showing "Confirm delete: <old file>"
-    after switching selections until the next click quietly re-arms it.
+    clears the armed-for-delete state the instant the user picks a different
+    dropdown entry. do_delete_session's own armed_path != session_path check
+    already guarantees a stale confirm can never delete the wrong file, but
+    without this the button would keep visually showing "Confirm delete: <old
+    file>" after switching selections until the next click quietly re-arms it.
+    Wired off the dropdown's select event (real user picks only) rather than
+    change, so save/delete/purge silently updating the dropdown's own value
+    doesn't re-trigger this.
     """
     return gr.update(value=_DELETE_SESSION_LABEL), None
 
@@ -967,20 +1003,25 @@ def run_pipeline(
     # Auto-save immediately - judging a real VOD can take a long time (dozens of real
     # LLM calls), so the result is checkpointed to disk before the operator even starts
     # reviewing it, rather than living only in the browser's in-memory clips_state.
+    # Always overwrites one fixed slot (_AUTOSAVE_PATH) instead of creating a fresh
+    # timestamped file per run, so repeated analyses don't pile up disposable saves -
+    # a deliberate "Save session" click is what creates a real, permanently-named file.
+    # session_path_state is reset to None (not the autosave slot) below so a later
+    # manual save creates that fresh named file instead of silently overwriting the
+    # autosave checkpoint.
     try:
-        session_path = save_session(
+        save_session(
             refined_clips, source_video_path, youtube_source, twitch_source, chat_offset,
-            title_hint=get_twitch_vod_title(twitch_source) or "",
+            session_path=str(_AUTOSAVE_PATH),
         )
-        session_update = gr.update(choices=_session_choices(), value=str(session_path))
+        session_update = gr.update(choices=_session_choices())
     except SessionError as exc:
         logger.warning("Auto-save of the finished session failed: %s", exc)
-        session_path = None
         session_update = gr.update()
 
     return (
         fig, refined_clips, status, 0, gr.update(value=False), _page_label(visible, 0),
-        transcript_text, str(session_path) if session_path else None, session_update, *page_updates,
+        transcript_text, None, session_update, *page_updates,
     )
 
 
@@ -1382,17 +1423,17 @@ def build_app() -> gr.Blocks:
         with gr.Row():
             session_dropdown = gr.Dropdown(
                 label="Saved sessions", choices=_session_choices(), value=None,
-                filterable=True,
+                filterable=True, elem_classes=["vb-session-dropdown"],
+                info="Pick one to load it automatically.",
             )
-            refresh_sessions_btn = gr.Button("Refresh", size="sm")
-            load_session_btn = gr.Button("Load session", size="sm")
             save_session_btn = gr.Button("Save session", size="sm")
-            delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
-        with gr.Row():
-            confirm_purge_checkbox = gr.Checkbox(
-                label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
-            )
-            purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
+        with gr.Accordion("Delete / purge saves (advanced)", open=False):
+            with gr.Row():
+                delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
+                confirm_purge_checkbox = gr.Checkbox(
+                    label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
+                )
+                purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
 
         with gr.Row():
             show_rejected_checkbox = gr.Checkbox(
@@ -1547,22 +1588,10 @@ def build_app() -> gr.Blocks:
             api_visibility="private",
         )
 
-        refresh_sessions_btn.click(
-            fn=do_refresh_sessions, inputs=[], outputs=[session_dropdown], api_visibility="private",
-        )
         save_session_btn.click(
             fn=do_save_session,
             inputs=[clips_state, source_video_input, youtube_input, twitch_input, offset_input, session_path_state],
             outputs=[session_path_state, session_dropdown],
-            api_visibility="private",
-        )
-        load_session_btn.click(
-            fn=do_load_session,
-            inputs=[session_dropdown],
-            outputs=[
-                clips_state, session_path_state, source_video_input, youtube_input, twitch_input, offset_input,
-                show_rejected_checkbox, page_state, page_label, *card_outputs,
-            ],
             api_visibility="private",
         )
         purge_sessions_btn.click(
@@ -1577,10 +1606,23 @@ def build_app() -> gr.Blocks:
             outputs=[delete_session_btn, delete_armed_state, session_dropdown, session_path_state],
             api_visibility="private",
         )
-        session_dropdown.change(
+        # .select (fires only on a real user pick) rather than .change (fires on ANY
+        # value change, including save/delete/purge above programmatically updating
+        # this same dropdown) - otherwise saving or deleting a session would
+        # immediately re-trigger a reload of whatever the dropdown's new value
+        # happens to be, clobbering the operator's current in-progress review state.
+        session_dropdown.select(
             fn=do_reset_delete_arm,
             inputs=[],
             outputs=[delete_session_btn, delete_armed_state],
+            api_visibility="private",
+        ).then(
+            fn=do_load_session,
+            inputs=[session_dropdown],
+            outputs=[
+                clips_state, session_path_state, source_video_input, youtube_input, twitch_input, offset_input,
+                show_rejected_checkbox, page_state, page_label, *card_outputs,
+            ],
             api_visibility="private",
         )
 
