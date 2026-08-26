@@ -1250,32 +1250,38 @@ def build_app() -> gr.Blocks:
                         placeholder=r"C:\path\to\downloaded_video.mp4",
                     )
                 with gr.Column():
-                    audio_enable_checkbox = gr.Checkbox(
-                        label="Enable audio peak analysis", value=False,
-                        elem_classes=["vb-toggle"],
-                    )
-                    sound_event_enable_checkbox = gr.Checkbox(
-                        label="Enable sound event detection", value=False,
-                        elem_classes=["vb-toggle"],
-                    )
-                    llm_judging_enabled_checkbox = gr.Checkbox(
-                        label="Enable AI Arbitration", value=True,
-                        elem_classes=["vb-toggle"],
-                    )
+                    with gr.Group():
+                        audio_enable_checkbox = gr.Checkbox(
+                            label="Enable audio peak analysis", value=False,
+                            elem_classes=["vb-toggle"],
+                        )
+                        sound_event_enable_checkbox = gr.Checkbox(
+                            label="Enable sound event detection", value=False,
+                            elem_classes=["vb-toggle"],
+                        )
+                        llm_judging_enabled_checkbox = gr.Checkbox(
+                            label="Enable AI Arbitration", value=True,
+                            elem_classes=["vb-toggle"],
+                        )
+                    with gr.Group():
+                        download_vod_btn = gr.Button("Download VOD")
+                        vod_quality_input = gr.Dropdown(
+                            label="VOD download quality",
+                            choices=[
+                                "best", "worst", "audio_only",
+                                "1080p60", "720p60", "480p30", "360p30", "160p30",
+                            ],
+                            value=settings.fetcher.twitch_video_quality,
+                            allow_custom_value=True,
+                            info="Pick a common quality, or type an exact rendition "
+                                 "(e.g. 480p30) if you know it's available for this VOD.",
+                        )
+            download_status = gr.Markdown("")
 
             clips_state = gr.State([])
             page_state = gr.State(0)
             session_path_state = gr.State(None)
             delete_armed_state = gr.State(None)
-
-            with gr.Row():
-                vod_quality_input = gr.Textbox(
-                    label="VOD download quality",
-                    value=settings.fetcher.twitch_video_quality,
-                    placeholder="best, worst, audio_only, or a resolution like 720p60",
-                )
-                download_vod_btn = gr.Button("Download VOD")
-            download_status = gr.Markdown("")
 
             with gr.Accordion("LLM provider (advanced)", open=False):
                 llm_provider_input = gr.Dropdown(
@@ -1363,48 +1369,50 @@ def build_app() -> gr.Blocks:
                     minimum=30, maximum=600, step=10,
                     value=settings.hype.max_merged_duration_seconds,
                 )
-            with gr.Accordion("Audio peak analysis (advanced)", open=False):
-                gr.Markdown(
-                    "Detects loud moments (shouts, sudden outbursts) from the VOD's own audio track - "
-                    "requires the local source video above to already be downloaded. Enabled via the "
-                    "'Enable audio peak analysis' switch up in Sources."
-                )
-                with gr.Row():
-                    audio_z_threshold_input = gr.Slider(
-                        label="Audio Z-score threshold (higher = fewer, louder-only peaks)",
-                        minimum=1.0, maximum=6.0, step=0.1,
-                        value=settings.audio.z_score_threshold,
-                    )
-                    audio_allow_new_checkbox = gr.Checkbox(
-                        label="Allow audio-only peaks (no matching chat spike) to become their own candidates",
-                        value=settings.audio.allow_new_candidates,
-                    )
-            with gr.Accordion("Sound event detection (advanced)", open=False):
-                _sound_event_problems = settings.sound_event.validate()
-                gr.Markdown(
-                    "Detects specific acoustic events (laughter, screaming, cheering, groaning) via a "
-                    "YAMNet model - also requires the local source video above. Enabled via the "
-                    "'Enable sound event detection' switch up in Sources.\n\n"
-                    + (
-                        f"_Model not ready: {' '.join(_sound_event_problems)}_"
-                        if _sound_event_problems else "_YAMNet model found and ready._"
-                    )
-                )
-                sound_event_classes_input = gr.CheckboxGroup(
-                    label="Event types to detect",
-                    choices=settings.sound_event.target_classes,
-                    value=settings.sound_event.target_classes,
-                )
-                with gr.Row():
-                    sound_event_confidence_input = gr.Slider(
-                        label="Confidence threshold (higher = fewer, more certain events)",
-                        minimum=0.05, maximum=0.95, step=0.05,
-                        value=settings.sound_event.confidence_threshold,
-                    )
-                    sound_event_allow_new_checkbox = gr.Checkbox(
-                        label="Allow event-only peaks (no matching chat/audio spike) to become their own candidates",
-                        value=settings.sound_event.allow_new_candidates,
-                    )
+            with gr.Accordion("Audio peak & sound event detection (advanced)", open=False):
+                with gr.Row(elem_classes=["vb-two-col"]):
+                    with gr.Column():
+                        gr.Markdown(
+                            "**Audio peak analysis** - detects loud moments (shouts, sudden "
+                            "outbursts) from the VOD's own audio track - requires the local "
+                            "source video above to already be downloaded. Enabled via the "
+                            "'Enable audio peak analysis' switch up in Sources."
+                        )
+                        audio_z_threshold_input = gr.Slider(
+                            label="Audio Z-score threshold (higher = fewer, louder-only peaks)",
+                            minimum=1.0, maximum=6.0, step=0.1,
+                            value=settings.audio.z_score_threshold,
+                        )
+                        audio_allow_new_checkbox = gr.Checkbox(
+                            label="Allow audio-only peaks (no matching chat spike) to become their own candidates",
+                            value=settings.audio.allow_new_candidates,
+                        )
+                    with gr.Column():
+                        _sound_event_problems = settings.sound_event.validate()
+                        gr.Markdown(
+                            "**Sound event detection** - detects specific acoustic events "
+                            "(laughter, screaming, cheering, groaning) via a YAMNet model - "
+                            "also requires the local source video above. Enabled via the "
+                            "'Enable sound event detection' switch up in Sources.\n\n"
+                            + (
+                                f"_Model not ready: {' '.join(_sound_event_problems)}_"
+                                if _sound_event_problems else "_YAMNet model found and ready._"
+                            )
+                        )
+                        sound_event_classes_input = gr.CheckboxGroup(
+                            label="Event types to detect",
+                            choices=settings.sound_event.target_classes,
+                            value=settings.sound_event.target_classes,
+                        )
+                        sound_event_confidence_input = gr.Slider(
+                            label="Confidence threshold (higher = fewer, more certain events)",
+                            minimum=0.05, maximum=0.95, step=0.05,
+                            value=settings.sound_event.confidence_threshold,
+                        )
+                        sound_event_allow_new_checkbox = gr.Checkbox(
+                            label="Allow event-only peaks (no matching chat/audio spike) to become their own candidates",
+                            value=settings.sound_event.allow_new_candidates,
+                        )
             with gr.Accordion("LLM judgment settings (advanced)", open=False):
                 min_viral_score_input = gr.Slider(
                     label="Minimum viral score to keep (1-10) - clips the LLM itself scores below "

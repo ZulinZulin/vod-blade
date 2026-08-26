@@ -323,3 +323,17 @@ gradio-app {
     outline-offset: 2px;
 }
 
+/* Gradio's Row defaults to flex-wrap: wrap, which decides whether to wrap based
+   on each column's own PREFERRED (pre-shrink) content width, not its shrunk
+   floor - .gradio-container's own min-width:0 reset only affects how far a
+   column CAN shrink, not that wrap decision. The sound event detection column
+   here (event-type pills, sliders) has a wide enough preferred width that this
+   row wrapped the two columns onto separate lines instead of sitting side by
+   side, confirmed via live DOM inspection (both columns reported the row's
+   FULL width, not half). Forcing nowrap makes the two columns always share the
+   row; min-width:0 then does its job letting each one shrink/wrap its own
+   internal content (e.g. the event-type pills) instead of the whole column. */
+.vb-two-col {
+    flex-wrap: nowrap !important;
+}
+
