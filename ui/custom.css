@@ -35,7 +35,7 @@ body {
        flat 100% width removes the content-dependence entirely: it always fills
        available space up to the max-width cap below, whatever is expanded. */
     width: 100% !important;
-    max-width: 1500px !important;
+    max-width: 1300px !important;
     margin: 0 auto !important;
     /* Inherited by all descendants: a long unbroken string (a file path, a VOD
        title with no spaces) wraps inside its box instead of forcing it wider. */
@@ -111,7 +111,7 @@ body {
    makes it show in that outer margin; .gradio-container gets its own solid
    background-color below so the actual app content sits on a plain backdrop
    instead of the pattern showing through the gaps between its own blocks.
-   On a narrow window (viewport <= 1500px) the container fills the full width
+   On a narrow window (viewport <= 1300px) the container fills the full width
    and there's no margin left for the pattern to show in at all - that's an
    inherent tradeoff of this approach, not a bug. */
 /* Not body: <gradio-app> is a custom element sitting between body and
@@ -120,7 +120,15 @@ body {
    never actually be seen. gradio-app is the real outermost visible layer. */
 gradio-app {
     background-image: url("/gradio_api/file={{HEART_SVG_PATH}}") !important;
-    background-repeat: space !important;
+    /* repeat, not space: "space" redistributes gaps between tiles to fit the
+       covering box exactly, which depends on gradio-app's own height - opening
+       ANY accordion anywhere on the page changes that height, so every tile
+       visibly reflowed/jumped on every toggle. Plain repeat always tiles from
+       a fixed top-left origin regardless of box size, so growing/shrinking the
+       page only reveals or hides tiles at the bottom edge instead of moving
+       the existing ones. Confirmed via live DOM inspection (gradio-app's
+       scrollHeight measurably changes on accordion toggle). */
+    background-repeat: repeat !important;
     background-size: 80px 80px !important;
 }
 /* Feathered instead of a hard cutoff: opaque through the middle (masking the
