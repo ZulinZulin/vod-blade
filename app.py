@@ -1715,12 +1715,24 @@ def _load_custom_css() -> str:
     return css.replace("{{HEART_SVG_PATH}}", heart_svg_path)
 
 
+# Loaded via launch(head=...) rather than an @import at the top of custom.css - an
+# @import only works if it's literally the first rule in its own stylesheet, which is
+# fragile to guarantee once that file's content gets composed with other CSS. A real
+# <link> in <head> has no such ordering requirement. Used for the "Analyze Stream"
+# button's font (see ui/custom.css's #analyze_stream_btn rule).
+_GOOGLE_FONT_HEAD = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Russo+One&display=swap" rel="stylesheet">
+"""
+
 if __name__ == "__main__":
     app = build_app()
     app.queue().launch(
         server_port=7863,
         css_paths=[_UI_DIR / "theme.css"],
         css=_load_custom_css(),
+        head=_GOOGLE_FONT_HEAD,
         allowed_paths=[str(_UI_DIR)],
         favicon_path=str(_UI_DIR / "logos" / "logoverysmall.png"),
         footer_links=["gradio", "settings"],

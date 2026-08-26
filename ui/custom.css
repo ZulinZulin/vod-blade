@@ -391,8 +391,14 @@ gradio-app {
     position: relative;
     isolation: isolate;
     overflow: visible;
-    font-weight: 700;
-    letter-spacing: 0.03em;
+    /* Russo One - loaded via launch(head=...) in app.py, a bold single-weight
+       display face (not the theme's regular UI font) so this one button reads
+       as a distinct call-to-action rather than more body text. Falls back to
+       the theme's own font stack if the Google Fonts request ever fails. */
+    font-family: "Russo One", sans-serif;
+    font-size: 1.05em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     box-shadow: 0 4px 18px rgba(247, 4, 143, 0.45);
     transition: box-shadow 0.25s ease, filter 0.15s ease;
 }
