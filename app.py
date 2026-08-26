@@ -1161,10 +1161,18 @@ _HIDE_SCREEN_STUDIO_JS = """
 # a CSS animation already applied to an element won't replay just because its trigger
 # class gets re-added on the next click, so this removes the class, forces a reflow
 # (reading offsetWidth) to flush that removal before the browser processes the next
-# style change, then re-adds it. Also swaps the button's own label to a random quote
-# for the same duration, restored by the same animationend handler that removes the
-# spin class - both are purely cosmetic and independent of the real (much longer)
-# analysis run underneath, which isn't wired to this button's label at all.
+# style change, then re-adds it. The spin class/animation live on the button's own
+# wrapper (.vb-analyze-frame, a gr.Group()), not the button - the ring is the
+# wrapper's ::after showing only in the padding gap around the button, with the
+# button's own opaque background naturally covering the rest of it (a real DOM
+# ancestor's background always paints under its children, unlike a same-element
+# negative-z-index pseudo, which paints ABOVE that same element's own background -
+# confirmed via live inspection: with the ring as the button's own ::after, the
+# whole button face washed with rainbow instead of just a thin outline). Also
+# swaps the button's own label to a random quote for the same duration, restored
+# by the same animationend handler that removes the spin class - both are purely
+# cosmetic and independent of the real (much longer) analysis run underneath,
+# which isn't wired to this button's label at all.
 # The button is part of the initial static layout (unlike the Settings modal that
 # _HIDE_SCREEN_STUDIO_JS has to wait for), so a plain lookup on load is enough - no
 # MutationObserver needed here.
@@ -1173,6 +1181,7 @@ _ANALYZE_BTN_SPIN_JS = """
     const btn = document.getElementById('analyze_stream_btn');
     if (!btn || btn.dataset.vbSpinBound) return;
     btn.dataset.vbSpinBound = '1';
+    const frame = btn.closest('.vb-analyze-frame') || btn;
 
     // The label is a plain text node sitting between Gradio's own (currently
     // unused) icon-slot comment placeholders - mutating that node directly,
@@ -1213,13 +1222,13 @@ _ANALYZE_BTN_SPIN_JS = """
 
     btn.addEventListener('click', () => {
         labelNode.nodeValue = quotes[Math.floor(Math.random() * quotes.length)];
-        btn.classList.remove('vb-rainbow-spin');
-        void btn.offsetWidth;
-        btn.classList.add('vb-rainbow-spin');
+        frame.classList.remove('vb-rainbow-spin');
+        void frame.offsetWidth;
+        frame.classList.add('vb-rainbow-spin');
     });
-    btn.addEventListener('animationend', (e) => {
+    frame.addEventListener('animationend', (e) => {
         if (e.animationName === 'vb-rainbow-spin') {
-            btn.classList.remove('vb-rainbow-spin');
+            frame.classList.remove('vb-rainbow-spin');
             labelNode.nodeValue = originalLabel;
         }
     });
@@ -1443,7 +1452,8 @@ def build_app() -> gr.Blocks:
                     show_label=False,
                 )
                 reset_system_prompt_btn = gr.Button("Reset to default", size="sm")
-            run_btn = gr.Button("Analyze Stream", variant="primary", elem_id="analyze_stream_btn")
+            with gr.Group(elem_classes=["vb-analyze-frame"]):
+                run_btn = gr.Button("Analyze Stream", variant="primary", elem_id="analyze_stream_btn")
             status_box = gr.Markdown("")
 
         gr.Markdown(
