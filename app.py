@@ -827,6 +827,7 @@ def run_pipeline(
     sound_event_classes: List[str],
     sound_event_confidence: float,
     sound_event_allow_new: bool,
+    autosave_enabled: bool,
     progress=gr.Progress(),
 ):
     # Gradio Textbox/Dropdown components default to value=None (not "") when left
@@ -1000,23 +1001,26 @@ def run_pipeline(
     page_updates = _build_card_updates(visible, page=0, source_video_path=source_video_path)
     transcript_text = _format_full_transcript(subtitles)
 
-    # Auto-save immediately - judging a real VOD can take a long time (dozens of real
-    # LLM calls), so the result is checkpointed to disk before the operator even starts
-    # reviewing it, rather than living only in the browser's in-memory clips_state.
-    # Always overwrites one fixed slot (_AUTOSAVE_PATH) instead of creating a fresh
-    # timestamped file per run, so repeated analyses don't pile up disposable saves -
-    # a deliberate "Save session" click is what creates a real, permanently-named file.
-    # session_path_state is reset to None (not the autosave slot) below so a later
-    # manual save creates that fresh named file instead of silently overwriting the
-    # autosave checkpoint.
-    try:
-        save_session(
-            refined_clips, source_video_path, youtube_source, twitch_source, chat_offset,
-            session_path=str(_AUTOSAVE_PATH),
-        )
-        session_update = gr.update(choices=_session_choices())
-    except SessionError as exc:
-        logger.warning("Auto-save of the finished session failed: %s", exc)
+    # Auto-save immediately (unless the operator opted out) - judging a real VOD can take
+    # a long time (dozens of real LLM calls), so the result is checkpointed to disk before
+    # the operator even starts reviewing it, rather than living only in the browser's
+    # in-memory clips_state. Always overwrites one fixed slot (_AUTOSAVE_PATH) instead of
+    # creating a fresh timestamped file per run, so repeated analyses don't pile up
+    # disposable saves - a deliberate "Save session" click is what creates a real,
+    # permanently-named file. session_path_state is reset to None (not the autosave slot)
+    # below so a later manual save creates that fresh named file instead of silently
+    # overwriting the autosave checkpoint.
+    if autosave_enabled:
+        try:
+            save_session(
+                refined_clips, source_video_path, youtube_source, twitch_source, chat_offset,
+                session_path=str(_AUTOSAVE_PATH),
+            )
+            session_update = gr.update(choices=_session_choices())
+        except SessionError as exc:
+            logger.warning("Auto-save of the finished session failed: %s", exc)
+            session_update = gr.update()
+    else:
         session_update = gr.update()
 
     return (
@@ -1253,27 +1257,13 @@ def build_app() -> gr.Blocks:
                         label="Enable sound event detection", value=False,
                     )
                     llm_judging_enabled_checkbox = gr.Checkbox(
-                        label="Allow LLM judging", value=True,
+                        label="Enable AI Arbitration", value=True,
                     )
 
             clips_state = gr.State([])
             page_state = gr.State(0)
             session_path_state = gr.State(None)
             delete_armed_state = gr.State(None)
-            with gr.Row():
-                session_dropdown = gr.Dropdown(
-                    label="Saved sessions", choices=_session_choices(), value=None,
-                    filterable=True, elem_classes=["vb-session-dropdown"],
-                    info="Pick one to load it automatically.",
-                )
-                save_session_btn = gr.Button("Save session", size="sm")
-            with gr.Accordion("Delete / purge saves (advanced)", open=False):
-                with gr.Row():
-                    delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
-                    confirm_purge_checkbox = gr.Checkbox(
-                        label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
-                    )
-                    purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
 
             with gr.Row():
                 vod_quality_input = gr.Textbox(
@@ -1283,6 +1273,63 @@ def build_app() -> gr.Blocks:
                 )
                 download_vod_btn = gr.Button("Download VOD")
             download_status = gr.Markdown("")
+
+            with gr.Accordion("LLM provider (advanced)", open=False):
+                llm_provider_input = gr.Dropdown(
+                    label="LLM provider",
+                    choices=["openai", "deepseek", "ollama", "openrouter", "nanogpt"],
+                    value=settings.llm.provider,
+                )
+                with gr.Row():
+                    llm_model_input = gr.Dropdown(
+                        label="Model (optional - blank uses the provider's default; type to search, "
+                              "or click 'Fetch models' for a live list)",
+                        choices=[settings.llm.model] if settings.llm.model else [],
+                        value=settings.llm.model or "",
+                        allow_custom_value=True,
+                        filterable=True,
+                    )
+                    fetch_models_btn = gr.Button("Fetch models from API", size="sm")
+                with gr.Row():
+                    llm_api_base_input = gr.Textbox(
+                        label="API base URL (optional - blank uses the provider's default)",
+                        value=settings.llm.api_base or "",
+                        placeholder="e.g. https://nano-gpt.com/api/v1",
+                    )
+                    llm_api_key_input = gr.Textbox(
+                        label="API key (optional - blank uses LLM_API_KEY from .env; ignored for Ollama)",
+                        value="",
+                        type="password",
+                    )
+                gr.Markdown(
+                    "_openrouter and nanogpt are third-party aggregators exposing many underlying "
+                    "models - 'Fetch models from API' lists what's actually available from whichever "
+                    "provider/API base/key is set above (needs a valid key for most providers). Local "
+                    "Ollama note: the app can detect the model being evicted to CPU/RAM, but not GPU "
+                    "**compute** contention - another GPU-heavy app (image/video generation, games) "
+                    "running at the same time can still make judgment run dramatically slower with no "
+                    "error, even while the model stays fully loaded on the GPU. Close other GPU-heavy "
+                    "applications for best performance._"
+                )
+
+            with gr.Row():
+                session_dropdown = gr.Dropdown(
+                    label="Load session", choices=_session_choices(), value=None,
+                    filterable=True, elem_classes=["vb-session-dropdown"],
+                    info="Pick one to load it automatically.",
+                )
+                save_session_btn = gr.Button("Save session", size="sm")
+            autosave_enabled_checkbox = gr.Checkbox(
+                label="Auto-save after each run", value=True,
+            )
+            with gr.Accordion("Delete / purge saves (advanced)", open=False):
+                with gr.Row():
+                    delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
+                    confirm_purge_checkbox = gr.Checkbox(
+                        label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
+                    )
+                    purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
+
             with gr.Accordion("Hype detection settings (advanced)", open=False):
                 with gr.Row():
                     z_threshold_input = gr.Slider(
@@ -1353,43 +1400,6 @@ def build_app() -> gr.Blocks:
                         label="Allow event-only peaks (no matching chat/audio spike) to become their own candidates",
                         value=settings.sound_event.allow_new_candidates,
                     )
-            with gr.Accordion("LLM provider (advanced)", open=False):
-                llm_provider_input = gr.Dropdown(
-                    label="LLM provider",
-                    choices=["openai", "deepseek", "ollama", "openrouter", "nanogpt"],
-                    value=settings.llm.provider,
-                )
-                with gr.Row():
-                    llm_model_input = gr.Dropdown(
-                        label="Model (optional - blank uses the provider's default; type to search, "
-                              "or click 'Fetch models' for a live list)",
-                        choices=[settings.llm.model] if settings.llm.model else [],
-                        value=settings.llm.model or "",
-                        allow_custom_value=True,
-                        filterable=True,
-                    )
-                    fetch_models_btn = gr.Button("Fetch models from API", size="sm")
-                with gr.Row():
-                    llm_api_base_input = gr.Textbox(
-                        label="API base URL (optional - blank uses the provider's default)",
-                        value=settings.llm.api_base or "",
-                        placeholder="e.g. https://nano-gpt.com/api/v1",
-                    )
-                    llm_api_key_input = gr.Textbox(
-                        label="API key (optional - blank uses LLM_API_KEY from .env; ignored for Ollama)",
-                        value="",
-                        type="password",
-                    )
-                gr.Markdown(
-                    "_openrouter and nanogpt are third-party aggregators exposing many underlying "
-                    "models - 'Fetch models from API' lists what's actually available from whichever "
-                    "provider/API base/key is set above (needs a valid key for most providers). Local "
-                    "Ollama note: the app can detect the model being evicted to CPU/RAM, but not GPU "
-                    "**compute** contention - another GPU-heavy app (image/video generation, games) "
-                    "running at the same time can still make judgment run dramatically slower with no "
-                    "error, even while the model stays fully loaded on the GPU. Close other GPU-heavy "
-                    "applications for best performance._"
-                )
             with gr.Accordion("LLM judgment settings (advanced)", open=False):
                 min_viral_score_input = gr.Slider(
                     label="Minimum viral score to keep (1-10) - clips the LLM itself scores below "
@@ -1529,6 +1539,7 @@ def build_app() -> gr.Blocks:
                 audio_enable_checkbox, audio_z_threshold_input, audio_allow_new_checkbox,
                 sound_event_enable_checkbox, sound_event_classes_input,
                 sound_event_confidence_input, sound_event_allow_new_checkbox,
+                autosave_enabled_checkbox,
             ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
