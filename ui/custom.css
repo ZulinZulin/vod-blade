@@ -396,7 +396,8 @@ gradio-app {
        as a distinct call-to-action rather than more body text. Falls back to
        the theme's own font stack if the Google Fonts request ever fails. */
     font-family: "Russo One", sans-serif;
-    font-size: 1.05em;
+    font-size: 1.4em;
+    color: #120F2B;
     letter-spacing: 0.06em;
     text-transform: uppercase;
     box-shadow: 0 4px 18px rgba(247, 4, 143, 0.45);
