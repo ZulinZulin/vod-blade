@@ -1216,10 +1216,10 @@ def _logo_header_html() -> str:
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="VOD BLADE") as demo:
         gr.HTML(_logo_header_html())
-        gr.Markdown("Please provide subtitles source AND Twitch VOD URL of the same stream.")
 
         with gr.Accordion("Sources & Settings", open=True):
             gr.Markdown("### Sources")
+            gr.Markdown("Please provide subtitles source AND Twitch VOD URL of the same stream.")
             with gr.Row():
                 with gr.Column():
                     youtube_input = gr.Textbox(
@@ -1427,7 +1427,10 @@ def build_app() -> gr.Blocks:
             run_btn = gr.Button("Analyze Stream", variant="primary")
             status_box = gr.Markdown("")
 
-        gr.Markdown("### Cool graph <small style=\"font-weight: normal;\">you can click on it</small>")
+        gr.Markdown(
+            "### Cool Graph <small style=\"font-weight: normal;\">you can click on it</small>",
+            elem_classes=["vb-section-heading"],
+        )
         hype_plot = gr.Plot(elem_id="hype_plot")
         # Bridge components for _HYPE_CLICK_BRIDGE_JS / _HYPE_HIGHLIGHT_SCROLL_JS - visible="hidden"
         # (not visible=False) so they stay mounted in the DOM for the JS to reach.
@@ -1435,7 +1438,7 @@ def build_app() -> gr.Blocks:
         hype_click_bridge_button = gr.Button(elem_id="hype_click_bridge_button", visible="hidden")
         hype_highlight_signal = gr.Textbox(elem_id="hype_highlight_signal", visible="hidden")
 
-        gr.Markdown("### Clip Candidates")
+        gr.Markdown("### Clip Candidates", elem_classes=["vb-section-heading"])
 
         with gr.Row():
             show_rejected_checkbox = gr.Checkbox(

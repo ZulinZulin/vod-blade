@@ -351,3 +351,11 @@ gradio-app {
     margin: 0;
 }
 
+/* Extra breathing room above the "Cool Graph" and "Clip Candidates" section
+   headers so each major section reads as its own block instead of butting
+   straight up against whatever ended the previous one (the Analyze button,
+   the candidate-nav row). */
+.vb-section-heading {
+    margin-top: 28px !important;
+}
+
