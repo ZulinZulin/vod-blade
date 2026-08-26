@@ -4,13 +4,13 @@ core/llm_agent.py
 Context alignment & LLM agent.
 
 Maps a chat-hype candidate window (core/chat_analyzer.ClipCandidate) onto the
-subtitle transcript covering that window, then asks an LLM (via litellm, so
-OpenAI / DeepSeek / local Ollama are interchangeable) to judge whether the
-window is actually clip-worthy (a chat spike is a statistical signal, not a
-guarantee something happened) and, if so, pick the precise hook/joke start
-and reaction-resolution end, plus a title, viral confidence score, and short
-summary. The LLM's raw text response is never trusted as-is: it is parsed as
-JSON and validated through a Pydantic schema before use.
+subtitle transcript covering that window, then asks a local Ollama model (via
+litellm) to judge whether the window is actually clip-worthy (a chat spike is
+a statistical signal, not a guarantee something happened) and, if so, pick
+the precise hook/joke start and reaction-resolution end, plus a title, viral
+confidence score, and short summary. The LLM's raw text response is never
+trusted as-is: it is parsed as JSON and validated through a Pydantic schema
+before use.
 
 Rejected candidates are kept, not discarded - see CandidateClip.is_clip_worthy -
 so a human operator can review them (app.py's "show rejected candidates" toggle)
@@ -519,7 +519,6 @@ class LLMAgent:
             max_tokens=self.cfg.max_tokens,
             timeout=self.cfg.request_timeout_s,
             api_base=self.api_base,
-            api_key=self.cfg.api_key,
             response_format={"type": "json_object"},
         )
         content = response.choices[0].message.content
@@ -555,8 +554,8 @@ class LLMAgent:
 
     def _ensure_ollama_ready(self) -> None:
         """
-        Ollama only: refuses to proceed if the model isn't sufficiently VRAM-resident,
-        per config.min_ollama_gpu_ratio (<=0 disables this check). Runs once per
+        Refuses to proceed if the model isn't sufficiently VRAM-resident, per
+        config.min_ollama_gpu_ratio (<=0 disables this check). Runs once per
         LLMAgent instance (guarded by _checked_gpu_residency). Failures in the check
         itself (Ollama unreachable, API shape changed, etc.) are logged and swallowed -
         only a CONFIRMED offload raises, since the diagnostic probe failing isn't the
@@ -567,7 +566,7 @@ class LLMAgent:
             return
         self._checked_gpu_residency = True
 
-        if self.cfg.provider != "ollama" or self.cfg.min_ollama_gpu_ratio <= 0:
+        if self.cfg.min_ollama_gpu_ratio <= 0:
             return
 
         bare_model = self.model.split("/", 1)[1] if self.model.startswith("ollama/") else self.model

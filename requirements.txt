@@ -22,8 +22,9 @@ srt>=3.5.3
 requests>=2.32.0
 
 # --- LLM SDK ---
+# Local Ollama only - litellm pulls in its own compatible openai SDK version as a
+# transitive dependency, so it isn't pinned here separately (nothing imports it directly).
 litellm>=1.44.0
-openai>=1.40.0
 pydantic>=2.8.0
 tenacity>=8.5.0
 

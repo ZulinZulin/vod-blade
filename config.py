@@ -309,22 +309,22 @@ class SoundEventConfig:
 @dataclass(frozen=True)
 class LLMConfig:
     """
-    litellm-compatible model routing. `provider` selects a preset;
-    `model` follows litellm's `<provider>/<model>` convention where needed
-    (e.g. "ollama/llama3.1", "deepseek/deepseek-chat", "gpt-4o-mini").
+    litellm-compatible model routing, hardcoded to a local Ollama server.
+    Cloud providers (OpenAI/DeepSeek/OpenRouter/NanoGPT) were cut after testing
+    showed only marginal judgment-quality gains over a good local model, for a
+    lot more latency (a real VOD run makes dozens of sequential judgment calls).
 
-    openrouter and nanogpt are both third-party aggregators that let you pick
-    from many underlying models. openrouter has native litellm support
-    ("openrouter/<model>"); nanogpt doesn't, so it's routed as a generic
-    OpenAI-compatible custom endpoint ("openai/<model>" + a custom api_base) -
-    see provider_litellm_prefix below for the actual per-provider mapping.
+    `model` is still user-configurable - point it at any model you've already
+    pulled via `ollama pull <name>` (this app doesn't manage Ollama models
+    itself, just talks to whatever server/model you tell it about).
     """
 
-    provider: str = os.getenv("LLM_PROVIDER", "openai")  # openai | deepseek | ollama | openrouter | nanogpt
-    # None (unset) means "use provider_model_defaults[provider]" — see resolve_model().
+    DEFAULT_MODEL = "ollama/qwen2.5:14b-instruct"
+    DEFAULT_API_BASE = "http://localhost:11434"
+
+    # None (unset) means "use DEFAULT_MODEL" — see resolve_model().
     model: Optional[str] = os.getenv("LLM_MODEL") or None
     api_base: Optional[str] = os.getenv("LLM_API_BASE") or None
-    api_key: Optional[str] = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
 
     temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "800"))
@@ -350,63 +350,24 @@ class LLMConfig:
     # Checked once per LLMAgent instance; a value <= 0 disables the check entirely.
     min_ollama_gpu_ratio: float = float(os.getenv("LLM_MIN_OLLAMA_GPU_RATIO", "0.95"))
 
-    # Per-provider defaults applied when the user only sets LLM_PROVIDER. Already carry
-    # whatever litellm prefix that provider needs (see provider_litellm_prefix), so a
-    # blank Model field resolves straight to a working default with no further work.
-    provider_model_defaults: Dict[str, str] = field(
-        default_factory=lambda: {
-            "openai": "gpt-4o-mini",
-            "deepseek": "deepseek/deepseek-chat",
-            "ollama": "ollama/llama3.1",
-            "openrouter": "openrouter/openai/gpt-4o-mini",
-            "nanogpt": "openai/zai-org/glm-5.2",
-        }
-    )
-    provider_api_base_defaults: Dict[str, str] = field(
-        default_factory=lambda: {
-            "ollama": "http://localhost:11434",
-            "openai": "https://api.openai.com/v1",
-            "deepseek": "https://api.deepseek.com",
-            "openrouter": "https://openrouter.ai/api/v1",
-            "nanogpt": "https://nano-gpt.com/api/v1",
-        }
-    )
-    # Maps our provider name to the litellm routing prefix its model string needs.
-    # Usually identical to the provider name itself ("ollama/", "deepseek/", ...) - the
-    # exception is nanogpt, which litellm has no native integration for, so it's routed
-    # as a generic OpenAI-compatible custom endpoint ("openai/" + a custom api_base)
-    # rather than "nanogpt/", which litellm wouldn't recognize as a provider at all.
-    provider_litellm_prefix: Dict[str, str] = field(
-        default_factory=lambda: {
-            "openai": "",
-            "deepseek": "deepseek/",
-            "ollama": "ollama/",
-            "openrouter": "openrouter/",
-            "nanogpt": "openai/",
-        }
-    )
-
     def resolve_model(self) -> str:
         """
-        The explicit LLM_MODEL if set, else the provider's default model.
+        The explicit LLM_MODEL if set, else DEFAULT_MODEL.
 
-        litellm routes requests purely off the model string's prefix (e.g.
-        "ollama/qwen2.5:14b-instruct") — without it, a non-OpenAI provider
-        silently gets treated as OpenAI and every call fails. Users naturally
-        set LLM_MODEL to the bare model ID as the provider itself names it
-        (e.g. "zai-org/glm-5.2" as nanogpt lists it), so auto-prepend the
-        litellm routing prefix if it's missing rather than requiring them to
-        know litellm's convention.
+        litellm routes requests purely off the model string's "ollama/" prefix
+        — without it, the request silently gets treated as OpenAI and fails.
+        Users naturally set LLM_MODEL to the bare name as `ollama list` shows
+        it (e.g. "qwen2.5:14b-instruct"), so auto-prepend the prefix if it's
+        missing rather than requiring them to know litellm's convention.
         """
-        model = self.model or self.provider_model_defaults.get(self.provider, "gpt-4o-mini")
-        prefix = self.provider_litellm_prefix.get(self.provider, f"{self.provider}/")
-        if prefix and not model.startswith(prefix):
-            model = f"{prefix}{model}"
+        model = self.model or self.DEFAULT_MODEL
+        if not model.startswith("ollama/"):
+            model = f"ollama/{model}"
         return model
 
-    def resolve_api_base(self) -> Optional[str]:
-        """The explicit LLM_API_BASE if set, else the provider's default base URL."""
-        return self.api_base or self.provider_api_base_defaults.get(self.provider)
+    def resolve_api_base(self) -> str:
+        """The explicit LLM_API_BASE if set, else the default local Ollama server."""
+        return self.api_base or self.DEFAULT_API_BASE
 
 
 # --------------------------------------------------------------------------- #

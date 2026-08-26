@@ -802,10 +802,8 @@ def run_pipeline(
     min_viral_score: float,
     content_hint: str,
     system_prompt: str,
-    llm_provider: str,
     llm_model: str,
     llm_api_base: str,
-    llm_api_key: str,
     llm_judging_enabled: bool,
     audio_enable: bool,
     audio_z_threshold: float,
@@ -825,7 +823,6 @@ def run_pipeline(
     system_prompt = system_prompt or ""
     llm_model = llm_model or ""
     llm_api_base = llm_api_base or ""
-    llm_api_key = llm_api_key or ""
 
     if not youtube_source or not twitch_source:
         raise gr.Error("Please provide both a subtitle source and a Twitch VOD source.")
@@ -837,11 +834,6 @@ def run_pipeline(
         raise gr.Error("Max merged candidate duration must be a positive number.")
     if min_viral_score is None or not (1 <= min_viral_score <= 10):
         raise gr.Error("Minimum viral score must be between 1 and 10.")
-    if llm_judging_enabled and llm_provider in ("openai", "deepseek") and not (llm_api_key.strip() or settings.llm.api_key):
-        raise gr.Error(
-            f"No API key configured for provider '{llm_provider}'. Enter one above, or set "
-            "LLM_API_KEY in .env if you'd rather not paste it into the UI each time."
-        )
     if audio_enable and not (source_video_path and Path(source_video_path).exists()):
         raise gr.Error(
             "Audio peak analysis is enabled but the local source video path above doesn't point to an "
@@ -937,10 +929,8 @@ def run_pipeline(
         progress(0.75, desc="Asking the LLM to judge and refine clip boundaries...")
         llm_cfg = replace(
             settings.llm,
-            provider=llm_provider,
             model=llm_model.strip() or None,
             api_base=llm_api_base.strip() or None,
-            api_key=llm_api_key.strip() or settings.llm.api_key,
             min_viral_score=int(min_viral_score),
         )
 
@@ -1020,62 +1010,33 @@ def run_pipeline(
 # --------------------------------------------------------------------------- #
 
 
-def do_fetch_models(provider: str, api_base: str, api_key: str):
+def do_fetch_models(api_base: str):
     """
-    Queries the selected provider's model-listing endpoint and returns the
-    fetched IDs as Dropdown choices, so the Model field can be picked from a
-    real, current catalog instead of typed blind. Ollama uses its own
-    /api/tags shape; every other provider here follows the OpenAI-compatible
-    GET {base}/models convention (openai, deepseek, openrouter, nanogpt all do).
+    Queries the local Ollama server's /api/tags and returns the pulled model
+    names as Dropdown choices, so the Model field can be picked from what's
+    actually available instead of typed blind. Pulling new models is on the
+    user via `ollama pull <name>` - this app only lists what's already there.
     """
-    base = (api_base or "").strip().rstrip("/") or settings.llm.provider_api_base_defaults.get(provider, "")
-    if not base:
-        raise gr.Error(f"No API base URL known for provider '{provider}'. Enter one above first.")
-
-    key = (api_key or "").strip() or settings.llm.api_key
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-
+    base = (api_base or "").strip().rstrip("/") or settings.llm.DEFAULT_API_BASE
     try:
-        if provider == "ollama":
-            resp = requests.get(f"{base}/api/tags", timeout=15)
-            resp.raise_for_status()
-            payload = resp.json()
-            model_ids = sorted({
-                str(entry.get("model") or entry.get("name"))
-                for entry in payload.get("models", [])
-                if entry.get("model") or entry.get("name")
-            })
-        else:
-            resp = requests.get(f"{base}/models", headers=headers, timeout=15)
-            resp.raise_for_status()
-            payload = resp.json()
-            entries = payload.get("data", payload) if isinstance(payload, dict) else payload
-            if not isinstance(entries, list):
-                raise gr.Error(f"Unexpected response shape from {base}/models (expected a list of models).")
-            model_ids = sorted({
-                str(entry.get("id") or entry.get("name"))
-                for entry in entries
-                if isinstance(entry, dict) and (entry.get("id") or entry.get("name"))
-            })
+        resp = requests.get(f"{base}/api/tags", timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        model_ids = sorted({
+            str(entry.get("model") or entry.get("name"))
+            for entry in payload.get("models", [])
+            if entry.get("model") or entry.get("name")
+        })
     except requests.exceptions.RequestException as exc:
         raise gr.Error(f"Failed to fetch models from {base}: {exc}")
     except ValueError as exc:  # response body wasn't valid JSON
-        raise gr.Error(f"Provider returned a non-JSON response from {base}/models: {exc}")
+        raise gr.Error(f"Ollama returned a non-JSON response from {base}/api/tags: {exc}")
 
     if not model_ids:
-        raise gr.Error(f"No models returned by {base} - check the API base/key above.")
+        raise gr.Error(f"No models returned by {base} - pull one first with 'ollama pull <name>'.")
 
-    gr.Info(f"Fetched {len(model_ids)} model(s) from {provider}.")
+    gr.Info(f"Fetched {len(model_ids)} model(s) from Ollama.")
     return gr.update(choices=model_ids)
-
-
-def do_provider_changed(provider: str):
-    """Switching providers clears any previously-fetched model list, which wouldn't apply here anyway."""
-    default_base = settings.llm.provider_api_base_defaults.get(provider, "")
-    return (
-        gr.update(choices=[], value=""),
-        gr.update(placeholder=f"e.g. {default_base}" if default_base else None),
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1299,39 +1260,28 @@ def build_app() -> gr.Blocks:
             session_path_state = gr.State(None)
             delete_armed_state = gr.State(None)
 
-            with gr.Accordion("LLM provider (advanced)", open=False):
-                llm_provider_input = gr.Dropdown(
-                    label="LLM provider",
-                    choices=["openai", "deepseek", "ollama", "openrouter", "nanogpt"],
-                    value=settings.llm.provider,
-                )
+            with gr.Accordion("Ollama settings (advanced)", open=False):
                 with gr.Row():
                     llm_model_input = gr.Dropdown(
-                        label="Model (optional - blank uses the provider's default; type to search, "
-                              "or click 'Fetch models' for a live list)",
+                        label="Model (optional - blank uses the default model; type to search, "
+                              "or click 'Fetch models' for what you've pulled)",
                         choices=[settings.llm.model] if settings.llm.model else [],
                         value=settings.llm.model or "",
                         allow_custom_value=True,
                         filterable=True,
                     )
-                    fetch_models_btn = gr.Button("Fetch models from API", size="sm")
-                with gr.Row():
-                    llm_api_base_input = gr.Textbox(
-                        label="API base URL (optional - blank uses the provider's default)",
-                        value=settings.llm.api_base or "",
-                        placeholder="e.g. https://nano-gpt.com/api/v1",
-                    )
-                    llm_api_key_input = gr.Textbox(
-                        label="API key (optional - blank uses LLM_API_KEY from .env; ignored for Ollama)",
-                        value="",
-                        type="password",
-                    )
+                    fetch_models_btn = gr.Button("Fetch models from Ollama", size="sm")
+                llm_api_base_input = gr.Textbox(
+                    label="Ollama server URL (optional - blank uses the local default)",
+                    value=settings.llm.api_base or "",
+                    placeholder=f"e.g. {settings.llm.DEFAULT_API_BASE}",
+                )
                 gr.Markdown(
-                    "_Local Ollama note: **Close other GPU-heavy applications for best "
-                    "performance.** VOD BLADE can detect the model being evicted to CPU/RAM, "
-                    "but not GPU compute contention - another GPU-heavy app (image/video "
-                    "generation, games) running at the same time can make judgment run "
-                    "dramatically slower._"
+                    "_**Close other GPU-heavy applications for best performance.** VOD BLADE "
+                    "can detect the model being evicted to CPU/RAM, but not GPU compute "
+                    "contention - another GPU-heavy app (image/video generation, games) "
+                    "running at the same time can make judgment run dramatically slower. New "
+                    "models aren't managed here - pull them yourself via `ollama pull <name>`._"
                 )
 
             with gr.Row():
@@ -1553,7 +1503,7 @@ def build_app() -> gr.Blocks:
                 z_threshold_input, min_gap_input, pre_spike_input, post_spike_input,
                 max_merged_duration_input,
                 min_viral_score_input, content_hint_input, system_prompt_input,
-                llm_provider_input, llm_model_input, llm_api_base_input, llm_api_key_input,
+                llm_model_input, llm_api_base_input,
                 llm_judging_enabled_checkbox,
                 audio_enable_checkbox, audio_z_threshold_input, audio_allow_new_checkbox,
                 sound_event_enable_checkbox, sound_event_classes_input,
@@ -1577,14 +1527,8 @@ def build_app() -> gr.Blocks:
 
         fetch_models_btn.click(
             fn=do_fetch_models,
-            inputs=[llm_provider_input, llm_api_base_input, llm_api_key_input],
+            inputs=[llm_api_base_input],
             outputs=[llm_model_input],
-            api_visibility="private",
-        )
-        llm_provider_input.change(
-            fn=do_provider_changed,
-            inputs=[llm_provider_input],
-            outputs=[llm_model_input, llm_api_base_input],
             api_visibility="private",
         )
 
