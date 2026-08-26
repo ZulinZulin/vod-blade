@@ -1468,10 +1468,10 @@ def build_app() -> gr.Blocks:
                 value=False,
             )
             unreject_all_btn = gr.Button("Un-reject all (manual only)", size="sm")
-        with gr.Row():
-            prev_page_btn = gr.Button("< Prev", size="sm")
-            page_label = gr.Markdown("No clips yet - run an analysis.")
-            next_page_btn = gr.Button("Next >", size="sm")
+        with gr.Row(elem_classes=["vb-pagination-row"]):
+            prev_page_btn = gr.Button("< Prev", size="lg")
+            page_label = gr.Markdown("No clips yet - run an analysis.", elem_classes=["vb-page-label"])
+            next_page_btn = gr.Button("Next >", size="lg")
 
         card_components = []
         with gr.Row(elem_classes=["candidate-grid"]):

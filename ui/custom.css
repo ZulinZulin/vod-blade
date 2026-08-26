@@ -337,3 +337,17 @@ gradio-app {
     flex-wrap: nowrap !important;
 }
 
+/* Pagination row: vertically centers the "Showing clips X-Y of Z" label
+   against the now-larger Prev/Next buttons (row default align-items doesn't
+   center a plain text column against taller siblings), and centers the text
+   itself within its own column instead of it sitting flush left. */
+.vb-pagination-row {
+    align-items: center !important;
+}
+.vb-page-label {
+    text-align: center;
+}
+.vb-page-label p {
+    margin: 0;
+}
+
