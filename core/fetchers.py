@@ -521,6 +521,10 @@ class TwitchVideoFetcher:
     def fetch(self, vod_url_or_id: str, quality: Optional[str] = None) -> Path:
         vod_id = extract_twitch_vod_id(vod_url_or_id)
         quality = quality or self.cfg.twitch_video_quality
+        # Not just the default DOWNLOADS_DIR (already created at import time, see
+        # config.py) - self.downloads_dir may be a custom folder the user just typed
+        # or picked via the UI, which won't exist yet.
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
         out_path = self.downloads_dir / f"twitch_vod_{vod_id}.mp4"
 
         if self.cfg.cache_enabled and out_path.exists():
@@ -591,6 +595,10 @@ def fetch_twitch_chat(
     return TwitchChatFetcher().fetch(vod_url_or_id, chat_offset_seconds=chat_offset_seconds)
 
 
-def fetch_twitch_vod(vod_url_or_id: str, quality: Optional[str] = None) -> Path:
-    """Downloads (or reuses a cached) Twitch VOD video file. Returns the local path."""
-    return TwitchVideoFetcher().fetch(vod_url_or_id, quality=quality)
+def fetch_twitch_vod(
+    vod_url_or_id: str, quality: Optional[str] = None, downloads_dir: Optional[Path] = None,
+) -> Path:
+    """Downloads (or reuses a cached) Twitch VOD video file. Returns the local path.
+    downloads_dir overrides config.DOWNLOADS_DIR - lets the UI's "Downloads folder"
+    field redirect where a VOD lands without touching the app-wide default."""
+    return TwitchVideoFetcher(downloads_dir=downloads_dir or DOWNLOADS_DIR).fetch(vod_url_or_id, quality=quality)

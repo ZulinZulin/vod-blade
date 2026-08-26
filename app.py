@@ -20,7 +20,10 @@ Layout:
 from __future__ import annotations
 
 import logging
+import os
+import platform
 import re
+import subprocess
 import sys
 from dataclasses import replace
 from datetime import datetime
@@ -33,7 +36,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 
-from config import SESSIONS_DIR, settings
+from config import DOWNLOADS_DIR, SESSIONS_DIR, settings
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
@@ -1044,7 +1047,7 @@ def do_fetch_models(api_base: str):
 # --------------------------------------------------------------------------- #
 
 
-def do_download_vod(twitch_source: str, quality: str):
+def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
     """
     Downloads the full Twitch VOD video file via TwitchDownloaderCLI, so
     exports have a local source file to reference. This is deliberately NOT
@@ -1069,7 +1072,10 @@ def do_download_vod(twitch_source: str, quality: str):
     )
 
     try:
-        video_path = fetch_twitch_vod(twitch_source, quality=quality or None)
+        video_path = fetch_twitch_vod(
+            twitch_source, quality=quality or None,
+            downloads_dir=Path(downloads_dir) if downloads_dir and downloads_dir.strip() else None,
+        )
     except FetcherError as exc:
         yield f"VOD download failed: {exc}", gr.update(interactive=True), gr.update()
         return
@@ -1079,6 +1085,60 @@ def do_download_vod(twitch_source: str, quality: str):
         gr.update(interactive=True),
         gr.update(value=str(video_path)),
     )
+
+
+def do_browse_downloads_dir(current_dir: str):
+    """
+    Opens a native OS folder picker (tkinter, not a Gradio component - browsers have
+    no API that hands a web page a real filesystem path, only file *contents*, so this
+    has to run in the Python backend, which for a local app like this one shares the
+    same machine/filesystem as the person clicking the button). Falls back to leaving
+    the field untouched if tkinter can't display anything (e.g. headless server with no
+    display) rather than crashing the request - typing the path by hand still works.
+    """
+    try:
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            chosen = filedialog.askdirectory(
+                initialdir=current_dir if current_dir and Path(current_dir).is_dir() else str(DOWNLOADS_DIR),
+                title="Choose a downloads folder",
+            )
+        finally:
+            root.destroy()
+    except Exception as exc:
+        logger.warning("Folder picker unavailable (%s); type the path in manually instead.", exc)
+        raise gr.Error(f"Couldn't open the folder picker ({exc}). Type the path in manually instead.")
+
+    if not chosen:
+        return gr.update()  # user cancelled the dialog
+    return gr.update(value=chosen)
+
+
+def do_open_downloads_folder(downloads_dir: str):
+    """Opens the downloads folder in the OS's own file browser (Explorer/Finder/whatever
+    the Linux file manager is), creating it first if it doesn't exist yet - e.g. a fresh
+    install where no VOD has ever been downloaded there."""
+    path = Path(downloads_dir) if downloads_dir and downloads_dir.strip() else DOWNLOADS_DIR
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise gr.Error(f"Could not create/access '{path}': {exc}")
+
+    system = platform.system()
+    try:
+        if system == "Windows":
+            os.startfile(path)  # noqa: S606 - opening a local folder the user themselves chose
+        elif system == "Darwin":
+            subprocess.run(["open", str(path)], check=True)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise gr.Error(f"Could not open '{path}' in the file browser: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1303,6 +1363,14 @@ def build_app() -> gr.Blocks:
                             allow_custom_value=True,
                             info="Best is recommended. 2-4GB per hour. Downloads from Twitch",
                         )
+                        downloads_dir_input = gr.Textbox(
+                            label="Downloads folder",
+                            value=str(DOWNLOADS_DIR),
+                            placeholder=str(DOWNLOADS_DIR),
+                        )
+                        with gr.Row():
+                            browse_downloads_dir_btn = gr.Button("Browse...", size="sm")
+                            open_downloads_folder_btn = gr.Button("Open Download Folder", size="sm")
             download_status = gr.Markdown("")
 
             clips_state = gr.State([])
@@ -1571,8 +1639,20 @@ def build_app() -> gr.Blocks:
 
         download_vod_btn.click(
             fn=do_download_vod,
-            inputs=[twitch_input, vod_quality_input],
+            inputs=[twitch_input, vod_quality_input, downloads_dir_input],
             outputs=[download_status, download_vod_btn, source_video_input],
+            api_visibility="private",
+        )
+        browse_downloads_dir_btn.click(
+            fn=do_browse_downloads_dir,
+            inputs=[downloads_dir_input],
+            outputs=[downloads_dir_input],
+            api_visibility="private",
+        )
+        open_downloads_folder_btn.click(
+            fn=do_open_downloads_folder,
+            inputs=[downloads_dir_input],
+            outputs=[],
             api_visibility="private",
         )
 
