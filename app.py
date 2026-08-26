@@ -1141,6 +1141,27 @@ def do_inject_resolve(clips: List[CandidateClip], source_video_path: str):
 
 _UI_DIR = Path(__file__).resolve().parent / "ui"
 
+# Gradio's Settings panel includes a "Screen Studio" demo-recording tool that has
+# nothing to do with this app - every section in that panel (Theme, Language, PWA,
+# Screen Studio, Run History) shares the same generic .banner-wrap class, so there's
+# no CSS selector that targets just this one; it has to be found by its heading text
+# instead. The Settings modal is only created the first time it's opened, not present
+# in the initial page load, so a MutationObserver watches for it rather than trying
+# to hide something that doesn't exist yet.
+_HIDE_SCREEN_STUDIO_JS = """
+() => {
+    const hideScreenStudio = () => {
+        for (const h of document.querySelectorAll('.banner-wrap h2')) {
+            if (h.textContent.includes('Screen Studio')) {
+                h.closest('.banner-wrap').style.display = 'none';
+            }
+        }
+    };
+    new MutationObserver(hideScreenStudio).observe(document.body, { childList: true, subtree: true });
+    hideScreenStudio();
+}
+"""
+
 
 def _logo_header_html() -> str:
     """
@@ -1435,10 +1456,20 @@ def build_app() -> gr.Blocks:
                 c["start"], c["end"], c["video"], c["toggle_btn"],
             ])
 
+        # api_visibility="private" on every real event below: this app runs ffmpeg on
+        # caller-supplied paths, reads/writes/deletes real files, talks to a local
+        # DaVinci Resolve instance, and spends LLM API credits from keys typed into the
+        # UI - none of that should be callable via Gradio's auto-generated REST API,
+        # only through the UI itself. Hiding the "Use via API" footer link (see
+        # launch(footer_links=...)) only hides the docs page; it doesn't touch the
+        # actual endpoints, which stay live regardless - this is the real lockdown.
+        # Not needed on the fn=None bindings above/below (JS-only, no Python function
+        # to call) - Gradio forces api_visibility to "private" for those automatically.
         reset_system_prompt_btn.click(
             fn=lambda: DEFAULT_SYSTEM_PROMPT,
             inputs=[],
             outputs=[system_prompt_input],
+            api_visibility="private",
         )
 
         run_btn.click(
@@ -1459,58 +1490,71 @@ def build_app() -> gr.Blocks:
                 show_rejected_checkbox, page_label, subtitles_display,
                 session_path_state, session_dropdown, *card_outputs,
             ],
+            api_visibility="private",
         )
 
         download_vod_btn.click(
             fn=do_download_vod,
             inputs=[twitch_input, vod_quality_input],
             outputs=[download_status, download_vod_btn, source_video_input],
+            api_visibility="private",
         )
 
         fetch_models_btn.click(
             fn=do_fetch_models,
             inputs=[llm_provider_input, llm_api_base_input, llm_api_key_input],
             outputs=[llm_model_input],
+            api_visibility="private",
         )
         llm_provider_input.change(
             fn=do_provider_changed,
             inputs=[llm_provider_input],
             outputs=[llm_model_input, llm_api_base_input],
+            api_visibility="private",
         )
 
+        demo.load(fn=None, inputs=None, outputs=None, js=_HIDE_SCREEN_STUDIO_JS)
         hype_plot.change(fn=None, inputs=None, outputs=None, js=_HYPE_CLICK_BRIDGE_JS)
         hype_click_bridge_button.click(
             fn=do_hype_plot_click,
             inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input, hype_click_bridge],
             outputs=[page_state, page_label, *card_outputs, hype_highlight_signal],
+            api_visibility="private",
         ).then(fn=None, inputs=None, outputs=None, js=_HYPE_HIGHLIGHT_SCROLL_JS)
 
         prev_page_btn.click(
             fn=partial(go_to_page, delta=-1),
             inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[page_state, page_label, *card_outputs],
+            api_visibility="private",
         )
         next_page_btn.click(
             fn=partial(go_to_page, delta=1),
             inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[page_state, page_label, *card_outputs],
+            api_visibility="private",
         )
         show_rejected_checkbox.change(
             fn=partial(go_to_page, delta=0),
             inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[page_state, page_label, *card_outputs],
+            api_visibility="private",
         )
         unreject_all_btn.click(
             fn=do_unreject_all_manual,
             inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[clips_state, page_state, page_label, *card_outputs],
+            api_visibility="private",
         )
 
-        refresh_sessions_btn.click(fn=do_refresh_sessions, inputs=[], outputs=[session_dropdown])
+        refresh_sessions_btn.click(
+            fn=do_refresh_sessions, inputs=[], outputs=[session_dropdown], api_visibility="private",
+        )
         save_session_btn.click(
             fn=do_save_session,
             inputs=[clips_state, source_video_input, youtube_input, twitch_input, offset_input, session_path_state],
             outputs=[session_path_state, session_dropdown],
+            api_visibility="private",
         )
         load_session_btn.click(
             fn=do_load_session,
@@ -1519,21 +1563,25 @@ def build_app() -> gr.Blocks:
                 clips_state, session_path_state, source_video_input, youtube_input, twitch_input, offset_input,
                 show_rejected_checkbox, page_state, page_label, *card_outputs,
             ],
+            api_visibility="private",
         )
         purge_sessions_btn.click(
             fn=do_purge_sessions,
             inputs=[confirm_purge_checkbox],
             outputs=[confirm_purge_checkbox, session_path_state, session_dropdown],
+            api_visibility="private",
         )
         delete_session_btn.click(
             fn=do_delete_session,
             inputs=[session_dropdown, delete_armed_state, session_path_state],
             outputs=[delete_session_btn, delete_armed_state, session_dropdown, session_path_state],
+            api_visibility="private",
         )
         session_dropdown.change(
             fn=do_reset_delete_arm,
             inputs=[],
             outputs=[delete_session_btn, delete_armed_state],
+            api_visibility="private",
         )
 
         for idx, c in enumerate(card_components):
@@ -1541,32 +1589,38 @@ def build_app() -> gr.Blocks:
                 fn=partial(_sync_bound, idx=idx, field_name="start_time"),
                 inputs=[clips_state, show_rejected_checkbox, page_state, c["start"]],
                 outputs=[clips_state],
+                api_visibility="private",
             )
             c["end"].release(
                 fn=partial(_sync_bound, idx=idx, field_name="end_time"),
                 inputs=[clips_state, show_rejected_checkbox, page_state, c["end"]],
                 outputs=[clips_state],
+                api_visibility="private",
             )
             c["thumbnail"].select(
                 fn=do_preview_clip,
                 inputs=[source_video_input, c["start"], c["end"]],
                 outputs=[c["video"], c["thumbnail"]],
+                api_visibility="private",
             )
             c["toggle_btn"].click(
                 fn=partial(do_toggle_worthy, idx=idx),
                 inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
                 outputs=[clips_state, page_state, page_label, *card_outputs],
+                api_visibility="private",
             )
 
         export_files_btn.click(
             fn=do_export_files,
             inputs=[clips_state, source_video_input],
             outputs=[fcpxml_file, edl_file],
+            api_visibility="private",
         )
         inject_btn.click(
             fn=do_inject_resolve,
             inputs=[clips_state, source_video_input],
             outputs=[inject_status],
+            api_visibility="private",
         )
 
     return demo
@@ -1592,4 +1646,5 @@ if __name__ == "__main__":
         css=_load_custom_css(),
         allowed_paths=[str(_UI_DIR)],
         favicon_path=str(_UI_DIR / "logos" / "logoverysmall.png"),
+        footer_links=["gradio", "settings"],
     )

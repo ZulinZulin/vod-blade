@@ -41,6 +41,23 @@ def _slugify(text: str, max_len: int = 60) -> str:
     return slug[:max_len] or "session"
 
 
+def _resolve_within_sessions_dir(session_path: str) -> Path:
+    """
+    Resolves session_path and confirms it's actually inside SESSIONS_DIR before any
+    read/delete. session_path ultimately comes from a dropdown value the UI
+    populates from real choices - but if this app's API is ever reached directly
+    (bypassing the UI, e.g. a raw HTTP call to the do_delete_session/do_load_session
+    endpoints) rather than through the dropdown itself, it could be set to an
+    arbitrary string. Without this check, delete_session would call
+    Path(anything).unlink() on whatever it's given, and load_session would read
+    whatever it's given.
+    """
+    resolved = Path(session_path).resolve()
+    if not resolved.is_relative_to(SESSIONS_DIR.resolve()):
+        raise SessionError(f"Refusing to operate outside the sessions directory: {session_path}")
+    return resolved
+
+
 def save_session(
     clips: List[CandidateClip],
     source_video_path: str,
@@ -71,7 +88,12 @@ def save_session(
     }
 
     if session_path:
-        out_path = Path(session_path)
+        # Validated the same way load/delete are: session_path is normally only ever
+        # a path this module itself already returned from an earlier save, but if
+        # reached directly (bypassing the UI - see _resolve_within_sessions_dir's
+        # docstring), an arbitrary value here would let write_text() overwrite any
+        # file the process can write to, not just a real session.
+        out_path = _resolve_within_sessions_dir(session_path)
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         slug = _slugify(title_hint or twitch_source or youtube_source or "session")
@@ -87,7 +109,7 @@ def save_session(
 
 def load_session(session_path: str) -> dict:
     """Returns {"clips", "source_video_path", "youtube_source", "twitch_source", "chat_offset"}."""
-    path = Path(session_path)
+    path = _resolve_within_sessions_dir(session_path)
     if not path.exists():
         raise SessionError(f"Session file not found: {session_path}")
     try:
@@ -111,7 +133,7 @@ def load_session(session_path: str) -> dict:
 
 def delete_session(session_path: str) -> None:
     """Permanently deletes one saved session file."""
-    path = Path(session_path)
+    path = _resolve_within_sessions_dir(session_path)
     if not path.exists():
         raise SessionError(f"Session file not found: {session_path}")
     try:
