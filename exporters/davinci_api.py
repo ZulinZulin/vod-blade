@@ -153,7 +153,7 @@ class DavinciResolveExporter:
         # ~2.5x too small, landing far earlier in the file than intended).
         fps = self._source_clip_frame_rate(pool_item)
 
-        timeline_name = timeline_name or "StreamCutter Clips"
+        timeline_name = timeline_name or "VOD BLADE Clips"
         timeline = media_pool.CreateEmptyTimeline(timeline_name)
         if timeline is None:
             raise DavinciAPIError(

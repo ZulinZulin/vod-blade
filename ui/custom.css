@@ -1,10 +1,21 @@
 /*
  * ui/custom.css
  *
- * StreamCutter's own layout/behavior fixes, loaded alongside ui/theme.css via
+ * VOD BLADE's own layout/behavior fixes, loaded alongside ui/theme.css via
  * app.py's launch(css_paths=[...]). Kept separate from theme.css so our own
  * rules survive independently of any future theme swap.
  */
+/* Gradio's built-in "loading" spinner shown while gr.Video/Image/Audio content is
+   loading (e.g. our card previews) isn't a swappable logo image - it's CSS-drawn
+   (one dot + two box-shadow copies, see Video-*.css's .loader rule) and already
+   tinted via --border-color-accent-subdued from ui/theme.css. Recolored here to
+   VOD BLADE's own magenta (sampled from ui/logos/logoSmall.png, same value used
+   for the header's gradient sweep) instead of the theme's pink, so it reads as
+   our own brand rather than the vendored theme's. */
+.loader {
+    background-color: #f7048f !important;
+    box-shadow: -24px 0 #f7048f, 24px 0 #f7048f !important;
+}
 /* overflow-x safety net lives on body, not .gradio-container: a box-shadow
    extends past its own element's box, and overflow-x: hidden on the SAME
    element clips that shadow away (setting only overflow-x also forces
@@ -120,5 +131,120 @@ gradio-app {
         color-mix(in srgb, var(--body-background-fill) 85%, white 15%) calc(100% - 2px),
         transparent 100%
     );
+}
+
+/* Logo header band - sits inside .gradio-container (see app.py's _logo_header_html,
+   the first thing rendered) so it moves and resizes with the container instead of
+   living on the fixed-viewport gradio-app layer like the heart pattern above.
+   Everything here is sized in relative units on purpose: .gradio-container's own
+   width changes with the viewport (up to its 1500px cap), so a fixed-pixel design
+   would look right at exactly one width and wrong everywhere else. The gradient
+   sweep animates via background-position PERCENTAGES rather than px offsets, which
+   is what makes it scale-agnostic - the same keyframes look correct whether the
+   container is 400px or 1500px wide. */
+/* Colors sampled directly from ui/logos/logoSmall.png (dominant non-white/black
+   pixels), not the pink/blue-violet/teal used elsewhere in the app - the logo's
+   own palette is warm gold/flame ("VOD") + metallic silver ("BLADE") + hot
+   magenta (the energy-blade slash cutting across it), so the header is themed
+   to match the actual artwork rather than the rest of the UI's accent colors. */
+.vb-header {
+    position: relative;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+    padding: 14px 0;
+    margin-bottom: 8px;
+    border-radius: 16px;
+    background: linear-gradient(
+        120deg,
+        color-mix(in srgb, #ffd980 30%, transparent) 0%,
+        color-mix(in srgb, #f7048f 30%, transparent) 25%,
+        color-mix(in srgb, #c8ccd5 22%, transparent) 50%,
+        color-mix(in srgb, #f7048f 30%, transparent) 75%,
+        color-mix(in srgb, #ffd980 30%, transparent) 100%
+    );
+    background-size: 220% 100%;
+    animation: vb-header-sweep 14s linear infinite;
+}
+@keyframes vb-header-sweep {
+    from { background-position: 0% 50%; }
+    to { background-position: 220% 50%; }
+}
+
+/* Bright diagonal streak that sweeps across once per cycle then holds off-screen -
+   a periodic "glint", like light catching a blade edge, rather than a continuous
+   wash. Same background-position-driven approach as the sweep above, so it's
+   equally scale-agnostic regardless of the header's current width. */
+.vb-header::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        100deg,
+        transparent 42%,
+        rgba(255, 255, 255, 0.6) 50%,
+        transparent 58%
+    );
+    background-size: 300% 100%;
+    animation: vb-blade-glint 6s ease-in-out infinite;
+    pointer-events: none;
+}
+@keyframes vb-blade-glint {
+    0% { background-position: 250% 0; }
+    30% { background-position: -150% 0; }
+    100% { background-position: -150% 0; }
+}
+
+/* Warm radial glow centered behind the logo - echoes the flame glow already
+   baked into "VOD" in the artwork itself, rather than the UI theme's pink.
+   Width/height are relative to .vb-header's own box (min() clamps it on very
+   narrow containers), and centering is via position:absolute + inset:0 +
+   margin:auto rather than a fixed offset, so it stays centered regardless of
+   the header's current width. */
+.vb-header-glow {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    width: min(420px, 70%);
+    height: 180%;
+    background: radial-gradient(
+        circle,
+        color-mix(in srgb, #ffb347 55%, transparent) 0%,
+        transparent 70%
+    );
+    animation: vb-glow-pulse 4s ease-in-out infinite;
+    pointer-events: none;
+}
+@keyframes vb-glow-pulse {
+    0%, 100% { opacity: 0.5; transform: scale(0.9); }
+    50% { opacity: 1; transform: scale(1.05); }
+}
+
+.vb-header-logo {
+    position: relative;
+    z-index: 1;
+    /* min-height in effect: clamp()'s middle value only grows past 130px on wide
+       viewports (10vw exceeds 130px once the viewport is over ~1300px), so this
+       never renders SMALLER than 130px regardless of container width - the
+       previous fixed 72px read as small against the header's own padding. */
+    height: clamp(130px, 10vw, 180px);
+    max-width: 70%;
+    filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.4));
+}
+.vb-header-logo-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: clamp(130px, 10vw, 180px);
+    padding: 0 20px;
+    font-size: clamp(20px, 6vw, 36px);
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+    color: white;
+    background: rgba(0, 0, 0, 0.35);
+    border-radius: 10px;
 }
 

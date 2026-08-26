@@ -1,7 +1,7 @@
 """
 app.py
 
-Gradio front-end tying the whole StreamCutter pipeline together:
+Gradio front-end tying the whole VOD BLADE pipeline together:
 
     fetchers -> chat_analyzer -> llm_agent -> exporters
 
@@ -1142,9 +1142,26 @@ def do_inject_resolve(clips: List[CandidateClip], source_video_path: str):
 _UI_DIR = Path(__file__).resolve().parent / "ui"
 
 
+def _logo_header_html() -> str:
+    """
+    Renders the top-of-page logo band. Uses logoverysmall.png (300x300) rather
+    than the HQ/Small versions in the same folder - at a 72px display height,
+    those would just be extra network weight (2MB/385KB vs 101KB) for zero
+    visible benefit. Falls back to a text placeholder if the file is missing.
+    """
+    logo_path = _UI_DIR / "logos" / "logoverysmall.png"
+    if logo_path.exists():
+        src = str(logo_path.resolve()).replace("\\", "/")
+        media = f'<img src="/gradio_api/file={src}" alt="VOD BLADE logo" class="vb-header-logo">'
+    else:
+        media = '<div class="vb-header-logo vb-header-logo-placeholder">VOD BLADE</div>'
+    return f'<div class="vb-header"><div class="vb-header-glow"></div>{media}</div>'
+
+
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="StreamCutter") as demo:
-        gr.Markdown("# StreamCutter\nTurn Twitch chat hype spikes into DaVinci Resolve-ready viral clips.")
+    with gr.Blocks(title="VOD BLADE") as demo:
+        gr.HTML(_logo_header_html())
+        gr.Markdown("Turn Twitch chat hype spikes into DaVinci Resolve-ready viral clips.")
 
         with gr.Accordion("Sources & Settings", open=True):
             gr.Markdown("### Sources")
@@ -1574,4 +1591,5 @@ if __name__ == "__main__":
         css_paths=[_UI_DIR / "theme.css"],
         css=_load_custom_css(),
         allowed_paths=[str(_UI_DIR)],
+        favicon_path=str(_UI_DIR / "logos" / "logoverysmall.png"),
     )

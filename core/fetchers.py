@@ -1,7 +1,7 @@
 """
 core/fetchers.py
 
-Data ingestion layer for StreamCutter.
+Data ingestion layer for VOD BLADE.
 
 Three independent input paths feed the rest of the pipeline:
 

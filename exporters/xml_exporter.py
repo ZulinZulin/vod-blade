@@ -227,7 +227,7 @@ def generate_fcpxml(
     )
 
     library = etree.SubElement(fcpxml, "library")
-    event = etree.SubElement(library, "event", name="StreamCutter Clips")
+    event = etree.SubElement(library, "event", name="VOD BLADE Clips")
 
     used_names: set = set()
     for i, clip in enumerate(clips, start=1):
@@ -319,7 +319,7 @@ def _seconds_to_timecode(seconds: float, fps: float) -> str:
 
 def generate_edl(
     clips: List[CandidateClip],
-    title: str = "StreamCutter Clips",
+    title: str = "VOD BLADE Clips",
     reel_name: str = "AX",
     export_config: Optional[ExportConfig] = None,
     source_video_path: Optional[str] = None,
@@ -363,7 +363,7 @@ def generate_edl(
 def export_edl_file(
     clips: List[CandidateClip],
     output_path: Optional[Path] = None,
-    title: str = "StreamCutter Clips",
+    title: str = "VOD BLADE Clips",
     reel_name: str = "AX",
     export_config: Optional[ExportConfig] = None,
     source_video_path: Optional[str] = None,

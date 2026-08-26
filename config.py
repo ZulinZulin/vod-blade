@@ -1,5 +1,5 @@
 """
-Central configuration for StreamCutter.
+Central configuration for VOD BLADE.
 
 All tunables live here so that `core/`, `exporters/`, and `app.py` never
 hardcode a path, weight, or model name. Values are sourced from environment
@@ -54,7 +54,7 @@ def _default_twitch_cli_name() -> str:
 
 @dataclass(frozen=True)
 class BinaryConfig:
-    """Locations of local CLI binaries StreamCutter shells out to."""
+    """Locations of local CLI binaries VOD BLADE shells out to."""
 
     twitch_downloader_cli: Path = field(
         default_factory=lambda: Path(
