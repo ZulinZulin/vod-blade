@@ -819,7 +819,7 @@ def run_pipeline(
     llm_model: str,
     llm_api_base: str,
     llm_api_key: str,
-    skip_llm: bool,
+    llm_judging_enabled: bool,
     audio_enable: bool,
     audio_z_threshold: float,
     audio_allow_new: bool,
@@ -849,7 +849,7 @@ def run_pipeline(
         raise gr.Error("Max merged candidate duration must be a positive number.")
     if min_viral_score is None or not (1 <= min_viral_score <= 10):
         raise gr.Error("Minimum viral score must be between 1 and 10.")
-    if not skip_llm and llm_provider in ("openai", "deepseek") and not (llm_api_key.strip() or settings.llm.api_key):
+    if llm_judging_enabled and llm_provider in ("openai", "deepseek") and not (llm_api_key.strip() or settings.llm.api_key):
         raise gr.Error(
             f"No API key configured for provider '{llm_provider}'. Enter one above, or set "
             "LLM_API_KEY in .env if you'd rather not paste it into the UI each time."
@@ -932,7 +932,7 @@ def run_pipeline(
             overlap_tolerance_s=settings.sound_event.overlap_tolerance_s,
         )
 
-    if skip_llm:
+    if not llm_judging_enabled:
         # Fast path for tuning hype detection or testing the UI without waiting on real LLM
         # calls: build clips straight from the raw statistical candidates, no judgment at all.
         # All default to is_clip_worthy=True since nothing has judged them one way or the
@@ -1227,22 +1227,54 @@ def build_app() -> gr.Blocks:
 
         with gr.Accordion("Sources & Settings", open=True):
             gr.Markdown("### Sources")
-            youtube_input = gr.Textbox(
-                label="YouTube URL or local .srt/.vtt/.txt transcript path",
-                placeholder="https://youtube.com/watch?v=... or C:\\path\\to\\transcript.srt",
-            )
-            twitch_input = gr.Textbox(
-                label="Twitch VOD URL or ID",
-                placeholder="https://twitch.tv/videos/123456789",
-            )
-            offset_input = gr.Number(
-                label="Chat offset (s) - Twitch clock minus YouTube clock",
-                value=settings.fetcher.default_chat_offset_seconds,
-            )
-            source_video_input = gr.Textbox(
-                label="Local source video path (used by exports)",
-                placeholder=r"C:\path\to\downloaded_video.mp4",
-            )
+            with gr.Row():
+                with gr.Column():
+                    youtube_input = gr.Textbox(
+                        label="YouTube URL or local .srt/.vtt/.txt transcript path",
+                        placeholder="https://youtube.com/watch?v=... or C:\\path\\to\\transcript.srt",
+                    )
+                    twitch_input = gr.Textbox(
+                        label="Twitch VOD URL or ID",
+                        placeholder="https://twitch.tv/videos/123456789",
+                    )
+                    offset_input = gr.Number(
+                        label="Chat offset (s) - Twitch clock minus YouTube clock",
+                        value=settings.fetcher.default_chat_offset_seconds,
+                    )
+                    source_video_input = gr.Textbox(
+                        label="Local source video path (used by exports)",
+                        placeholder=r"C:\path\to\downloaded_video.mp4",
+                    )
+                with gr.Column():
+                    audio_enable_checkbox = gr.Checkbox(
+                        label="Enable audio peak analysis", value=False,
+                    )
+                    sound_event_enable_checkbox = gr.Checkbox(
+                        label="Enable sound event detection", value=False,
+                    )
+                    llm_judging_enabled_checkbox = gr.Checkbox(
+                        label="Allow LLM judging", value=True,
+                    )
+
+            clips_state = gr.State([])
+            page_state = gr.State(0)
+            session_path_state = gr.State(None)
+            delete_armed_state = gr.State(None)
+            with gr.Row():
+                session_dropdown = gr.Dropdown(
+                    label="Saved sessions", choices=_session_choices(), value=None,
+                    filterable=True, elem_classes=["vb-session-dropdown"],
+                    info="Pick one to load it automatically.",
+                )
+                save_session_btn = gr.Button("Save session", size="sm")
+            with gr.Accordion("Delete / purge saves (advanced)", open=False):
+                with gr.Row():
+                    delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
+                    confirm_purge_checkbox = gr.Checkbox(
+                        label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
+                    )
+                    purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
+
             with gr.Row():
                 vod_quality_input = gr.Textbox(
                     label="VOD download quality",
@@ -1282,10 +1314,8 @@ def build_app() -> gr.Blocks:
             with gr.Accordion("Audio peak analysis (advanced)", open=False):
                 gr.Markdown(
                     "Detects loud moments (shouts, sudden outbursts) from the VOD's own audio track - "
-                    "requires the local source video above to already be downloaded."
-                )
-                audio_enable_checkbox = gr.Checkbox(
-                    label="Enable audio peak analysis", value=False,
+                    "requires the local source video above to already be downloaded. Enabled via the "
+                    "'Enable audio peak analysis' switch up in Sources."
                 )
                 with gr.Row():
                     audio_z_threshold_input = gr.Slider(
@@ -1301,14 +1331,12 @@ def build_app() -> gr.Blocks:
                 _sound_event_problems = settings.sound_event.validate()
                 gr.Markdown(
                     "Detects specific acoustic events (laughter, screaming, cheering, groaning) via a "
-                    "YAMNet model - also requires the local source video above.\n\n"
+                    "YAMNet model - also requires the local source video above. Enabled via the "
+                    "'Enable sound event detection' switch up in Sources.\n\n"
                     + (
                         f"_Model not ready: {' '.join(_sound_event_problems)}_"
                         if _sound_event_problems else "_YAMNet model found and ready._"
                     )
-                )
-                sound_event_enable_checkbox = gr.Checkbox(
-                    label="Enable sound event detection", value=False,
                 )
                 sound_event_classes_input = gr.CheckboxGroup(
                     label="Event types to detect",
@@ -1389,11 +1417,6 @@ def build_app() -> gr.Blocks:
                     show_label=False,
                 )
                 reset_system_prompt_btn = gr.Button("Reset to default", size="sm")
-            skip_llm_checkbox = gr.Checkbox(
-                label="Skip LLM judging (raw statistical candidates only - fast, for tuning "
-                      "hype detection or testing without waiting on real LLM calls)",
-                value=False,
-            )
             run_btn = gr.Button("Analyze Stream", variant="primary")
             status_box = gr.Markdown("")
 
@@ -1415,25 +1438,6 @@ def build_app() -> gr.Blocks:
             )
 
         gr.Markdown("### Clip Candidates")
-        clips_state = gr.State([])
-        page_state = gr.State(0)
-        session_path_state = gr.State(None)
-        delete_armed_state = gr.State(None)
-
-        with gr.Row():
-            session_dropdown = gr.Dropdown(
-                label="Saved sessions", choices=_session_choices(), value=None,
-                filterable=True, elem_classes=["vb-session-dropdown"],
-                info="Pick one to load it automatically.",
-            )
-            save_session_btn = gr.Button("Save session", size="sm")
-        with gr.Accordion("Delete / purge saves (advanced)", open=False):
-            with gr.Row():
-                delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
-                confirm_purge_checkbox = gr.Checkbox(
-                    label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
-                )
-                purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
 
         with gr.Row():
             show_rejected_checkbox = gr.Checkbox(
@@ -1521,7 +1525,7 @@ def build_app() -> gr.Blocks:
                 max_merged_duration_input,
                 min_viral_score_input, content_hint_input, system_prompt_input,
                 llm_provider_input, llm_model_input, llm_api_base_input, llm_api_key_input,
-                skip_llm_checkbox,
+                llm_judging_enabled_checkbox,
                 audio_enable_checkbox, audio_z_threshold_input, audio_allow_new_checkbox,
                 sound_event_enable_checkbox, sound_event_classes_input,
                 sound_event_confidence_input, sound_event_allow_new_checkbox,
