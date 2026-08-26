@@ -1218,7 +1218,7 @@ _ANALYZE_BTN_SPIN_JS = """
         btn.classList.add('vb-rainbow-spin');
     });
     btn.addEventListener('animationend', (e) => {
-        if (e.animationName === 'vb-rainbow-flow') {
+        if (e.animationName === 'vb-rainbow-spin') {
             btn.classList.remove('vb-rainbow-spin');
             labelNode.nodeValue = originalLabel;
         }
@@ -1700,15 +1700,24 @@ def _load_custom_css() -> str:
     return css.replace("{{HEART_SVG_PATH}}", heart_svg_path)
 
 
-# Loaded via launch(head=...) rather than an @import at the top of custom.css - an
-# @import only works if it's literally the first rule in its own stylesheet, which is
-# fragile to guarantee once that file's content gets composed with other CSS. A real
-# <link> in <head> has no such ordering requirement. Used for the "Analyze Stream"
-# button's font (see ui/custom.css's #analyze_stream_btn rule).
-_GOOGLE_FONT_HEAD = """
+# Loaded via launch(head=...) rather than folded into ui/custom.css's css=... string -
+# two separate things need this:
+#  - The Google Fonts <link>s: an @import only works if it's literally the first rule in
+#    its own stylesheet, fragile to guarantee once that file's content gets composed with
+#    other CSS. A real <link> in <head> has no such ordering requirement.
+#  - The @property rule: confirmed via live inspection that Gradio's css=... pipeline
+#    silently strips @property at-rules (they never make it into document.styleSheets),
+#    but the exact same rule survives untouched when it arrives via head=... instead,
+#    since that content is injected as literal HTML rather than being run through
+#    whatever rewrites/scopes the css=... string. --vb-spin-angle is what lets the
+#    "Analyze Stream" button's rainbow ring (ui/custom.css) actually rotate a
+#    conic-gradient's angle instead of sliding a linear one sideways - see that file's
+#    #analyze_stream_btn::after for why a real transform: rotate() isn't used instead.
+_CUSTOM_HEAD_TAGS = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Russo+One&display=swap" rel="stylesheet">
+<style>@property --vb-spin-angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }</style>
 """
 
 if __name__ == "__main__":
@@ -1717,7 +1726,7 @@ if __name__ == "__main__":
         server_port=7863,
         css_paths=[_UI_DIR / "theme.css"],
         css=_load_custom_css(),
-        head=_GOOGLE_FONT_HEAD,
+        head=_CUSTOM_HEAD_TAGS,
         allowed_paths=[str(_UI_DIR)],
         favicon_path=str(_UI_DIR / "logos" / "logoverysmall.png"),
         footer_links=["gradio", "settings"],

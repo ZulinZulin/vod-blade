@@ -368,7 +368,7 @@ gradio-app {
         brightens further on hover and dims slightly on press.
      2. ::before - a diagonal light band that sweeps across on hover (the
         "metallic shine"), via a background-position transition.
-     3. ::after - a rainbow border that flows around the button a few times on
+     3. ::after - a rainbow ring that spins around the button a few times on
         click - see _ANALYZE_BTN_SPIN_JS in app.py, which toggles
         .vb-rainbow-spin to (re)trigger the animation below.
    Hover/click feedback deliberately never uses `transform` (scale/translate/
@@ -378,15 +378,16 @@ gradio-app {
    accordion panel, which defaults to overflow-x: auto - confirmed via live
    DOM inspection, a transform here was making that panel grow a real
    horizontal scrollbar on hover/click. box-shadow, filter, and
-   background-position changes don't have this problem, so every effect below
-   is built from those instead. This also ruled out a true rotating
-   conic-gradient ring (needs `transform: rotate()`, or a `@property`-driven
-   angle - tried, but Gradio's css_paths pipeline silently strips @property
-   at-rules, confirmed by inspecting the actual injected <style> tag) in favor
-   of sliding a repeating rainbow gradient sideways instead. isolation:
-   isolate gives the button its own stacking context so the ring's negative
-   z-index tucks it just behind the button's own background instead of behind
-   unrelated page content. */
+   background-position/custom-property changes don't have this problem, so
+   every effect below is built from those instead of transform - including the
+   spinning ring, which rotates a conic-gradient by animating its own `from`
+   angle (--vb-spin-angle, registered via @property in app.py's launch(head=...)
+   - a plain css=... string silently drops @property at-rules, confirmed by
+   inspecting the actual injected <style> tag, but the identical rule survives
+   when it arrives via head=... instead) rather than literally rotating the
+   element. isolation: isolate gives the button its own stacking context so
+   the ring's negative z-index tucks it just behind the button's own
+   background instead of behind unrelated page content. */
 #analyze_stream_btn {
     position: relative;
     isolation: isolate;
@@ -436,29 +437,24 @@ gradio-app {
     inset: -4px;
     z-index: -1;
     border-radius: 10px;
-    /* The color sequence repeats 3x back-to-back across a background 3x the
-       element's width, then the animation slides it exactly one repeat-width
-       to the left - so it loops seamlessly with no visible seam or snap-back. */
-    background: linear-gradient(
-        90deg,
-        #ff2d55, #ff9500, #ffe600, #34c759, #00c7e6, #5e5ce6,
-        #ff2d55, #ff9500, #ffe600, #34c759, #00c7e6, #5e5ce6,
-        #ff2d55, #ff9500, #ffe600, #34c759, #00c7e6, #5e5ce6
+    /* conic-gradient reads as a color wheel around a center point (a "radial"
+       rainbow) rather than parallel bands - rotating its own start angle via
+       --vb-spin-angle makes it visibly spin without ever transforming the
+       element itself. */
+    background: conic-gradient(
+        from var(--vb-spin-angle),
+        #ff2d55, #ff9500, #ffe600, #34c759, #00c7e6, #5e5ce6, #ff2d55
     );
-    background-size: 300% 100%;
     opacity: 0;
     transition: opacity 0.4s ease;
 }
 #analyze_stream_btn.vb-rainbow-spin::after {
     opacity: 1;
-    animation: vb-rainbow-flow 0.8s linear 3;
+    animation: vb-rainbow-spin 0.8s linear 3;
 }
-@keyframes vb-rainbow-flow {
-    from {
-        background-position: 0% 0;
-    }
+@keyframes vb-rainbow-spin {
     to {
-        background-position: -100% 0;
+        --vb-spin-angle: 360deg;
     }
 }
 
