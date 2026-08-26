@@ -37,7 +37,7 @@ from config import SESSIONS_DIR, settings
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
-    FetcherError, SubtitleSegment, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod, get_twitch_vod_title,
+    FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod, get_twitch_vod_title,
 )
 from core.llm_agent import (
     DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError,
@@ -346,19 +346,6 @@ def _relative_offset_label(event_time: Optional[float], clip_start: float, clip_
     if event_time is None or not (clip_start <= event_time <= clip_end):
         return ""
     return f" ({_format_hms(event_time - clip_start)} into this clip)"
-
-
-def _format_full_transcript(subtitles: List[SubtitleSegment]) -> str:
-    """
-    Renders the whole fetched subtitle track as '[HH:MM:SS -> HH:MM:SS] text' lines,
-    so an operator can eyeball the actual language/content pulled for a stream and
-    scroll to the context around a clip without leaving the app.
-    """
-    if not subtitles:
-        return "(no subtitles loaded yet - run an analysis)"
-    return "\n".join(
-        f"[{_format_hms(seg.start)} -> {_format_hms(seg.end)}] {seg.text}" for seg in subtitles
-    )
 
 
 _TIMECODE_PREFIX_RE = re.compile(r"\[\d+(?:\.\d+)?-\d+(?:\.\d+)?\]\s*")
@@ -746,7 +733,7 @@ def do_purge_sessions(confirmed: bool):
     return gr.update(value=False), None, gr.update(choices=_session_choices(), value=None)
 
 
-_DELETE_SESSION_LABEL = "Delete selected session"
+_DELETE_SESSION_LABEL = "Delete current save"
 
 
 def do_delete_session(session_path: Optional[str], armed_path: Optional[str], active_session_path: Optional[str]):
@@ -999,7 +986,6 @@ def run_pipeline(
     # from a previous run doesn't leak into a new one.
     visible = _visible_clips(refined_clips, show_rejected=False)
     page_updates = _build_card_updates(visible, page=0, source_video_path=source_video_path)
-    transcript_text = _format_full_transcript(subtitles)
 
     # Auto-save immediately (unless the operator opted out) - judging a real VOD can take
     # a long time (dozens of real LLM calls), so the result is checkpointed to disk before
@@ -1025,7 +1011,7 @@ def run_pipeline(
 
     return (
         fig, refined_clips, status, 0, gr.update(value=False), _page_label(visible, 0),
-        transcript_text, None, session_update, *page_updates,
+        None, session_update, *page_updates,
     )
 
 
@@ -1230,7 +1216,7 @@ def _logo_header_html() -> str:
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="VOD BLADE") as demo:
         gr.HTML(_logo_header_html())
-        gr.Markdown("Turn Twitch chat hype spikes into DaVinci Resolve-ready viral clips.")
+        gr.Markdown("Please provide subtitles source AND Twitch VOD URL of the same stream.")
 
         with gr.Accordion("Sources & Settings", open=True):
             gr.Markdown("### Sources")
@@ -1244,13 +1230,13 @@ def build_app() -> gr.Blocks:
                         label="Twitch VOD URL or ID",
                         placeholder="https://twitch.tv/videos/123456789",
                     )
+                    source_video_input = gr.Textbox(
+                        label="Local source video path (Optional. Used by sound analysis and Resolve exports)",
+                        placeholder=r"C:\path\to\downloaded_video.mp4",
+                    )
                     offset_input = gr.Number(
                         label="Chat offset (s) - Twitch clock minus YouTube clock",
                         value=settings.fetcher.default_chat_offset_seconds,
-                    )
-                    source_video_input = gr.Textbox(
-                        label="Local source video path (used by exports)",
-                        placeholder=r"C:\path\to\downloaded_video.mp4",
                     )
                 with gr.Column():
                     with gr.Group():
@@ -1276,8 +1262,7 @@ def build_app() -> gr.Blocks:
                             ],
                             value=settings.fetcher.twitch_video_quality,
                             allow_custom_value=True,
-                            info="Pick a common quality, or type an exact rendition "
-                                 "(e.g. 480p30) if you know it's available for this VOD.",
+                            info="Best is recommended. 2-4GB per hour. Downloads from Twitch",
                         )
             download_status = gr.Markdown("")
 
@@ -1314,21 +1299,17 @@ def build_app() -> gr.Blocks:
                         type="password",
                     )
                 gr.Markdown(
-                    "_openrouter and nanogpt are third-party aggregators exposing many underlying "
-                    "models - 'Fetch models from API' lists what's actually available from whichever "
-                    "provider/API base/key is set above (needs a valid key for most providers). Local "
-                    "Ollama note: the app can detect the model being evicted to CPU/RAM, but not GPU "
-                    "**compute** contention - another GPU-heavy app (image/video generation, games) "
-                    "running at the same time can still make judgment run dramatically slower with no "
-                    "error, even while the model stays fully loaded on the GPU. Close other GPU-heavy "
-                    "applications for best performance._"
+                    "_Local Ollama note: **Close other GPU-heavy applications for best "
+                    "performance.** VOD BLADE can detect the model being evicted to CPU/RAM, "
+                    "but not GPU compute contention - another GPU-heavy app (image/video "
+                    "generation, games) running at the same time can make judgment run "
+                    "dramatically slower._"
                 )
 
             with gr.Row():
                 session_dropdown = gr.Dropdown(
                     label="Load session", choices=_session_choices(), value=None,
                     filterable=True, elem_classes=["vb-session-dropdown"],
-                    info="Pick one to load it automatically.",
                 )
                 with gr.Column():
                     save_session_btn = gr.Button("Save session", size="sm")
@@ -1344,7 +1325,7 @@ def build_app() -> gr.Blocks:
                     )
                     purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
 
-            with gr.Accordion("Hype detection settings (advanced)", open=False):
+            with gr.Accordion("Chat spikes detection settings", open=False):
                 with gr.Row():
                     z_threshold_input = gr.Slider(
                         label="Z-score threshold (higher = fewer, stronger-only spikes)",
@@ -1372,7 +1353,7 @@ def build_app() -> gr.Blocks:
                     minimum=30, maximum=600, step=10,
                     value=settings.hype.max_merged_duration_seconds,
                 )
-            with gr.Accordion("Audio peak & sound event detection (advanced)", open=False):
+            with gr.Accordion("Audio analysis settings", open=False):
                 with gr.Row(elem_classes=["vb-two-col"]):
                     with gr.Column():
                         gr.Markdown(
@@ -1416,7 +1397,7 @@ def build_app() -> gr.Blocks:
                             label="Allow event-only peaks (no matching chat/audio spike) to become their own candidates",
                             value=settings.sound_event.allow_new_candidates,
                         )
-            with gr.Accordion("LLM judgment settings (advanced)", open=False):
+            with gr.Accordion("AI Arbitration settings", open=False):
                 min_viral_score_input = gr.Slider(
                     label="Minimum viral score to keep (1-10) - clips the LLM itself scores below "
                           "this are rejected even if it called them worthy",
@@ -1429,11 +1410,11 @@ def build_app() -> gr.Blocks:
                     placeholder="e.g. 'podcast, lots of talking - be strict about what counts as "
                                 "notable' or 'fast-paced gaming stream'",
                 )
-            with gr.Accordion("System prompt (advanced - edit with care)", open=False):
+            with gr.Accordion("System prompt [DANGER ZONE]", open=False):
                 gr.Markdown(
-                    "_This is the full instruction set the LLM judges every candidate against. "
-                    "Edit it to change how judgment works; leave it as-is otherwise. If your edit "
-                    "breaks the required JSON output format, calls will fail validation and those "
+                    "_This is the full instruction set the LLM arbitrates every candidate clip "
+                    "against. Edit it to change how arbitration works. If your edit breaks the "
+                    "required JSON output format, calls will fail validation and those "
                     "candidates fall back to their raw chat-spike window instead of crashing._"
                 )
                 system_prompt_input = gr.Textbox(
@@ -1446,22 +1427,13 @@ def build_app() -> gr.Blocks:
             run_btn = gr.Button("Analyze Stream", variant="primary")
             status_box = gr.Markdown("")
 
-        gr.Markdown("### Chat Hype Timeline")
+        gr.Markdown("### Cool graph\n<small>you can click on it</small>")
         hype_plot = gr.Plot(elem_id="hype_plot")
         # Bridge components for _HYPE_CLICK_BRIDGE_JS / _HYPE_HIGHLIGHT_SCROLL_JS - visible="hidden"
         # (not visible=False) so they stay mounted in the DOM for the JS to reach.
         hype_click_bridge = gr.Textbox(elem_id="hype_click_bridge", visible="hidden")
         hype_click_bridge_button = gr.Button(elem_id="hype_click_bridge_button", visible="hidden")
         hype_highlight_signal = gr.Textbox(elem_id="hype_highlight_signal", visible="hidden")
-
-        with gr.Accordion("Subtitles (verify language / scroll for context around a clip)", open=False):
-            subtitles_display = gr.Textbox(
-                value="(no subtitles loaded yet - run an analysis)",
-                lines=15,
-                max_lines=30,
-                interactive=False,
-                show_label=False,
-            )
 
         gr.Markdown("### Clip Candidates")
 
@@ -1559,7 +1531,7 @@ def build_app() -> gr.Blocks:
             ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
-                show_rejected_checkbox, page_label, subtitles_display,
+                show_rejected_checkbox, page_label,
                 session_path_state, session_dropdown, *card_outputs,
             ],
             api_visibility="private",
