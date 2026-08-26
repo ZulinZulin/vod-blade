@@ -1318,10 +1318,11 @@ def build_app() -> gr.Blocks:
                     filterable=True, elem_classes=["vb-session-dropdown"],
                     info="Pick one to load it automatically.",
                 )
-                save_session_btn = gr.Button("Save session", size="sm")
-            autosave_enabled_checkbox = gr.Checkbox(
-                label="Auto-save after each run", value=True,
-            )
+                with gr.Column():
+                    save_session_btn = gr.Button("Save session", size="sm")
+                    autosave_enabled_checkbox = gr.Checkbox(
+                        label="Auto-save after each run", value=True,
+                    )
             with gr.Accordion("Delete / purge saves (advanced)", open=False):
                 with gr.Row():
                     delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
