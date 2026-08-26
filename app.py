@@ -1196,6 +1196,34 @@ _HIDE_SCREEN_STUDIO_JS = """
 }
 """
 
+# Retriggers the CSS-driven rainbow-spin animation on every click, not just the first -
+# a CSS animation already applied to an element won't replay just because its trigger
+# class gets re-added on the next click, so this removes the class, forces a reflow
+# (reading offsetWidth) to flush that removal before the browser processes the next
+# style change, then re-adds it. animationend removes the class again afterward so the
+# ring's own opacity transition (see ui/custom.css) can fade it back out instead of it
+# snapping to hidden, and so the element is back in its "off" state ready for next click.
+# The button is part of the initial static layout (unlike the Settings modal that
+# _HIDE_SCREEN_STUDIO_JS has to wait for), so a plain lookup on load is enough - no
+# MutationObserver needed here.
+_ANALYZE_BTN_SPIN_JS = """
+() => {
+    const btn = document.getElementById('analyze_stream_btn');
+    if (!btn || btn.dataset.vbSpinBound) return;
+    btn.dataset.vbSpinBound = '1';
+    btn.addEventListener('click', () => {
+        btn.classList.remove('vb-rainbow-spin');
+        void btn.offsetWidth;
+        btn.classList.add('vb-rainbow-spin');
+    });
+    btn.addEventListener('animationend', (e) => {
+        if (e.animationName === 'vb-rainbow-flow') {
+            btn.classList.remove('vb-rainbow-spin');
+        }
+    });
+}
+"""
+
 
 def _logo_header_html() -> str:
     """
@@ -1424,7 +1452,7 @@ def build_app() -> gr.Blocks:
                     show_label=False,
                 )
                 reset_system_prompt_btn = gr.Button("Reset to default", size="sm")
-            run_btn = gr.Button("Analyze Stream", variant="primary")
+            run_btn = gr.Button("Analyze Stream", variant="primary", elem_id="analyze_stream_btn")
             status_box = gr.Markdown("")
 
         gr.Markdown(
@@ -1561,6 +1589,7 @@ def build_app() -> gr.Blocks:
         )
 
         demo.load(fn=None, inputs=None, outputs=None, js=_HIDE_SCREEN_STUDIO_JS)
+        demo.load(fn=None, inputs=None, outputs=None, js=_ANALYZE_BTN_SPIN_JS)
         hype_plot.change(fn=None, inputs=None, outputs=None, js=_HYPE_CLICK_BRIDGE_JS)
         hype_click_bridge_button.click(
             fn=do_hype_plot_click,

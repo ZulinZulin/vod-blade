@@ -359,3 +359,99 @@ gradio-app {
     margin-top: 28px !important;
 }
 
+/* "Analyze Stream" - the one button that actually kicks off the whole pipeline,
+   styled to stand out from every other (deliberately plain) button in the app.
+   Three layered effects, all on the button element itself (Gradio's Button
+   component has no extra wrapper div around it - confirmed via DOM inspection -
+   so pseudo-elements sit directly on #analyze_stream_btn):
+     1. A persistent soft glow, a bit more presence than a default button;
+        brightens further on hover and dims slightly on press.
+     2. ::before - a diagonal light band that sweeps across on hover (the
+        "metallic shine"), via a background-position transition.
+     3. ::after - a rainbow border that flows around the button a few times on
+        click - see _ANALYZE_BTN_SPIN_JS in app.py, which toggles
+        .vb-rainbow-spin to (re)trigger the animation below.
+   Hover/click feedback deliberately never uses `transform` (scale/translate/
+   rotate): Chromium counts a transformed element's POST-transform bounding
+   box toward its ancestors' *scrollable* overflow even though the transform
+   is purely visual, and this button sits inside Sources & Settings' own
+   accordion panel, which defaults to overflow-x: auto - confirmed via live
+   DOM inspection, a transform here was making that panel grow a real
+   horizontal scrollbar on hover/click. box-shadow, filter, and
+   background-position changes don't have this problem, so every effect below
+   is built from those instead. This also ruled out a true rotating
+   conic-gradient ring (needs `transform: rotate()`, or a `@property`-driven
+   angle - tried, but Gradio's css_paths pipeline silently strips @property
+   at-rules, confirmed by inspecting the actual injected <style> tag) in favor
+   of sliding a repeating rainbow gradient sideways instead. isolation:
+   isolate gives the button its own stacking context so the ring's negative
+   z-index tucks it just behind the button's own background instead of behind
+   unrelated page content. */
+#analyze_stream_btn {
+    position: relative;
+    isolation: isolate;
+    overflow: visible;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    box-shadow: 0 4px 18px rgba(247, 4, 143, 0.45);
+    transition: box-shadow 0.25s ease, filter 0.15s ease;
+}
+#analyze_stream_btn:hover {
+    box-shadow: 0 6px 26px rgba(247, 4, 143, 0.7);
+    filter: brightness(1.08);
+}
+#analyze_stream_btn:active {
+    filter: brightness(0.93);
+}
+#analyze_stream_btn::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    border-radius: inherit;
+    pointer-events: none;
+    background: linear-gradient(
+        120deg,
+        transparent 40%,
+        rgba(255, 255, 255, 0.55) 50%,
+        transparent 60%
+    );
+    background-size: 250% 100%;
+    background-position: 150% 0;
+    transition: background-position 0.7s ease;
+}
+#analyze_stream_btn:hover::before {
+    background-position: -50% 0;
+}
+#analyze_stream_btn::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    z-index: -1;
+    border-radius: 10px;
+    /* The color sequence repeats 3x back-to-back across a background 3x the
+       element's width, then the animation slides it exactly one repeat-width
+       to the left - so it loops seamlessly with no visible seam or snap-back. */
+    background: linear-gradient(
+        90deg,
+        #ff2d55, #ff9500, #ffe600, #34c759, #00c7e6, #5e5ce6,
+        #ff2d55, #ff9500, #ffe600, #34c759, #00c7e6, #5e5ce6,
+        #ff2d55, #ff9500, #ffe600, #34c759, #00c7e6, #5e5ce6
+    );
+    background-size: 300% 100%;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+}
+#analyze_stream_btn.vb-rainbow-spin::after {
+    opacity: 1;
+    animation: vb-rainbow-flow 0.8s linear 3;
+}
+@keyframes vb-rainbow-flow {
+    from {
+        background-position: 0% 0;
+    }
+    to {
+        background-position: -100% 0;
+    }
+}
+
