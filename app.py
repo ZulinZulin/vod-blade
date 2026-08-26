@@ -1252,12 +1252,15 @@ def build_app() -> gr.Blocks:
                 with gr.Column():
                     audio_enable_checkbox = gr.Checkbox(
                         label="Enable audio peak analysis", value=False,
+                        elem_classes=["vb-toggle"],
                     )
                     sound_event_enable_checkbox = gr.Checkbox(
                         label="Enable sound event detection", value=False,
+                        elem_classes=["vb-toggle"],
                     )
                     llm_judging_enabled_checkbox = gr.Checkbox(
                         label="Enable AI Arbitration", value=True,
+                        elem_classes=["vb-toggle"],
                     )
 
             clips_state = gr.State([])
@@ -1322,6 +1325,7 @@ def build_app() -> gr.Blocks:
                     save_session_btn = gr.Button("Save session", size="sm")
                     autosave_enabled_checkbox = gr.Checkbox(
                         label="Auto-save after each run", value=True,
+                        elem_classes=["vb-toggle"],
                     )
             with gr.Accordion("Delete / purge saves (advanced)", open=False):
                 with gr.Row():
