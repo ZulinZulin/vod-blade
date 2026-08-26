@@ -1427,7 +1427,7 @@ def build_app() -> gr.Blocks:
             run_btn = gr.Button("Analyze Stream", variant="primary")
             status_box = gr.Markdown("")
 
-        gr.Markdown("### Cool graph\n<small>you can click on it</small>")
+        gr.Markdown("### Cool graph <small>you can click on it</small>")
         hype_plot = gr.Plot(elem_id="hype_plot")
         # Bridge components for _HYPE_CLICK_BRIDGE_JS / _HYPE_HIGHLIGHT_SCROLL_JS - visible="hidden"
         # (not visible=False) so they stay mounted in the DOM for the JS to reach.
