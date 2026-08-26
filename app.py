@@ -1161,9 +1161,10 @@ _HIDE_SCREEN_STUDIO_JS = """
 # a CSS animation already applied to an element won't replay just because its trigger
 # class gets re-added on the next click, so this removes the class, forces a reflow
 # (reading offsetWidth) to flush that removal before the browser processes the next
-# style change, then re-adds it. animationend removes the class again afterward so the
-# ring's own opacity transition (see ui/custom.css) can fade it back out instead of it
-# snapping to hidden, and so the element is back in its "off" state ready for next click.
+# style change, then re-adds it. Also swaps the button's own label to a random quote
+# for the same duration, restored by the same animationend handler that removes the
+# spin class - both are purely cosmetic and independent of the real (much longer)
+# analysis run underneath, which isn't wired to this button's label at all.
 # The button is part of the initial static layout (unlike the Settings modal that
 # _HIDE_SCREEN_STUDIO_JS has to wait for), so a plain lookup on load is enough - no
 # MutationObserver needed here.
@@ -1172,7 +1173,46 @@ _ANALYZE_BTN_SPIN_JS = """
     const btn = document.getElementById('analyze_stream_btn');
     if (!btn || btn.dataset.vbSpinBound) return;
     btn.dataset.vbSpinBound = '1';
+
+    // The label is a plain text node sitting between Gradio's own (currently
+    // unused) icon-slot comment placeholders - mutating that node directly,
+    // instead of btn.textContent, leaves those placeholders in the DOM in
+    // case a later Gradio re-render of this button ever expects them there.
+    // There's also a lone whitespace text node between two of the comment
+    // placeholders (a template artifact) - skip it, or it (not the real
+    // label) is what gets replaced, leaving "Analyze Stream" concatenated
+    // right after the quote instead of swapped out.
+    let labelNode = Array.from(btn.childNodes).find(
+        n => n.nodeType === Node.TEXT_NODE && n.nodeValue.trim().length > 0
+    );
+    if (!labelNode) {
+        labelNode = document.createTextNode('');
+        btn.appendChild(labelNode);
+    }
+    const originalLabel = labelNode.nodeValue;
+
+    const quotes = [
+        "Henshin-a-go-go, baby!",
+        "Heaven or Hell?",
+        "Tomorrow is mine!",
+        "Rip and tear until it's done",
+        "Can't escape from crossing fate!",
+        "Hesitation is defeat",
+        "The wheel of fate is turning",
+        "It's not a lake, it's an ocean",
+        "The job… Killer is dead",
+        "This is a story of a fighter who wanted to become...",
+        "Here comes Daredevil!",
+        "Eyes up, guardian",
+        "In my restless dream I see this town...",
+        "Optimists inbound",
+        "Do not fear to commit",
+        "Sheeky Breeky i v damki",
+        "Humanity restored",
+    ];
+
     btn.addEventListener('click', () => {
+        labelNode.nodeValue = quotes[Math.floor(Math.random() * quotes.length)];
         btn.classList.remove('vb-rainbow-spin');
         void btn.offsetWidth;
         btn.classList.add('vb-rainbow-spin');
@@ -1180,6 +1220,7 @@ _ANALYZE_BTN_SPIN_JS = """
     btn.addEventListener('animationend', (e) => {
         if (e.animationName === 'vb-rainbow-flow') {
             btn.classList.remove('vb-rainbow-spin');
+            labelNode.nodeValue = originalLabel;
         }
     });
 }
