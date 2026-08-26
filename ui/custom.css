@@ -26,6 +26,15 @@ body {
     overflow-x: hidden;
 }
 .gradio-container {
+    /* Without an explicit width, this sizes to its own content (shrink-to-fit)
+       as a flex item of <gradio-app>'s column layout rather than stretching to
+       fill it - confirmed via live DOM inspection (getComputedStyle showed no
+       stretch happening despite align-items: normal). That made the container
+       visibly jump wider every time an accordion revealed a row too wide to
+       fit its PREVIOUS (narrower) size, e.g. opening "Audio peak analysis". A
+       flat 100% width removes the content-dependence entirely: it always fills
+       available space up to the max-width cap below, whatever is expanded. */
+    width: 100% !important;
     max-width: 1500px !important;
     margin: 0 auto !important;
     /* Inherited by all descendants: a long unbroken string (a file path, a VOD
