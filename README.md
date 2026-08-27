@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="ui/logos/logoSmall.png" alt="VOD BLADE logo" width="220">
+</p>
+
 # VOD BLADE
 
 Turns a Twitch VOD into a set of DaVinci-Resolve-ready highlight clips automatically,
