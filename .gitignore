@@ -9,3 +9,4 @@ data/sessions/
 bin/
 dist/
 vendor/
+.claude/

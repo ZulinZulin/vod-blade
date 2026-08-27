@@ -57,3 +57,10 @@ over (or alongside) the old one.
 ## Building from source / contributing
 
 See [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## License
+
+Copyright (C) 2026 ZulinZulin. Licensed under the
+[GNU General Public License v3.0](LICENSE) - free to use, modify, and
+redistribute, including commercially; any distributed derivative must also be
+open-sourced under GPLv3.
