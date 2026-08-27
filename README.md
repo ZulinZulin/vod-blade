@@ -11,8 +11,8 @@ worth clipping and pick precise in/out points.
 
 > **AI disclosure:** this project was built through extensive collaboration with
 > Claude (Anthropic's AI) - design decisions, implementation, debugging, and testing
-> were all directed and reviewed by the author throughout, but Claude wrote and tested
-> most of the actual code. This is also reflected directly in the commit history via
+> were all directed and reviewed by the author throughout, but Claude wrote most of
+> the actual code. This is also reflected directly in the commit history via
 > `Co-Authored-By: Claude Sonnet 5` trailers.
 
 ## What it does
@@ -33,8 +33,6 @@ worth clipping and pick precise in/out points.
 ## Requirements
 
 - Windows.
-- **DaVinci Resolve** (optional) - only needed for direct timeline injection; the
-  FCPXML/EDL export works without it.
 - **Ollama** (optional) - only needed for AI Arbitration. The app can install it and
   pull the model for you from the Settings panel; needs an NVIDIA GPU with roughly 9GB+
   VRAM for the default model. Without it, chat/audio/sound-event analysis alone still
