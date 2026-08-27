@@ -525,6 +525,12 @@ class LLMAgent:
             timeout=self.cfg.request_timeout_s,
             api_base=self.api_base,
             response_format={"type": "json_object"},
+            # Explicitly suppress Ollama "thinking" models (Qwen3 etc.) - without this,
+            # litellm's Ollama integration silently drops the actual answer when a model
+            # reasons by default (verified: content comes back empty, no error raised),
+            # so every judgment call would exhaust its retries and fall back. Harmless
+            # no-op on non-thinking models like qwen2.5.
+            think=False,
         )
         content = response.choices[0].message.content
         if not content or not content.strip():
