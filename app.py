@@ -665,6 +665,37 @@ def do_unreject_all_manual(clips: List[CandidateClip], show_rejected: bool, page
     )
 
 
+def do_reject_heartless(clips: List[CandidateClip], show_rejected: bool, page: int, source_video_path: str):
+    """
+    Bulk-rejects every currently-accepted clip that has no heart mark, for
+    quickly narrowing a big candidate list down to just what's been hand-picked.
+    Uses the same manual-rejection sentinel as the single-clip reject button, so
+    "Un-reject all (manual only)" restores these exactly like any other manual
+    rejection - no separate un-reject path needed. Already-rejected clips (by the
+    LLM or a prior manual reject) are left untouched regardless of mark, since
+    this button's job is only to reject, not to restore.
+    """
+    is_heartless_and_accepted = lambda c: c.is_clip_worthy and c.mark_color is None
+    count = sum(1 for c in clips if is_heartless_and_accepted(c))
+    updated = [
+        replace(c, is_clip_worthy=False, rejection_reason=_MANUAL_REJECTION_REASON)
+        if is_heartless_and_accepted(c) else c
+        for c in clips
+    ]
+
+    if count == 0:
+        gr.Warning("No unmarked, currently-accepted clips to reject.")
+    else:
+        gr.Info(f"Rejected {count} unmarked clip(s). Marked clips were left untouched.")
+
+    new_visible = _visible_clips(updated, show_rejected)
+    new_page = _clamp_page(page, new_visible)
+    return (
+        updated, new_page, _page_label(new_visible, new_page),
+        *_build_card_updates(new_visible, new_page, source_video_path),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Session persistence
 # --------------------------------------------------------------------------- #
@@ -1583,6 +1614,7 @@ def build_app() -> gr.Blocks:
                 label="Show rejected candidates",
                 value=False,
             )
+            reject_heartless_btn = gr.Button("Reject the heartless", size="sm")
             unreject_all_btn = gr.Button("Un-reject all (manual only)", size="sm")
         with gr.Row(elem_classes=["vb-pagination-row"]):
             prev_page_btn = gr.Button("< Prev", size="lg")
@@ -1739,6 +1771,12 @@ def build_app() -> gr.Blocks:
         )
         unreject_all_btn.click(
             fn=do_unreject_all_manual,
+            inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
+            outputs=[clips_state, page_state, page_label, *card_outputs],
+            api_visibility="private",
+        )
+        reject_heartless_btn.click(
+            fn=do_reject_heartless,
             inputs=[clips_state, show_rejected_checkbox, page_state, source_video_input],
             outputs=[clips_state, page_state, page_label, *card_outputs],
             api_visibility="private",
