@@ -25,6 +25,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import replace
 from datetime import datetime
 from functools import partial
@@ -52,6 +53,8 @@ from core.session_store import (
     SessionError, delete_session, list_sessions, load_session, purge_sessions, save_session,
 )
 from core import settings_store
+from core import ollama_setup
+from core.version import check_for_update, get_version
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
 from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
@@ -1095,14 +1098,7 @@ def do_fetch_models(api_base: str):
     """
     base = (api_base or "").strip().rstrip("/") or settings.llm.DEFAULT_API_BASE
     try:
-        resp = requests.get(f"{base}/api/tags", timeout=15)
-        resp.raise_for_status()
-        payload = resp.json()
-        model_ids = sorted({
-            str(entry.get("model") or entry.get("name"))
-            for entry in payload.get("models", [])
-            if entry.get("model") or entry.get("name")
-        })
+        model_ids = ollama_setup.get_installed_models(base)
     except requests.exceptions.RequestException as exc:
         raise gr.Error(f"Failed to fetch models from {base}: {exc}")
     except ValueError as exc:  # response body wasn't valid JSON
@@ -1113,6 +1109,138 @@ def do_fetch_models(api_base: str):
 
     gr.Info(f"Fetched {len(model_ids)} model(s) from Ollama.")
     return gr.update(choices=model_ids)
+
+
+_OLLAMA_MANUAL_FALLBACK_MD = (
+    "_Or install Ollama yourself from [ollama.com](https://ollama.com), then click Refresh._"
+)
+_UPDATE_CHECK_REPO = "ZulinZulin/StreamCutter"
+
+
+def _resolve_ollama_model_name(model_name: str) -> str:
+    return (model_name or "").strip() or ollama_setup.DEFAULT_MODEL
+
+
+def do_refresh_ollama_setup(model_name: str, api_base: str):
+    """
+    Live status check - re-run every time (page load, Refresh click, or right after
+    an install/pull/remove finishes) rather than trusting a stored flag, so this stays
+    correct even if the user installs/removes Ollama themselves outside this app.
+    """
+    model_name = _resolve_ollama_model_name(model_name)
+    base = (api_base or "").strip().rstrip("/") or ollama_setup.DEFAULT_API_BASE
+    state = ollama_setup.detect_state(model_name, base)
+
+    if state == ollama_setup.OllamaState.NOT_INSTALLED:
+        vram_mb = ollama_setup.check_gpu_vram_mb()
+        if vram_mb is None:
+            vram_line = "Couldn't detect your GPU's VRAM - Ollama needs an NVIDIA GPU with 9GB+ free for this model."
+        elif vram_mb < 9000:
+            vram_line = (
+                f"**Warning:** your GPU reports ~{vram_mb / 1024:.1f}GB VRAM - "
+                f"`{model_name}` needs roughly 9GB+ to run well."
+            )
+        else:
+            vram_line = f"Your GPU reports ~{vram_mb / 1024:.1f}GB VRAM - should be enough for `{model_name}`."
+        status = f"Ollama isn't installed. {vram_line}"
+        return (
+            status, gr.update(visible=False),
+            gr.update(visible=True), gr.update(visible=True, value=vram_line),
+            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
+        )
+    if state in (ollama_setup.OllamaState.INSTALLED_NOT_RUNNING, ollama_setup.OllamaState.RUNNING_MODEL_MISSING):
+        status = f"Ollama is installed, but `{model_name}` isn't pulled yet (~9GB download)."
+        return (
+            status, gr.update(visible=False),
+            gr.update(visible=False), gr.update(visible=False),
+            gr.update(visible=True, value=f"Download {model_name}"), gr.update(visible=False), gr.update(visible=False),
+        )
+    status = f"Local AI ready - `{model_name}` is pulled and Ollama is running."
+    return (
+        status, gr.update(visible=False),
+        gr.update(visible=False), gr.update(visible=False),
+        gr.update(visible=False), gr.update(visible=True), gr.update(visible=True),
+    )
+
+
+# All four handlers below share do_refresh_ollama_setup's 7-value output shape
+# (status_md, progress_md, install_btn, vram_md, pull_btn, remove_model_btn,
+# uninstall_btn): during a long-running step only progress_md changes (everything
+# else is a no-op gr.update()), and the final yield/return re-runs the live status
+# check so the panel settles into whatever's actually true - never a value this
+# function just assumes.
+_NO_OP_STATUS_TAIL = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
+
+
+def do_install_ollama(model_name: str, api_base: str):
+    """Downloads + silently installs Ollama. A bug here is never the only path
+    forward - the manual ollama.com link is always shown alongside this button."""
+    yield ("Downloading the Ollama installer...", gr.update(visible=True), *_NO_OP_STATUS_TAIL)
+    installer_path = Path(tempfile.gettempdir()) / "OllamaSetup.exe"
+    try:
+        for progress in ollama_setup.download_ollama_installer(installer_path):
+            percent = progress.get("percent")
+            text = (
+                f"Downloading the Ollama installer... {percent:.0f}%" if percent is not None
+                else f"Downloading the Ollama installer... {progress['downloaded_mb']:.0f}MB"
+            )
+            yield (text, gr.update(visible=True, value=text), *_NO_OP_STATUS_TAIL)
+
+        yield ("Installing Ollama (this can take a minute)...", gr.update(visible=True, value="Installing Ollama..."), *_NO_OP_STATUS_TAIL)
+        ollama_setup.install_ollama_silent(installer_path)
+    except (requests.exceptions.RequestException, ollama_setup.OllamaSetupError) as exc:
+        yield (f"Install failed: {exc}. Try the manual link below instead.", gr.update(visible=False), *_NO_OP_STATUS_TAIL)
+        return
+
+    status, _, install_btn, vram_md, pull_btn, remove_btn, uninstall_btn = do_refresh_ollama_setup(model_name, api_base)
+    yield (status, gr.update(visible=False), install_btn, vram_md, pull_btn, remove_btn, uninstall_btn)
+
+
+def do_pull_ollama_model(model_name: str, api_base: str):
+    model_name = _resolve_ollama_model_name(model_name)
+    base = (api_base or "").strip().rstrip("/") or ollama_setup.DEFAULT_API_BASE
+    yield (f"Pulling {model_name}...", gr.update(visible=True), *_NO_OP_STATUS_TAIL)
+    try:
+        for progress in ollama_setup.pull_model(model_name, base):
+            status_text = progress.get("status", "")
+            completed, total = progress.get("completed"), progress.get("total")
+            text = f"{status_text} ({completed / total:.0%})" if completed and total else status_text
+            yield (text, gr.update(visible=True, value=text), *_NO_OP_STATUS_TAIL)
+    except requests.exceptions.RequestException as exc:
+        yield (f"Pull failed: {exc}", gr.update(visible=False), *_NO_OP_STATUS_TAIL)
+        return
+
+    status, _, install_btn, vram_md, pull_btn, remove_btn, uninstall_btn = do_refresh_ollama_setup(model_name, api_base)
+    yield (status, gr.update(visible=False), install_btn, vram_md, pull_btn, remove_btn, uninstall_btn)
+
+
+def do_remove_ollama_model(model_name: str, api_base: str):
+    model_name = _resolve_ollama_model_name(model_name)
+    base = (api_base or "").strip().rstrip("/") or ollama_setup.DEFAULT_API_BASE
+    try:
+        ollama_setup.remove_model(model_name, base)
+    except requests.exceptions.RequestException as exc:
+        raise gr.Error(f"Could not remove {model_name}: {exc}")
+    return do_refresh_ollama_setup(model_name, api_base)
+
+
+def do_uninstall_ollama(model_name: str, api_base: str):
+    try:
+        ollama_setup.uninstall_ollama_silent()
+    except ollama_setup.OllamaSetupError as exc:
+        raise gr.Error(str(exc))
+    return do_refresh_ollama_setup(model_name, api_base)
+
+
+def do_check_for_app_update():
+    result = check_for_update(_UPDATE_CHECK_REPO)
+    if result.error:
+        text = f"Couldn't check for updates: {result.error}"
+    elif result.is_newer:
+        text = f"Update available: {result.latest} (you have {result.current}). [Download it here]({result.release_url})"
+    else:
+        text = f"You're up to date (v{result.current})."
+    return gr.update(visible=True, value=text)
 
 
 # --------------------------------------------------------------------------- #
@@ -1500,6 +1628,22 @@ def build_app() -> gr.Blocks:
                     "running at the same time can make judgment run dramatically slower. New "
                     "models aren't managed here - pull them yourself via `ollama pull <name>`._"
                 )
+                gr.Markdown("#### Local AI setup")
+                ollama_status_md = gr.Markdown("Checking status...")
+                ollama_vram_md = gr.Markdown(visible=False)
+                ollama_progress_md = gr.Markdown(visible=False)
+                with gr.Row():
+                    ollama_install_btn = gr.Button("Install Ollama", visible=False, size="sm")
+                    ollama_pull_btn = gr.Button("Download model", visible=False, size="sm")
+                    ollama_remove_model_btn = gr.Button("Remove downloaded model", visible=False, size="sm")
+                    ollama_uninstall_btn = gr.Button("Remove Ollama", visible=False, size="sm", variant="stop")
+                    ollama_refresh_btn = gr.Button("Refresh", size="sm")
+                gr.Markdown(_OLLAMA_MANUAL_FALLBACK_MD)
+                gr.Markdown("---")
+                with gr.Row():
+                    gr.Markdown(f"VOD BLADE v{get_version()}")
+                    check_update_btn = gr.Button("Check for updates", size="sm")
+                update_check_md = gr.Markdown(visible=False)
 
             with gr.Accordion("Chat spikes detection settings", open=False):
                 with gr.Row():
@@ -1755,6 +1899,52 @@ def build_app() -> gr.Blocks:
             api_visibility="private",
         )
 
+        _ollama_status_outputs = [
+            ollama_status_md, ollama_progress_md, ollama_install_btn,
+            ollama_vram_md, ollama_pull_btn, ollama_remove_model_btn, ollama_uninstall_btn,
+        ]
+        ollama_refresh_btn.click(
+            fn=do_refresh_ollama_setup,
+            inputs=[llm_model_input, llm_api_base_input],
+            outputs=_ollama_status_outputs,
+            api_visibility="private",
+        )
+        ollama_install_btn.click(
+            fn=do_install_ollama,
+            inputs=[llm_model_input, llm_api_base_input],
+            outputs=_ollama_status_outputs,
+            api_visibility="private",
+        )
+        ollama_pull_btn.click(
+            fn=do_pull_ollama_model,
+            inputs=[llm_model_input, llm_api_base_input],
+            outputs=_ollama_status_outputs,
+            api_visibility="private",
+        )
+        ollama_remove_model_btn.click(
+            fn=do_remove_ollama_model,
+            inputs=[llm_model_input, llm_api_base_input],
+            outputs=_ollama_status_outputs,
+            api_visibility="private",
+        )
+        ollama_uninstall_btn.click(
+            fn=do_uninstall_ollama,
+            inputs=[llm_model_input, llm_api_base_input],
+            outputs=_ollama_status_outputs,
+            api_visibility="private",
+        )
+        check_update_btn.click(
+            fn=do_check_for_app_update,
+            inputs=[],
+            outputs=[update_check_md],
+            api_visibility="private",
+        )
+
+        demo.load(
+            fn=do_refresh_ollama_setup,
+            inputs=[llm_model_input, llm_api_base_input],
+            outputs=_ollama_status_outputs,
+        )
         demo.load(fn=None, inputs=None, outputs=None, js=_HIDE_SCREEN_STUDIO_JS)
         demo.load(fn=None, inputs=None, outputs=None, js=_ANALYZE_BTN_SPIN_JS)
         hype_plot.change(fn=None, inputs=None, outputs=None, js=_HYPE_CLICK_BRIDGE_JS)
