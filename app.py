@@ -51,6 +51,7 @@ from core.preview import PreviewError, extract_preview_clip, extract_thumbnail
 from core.session_store import (
     SessionError, delete_session, list_sessions, load_session, purge_sessions, save_session,
 )
+from core import settings_store
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
 from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
@@ -1213,6 +1214,13 @@ def do_open_downloads_folder(downloads_dir: str):
         raise gr.Error(f"Could not open '{path}' in the file browser: {exc}")
 
 
+def do_persist_downloads_dir(downloads_dir: str) -> None:
+    """Remembers a chosen downloads folder across restarts - without this the textbox
+    silently reset to the hardcoded default on every fresh page load."""
+    if downloads_dir and downloads_dir.strip():
+        settings_store.set_downloads_dir_override(Path(downloads_dir.strip()))
+
+
 # --------------------------------------------------------------------------- #
 # Export handlers
 # --------------------------------------------------------------------------- #
@@ -1437,7 +1445,7 @@ def build_app() -> gr.Blocks:
                         )
                         downloads_dir_input = gr.Textbox(
                             label="Downloads folder",
-                            value=str(DOWNLOADS_DIR),
+                            value=str(settings_store.get_downloads_dir_override() or DOWNLOADS_DIR),
                             placeholder=str(DOWNLOADS_DIR),
                         )
                         with gr.Row():
@@ -1733,6 +1741,12 @@ def build_app() -> gr.Blocks:
             outputs=[],
             api_visibility="private",
         )
+        downloads_dir_input.blur(
+            fn=do_persist_downloads_dir,
+            inputs=[downloads_dir_input],
+            outputs=[],
+            api_visibility="private",
+        )
 
         fetch_models_btn.click(
             fn=do_fetch_models,
@@ -1905,6 +1919,7 @@ if __name__ == "__main__":
     app = build_app()
     app.queue().launch(
         server_port=7863,
+        inbrowser=True,
         css_paths=[_UI_DIR / "theme.css"],
         css=_load_custom_css(),
         head=_CUSTOM_HEAD_TAGS,

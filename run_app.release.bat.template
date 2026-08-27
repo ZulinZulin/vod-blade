@@ -1,0 +1,18 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+title VOD BLADE
+
+rem Redirects small app state to %LOCALAPPDATA% and large VOD downloads to the
+rem user's Videos folder, keeping both outside this (replaceable/deletable)
+rem app folder. config.py falls back to app-folder-relative paths if these are
+rem unset, so a dev checkout running the other run_app.bat is unaffected.
+set VOD_BLADE_DATA_DIR=%LOCALAPPDATA%\VOD BLADE
+set VOD_BLADE_DOWNLOADS_DIR=%USERPROFILE%\Videos\VOD BLADE
+
+echo [VOD BLADE] Starting app.py ...
+"%~dp0python\python.exe" "%~dp0app.py"
+
+echo.
+echo [VOD BLADE] Server stopped (exit code %ERRORLEVEL%).
+pause

@@ -25,12 +25,15 @@ load_dotenv()
 # --------------------------------------------------------------------------- #
 
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
-DATA_DIR: Final[Path] = BASE_DIR / "data"
+# Overridable so a packaged release can redirect these outside the versioned app
+# folder (small state to %LOCALAPPDATA%, large downloads to a visible user folder)
+# without changing what a dev checkout does by default.
+DATA_DIR: Final[Path] = Path(os.getenv("VOD_BLADE_DATA_DIR", str(BASE_DIR / "data")))
 CACHE_DIR: Final[Path] = DATA_DIR / "cache"
 THUMBNAILS_DIR: Final[Path] = CACHE_DIR / "thumbnails"
 AUDIO_RMS_CACHE_DIR: Final[Path] = CACHE_DIR / "audio_rms"
 SOUND_EVENT_CACHE_DIR: Final[Path] = CACHE_DIR / "sound_events"
-DOWNLOADS_DIR: Final[Path] = DATA_DIR / "downloads"
+DOWNLOADS_DIR: Final[Path] = Path(os.getenv("VOD_BLADE_DOWNLOADS_DIR", str(DATA_DIR / "downloads")))
 EXPORTS_DIR: Final[Path] = DATA_DIR / "exports"
 SESSIONS_DIR: Final[Path] = DATA_DIR / "sessions"
 BIN_DIR: Final[Path] = BASE_DIR / "bin"
