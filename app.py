@@ -1378,7 +1378,26 @@ def build_app() -> gr.Blocks:
             session_path_state = gr.State(None)
             delete_armed_state = gr.State(None)
 
-            with gr.Accordion("Ollama settings (advanced)", open=False):
+            with gr.Row():
+                session_dropdown = gr.Dropdown(
+                    label="Load session", choices=_session_choices(), value=None,
+                    filterable=True, elem_classes=["vb-session-dropdown"],
+                )
+                with gr.Column():
+                    save_session_btn = gr.Button("Save session", size="sm")
+                    autosave_enabled_checkbox = gr.Checkbox(
+                        label="Auto-save after each run", value=True,
+                        elem_classes=["vb-toggle"],
+                    )
+            with gr.Accordion("Delete / purge saves (advanced)", open=False):
+                with gr.Row():
+                    delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
+                    confirm_purge_checkbox = gr.Checkbox(
+                        label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
+                    )
+                    purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
+
+            with gr.Accordion("Ollama settings", open=False):
                 with gr.Row():
                     llm_model_input = gr.Dropdown(
                         label="Model (optional - blank uses the default model; type to search, "
@@ -1401,25 +1420,6 @@ def build_app() -> gr.Blocks:
                     "running at the same time can make judgment run dramatically slower. New "
                     "models aren't managed here - pull them yourself via `ollama pull <name>`._"
                 )
-
-            with gr.Row():
-                session_dropdown = gr.Dropdown(
-                    label="Load session", choices=_session_choices(), value=None,
-                    filterable=True, elem_classes=["vb-session-dropdown"],
-                )
-                with gr.Column():
-                    save_session_btn = gr.Button("Save session", size="sm")
-                    autosave_enabled_checkbox = gr.Checkbox(
-                        label="Auto-save after each run", value=True,
-                        elem_classes=["vb-toggle"],
-                    )
-            with gr.Accordion("Delete / purge saves (advanced)", open=False):
-                with gr.Row():
-                    delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
-                    confirm_purge_checkbox = gr.Checkbox(
-                        label="Confirm purge (deletes ALL saved sessions permanently)", value=False,
-                    )
-                    purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
 
             with gr.Accordion("Chat spikes detection settings", open=False):
                 with gr.Row():
@@ -1539,7 +1539,7 @@ def build_app() -> gr.Blocks:
 
         with gr.Row():
             show_rejected_checkbox = gr.Checkbox(
-                label="Show rejected candidates (statistical spikes the LLM judged not notable)",
+                label="Show rejected candidates",
                 value=False,
             )
             unreject_all_btn = gr.Button("Un-reject all (manual only)", size="sm")
