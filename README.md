@@ -39,7 +39,7 @@ worth clipping and pick precise in/out points.
 ## Getting started
 
 1. Download the latest release from the
-   [Releases page](https://github.com/ZulinZulin/StreamCutter/releases) and unzip it
+   [Releases page](https://github.com/ZulinZulin/vod-blade/releases) and unzip it
    anywhere.
 2. Run `run_app.bat`. Your browser opens automatically once the app is ready.
 3. Provide a subtitle source (a YouTube URL, or a local transcript file) and the

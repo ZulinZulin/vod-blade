@@ -14,8 +14,8 @@
 ## Setup
 
 ```bash
-git clone https://github.com/ZulinZulin/StreamCutter.git
-cd StreamCutter
+git clone https://github.com/ZulinZulin/vod-blade.git
+cd vod-blade
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 copy .env.example .env

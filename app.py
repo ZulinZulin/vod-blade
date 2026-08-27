@@ -1114,7 +1114,7 @@ def do_fetch_models(api_base: str):
 _OLLAMA_MANUAL_FALLBACK_MD = (
     "_Or install Ollama yourself from [ollama.com](https://ollama.com), then click Refresh._"
 )
-_UPDATE_CHECK_REPO = "ZulinZulin/StreamCutter"
+_UPDATE_CHECK_REPO = "ZulinZulin/vod-blade"
 
 
 def _resolve_ollama_model_name(model_name: str) -> str:
