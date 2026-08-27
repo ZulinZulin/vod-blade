@@ -5,6 +5,12 @@ by finding chat-hype spikes, loud audio moments, and notable sound events across
 stream, then (optionally) using a local AI model to judge which moments are actually
 worth clipping and pick precise in/out points.
 
+> **AI disclosure:** this project was built through extensive collaboration with
+> Claude (Anthropic's AI) - design decisions, implementation, debugging, and testing
+> were all directed and reviewed by the author throughout, but Claude wrote and tested
+> most of the actual code. This is also reflected directly in the commit history via
+> `Co-Authored-By: Claude Sonnet 5` trailers.
+
 ## What it does
 
 - Reads a stream's subtitle/transcript track (YouTube captions or a local
