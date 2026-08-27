@@ -132,7 +132,7 @@ if ($LASTEXITCODE -ne 0) { throw "pip install failed with exit code $LASTEXITCOD
 # --- 5. Copy app source (explicit allowlist, never a blanket copy - avoids
 # --- shipping the dev's .env, data/, .venv/, __pycache__) ---
 Write-Host "[build] Copying app source ..."
-$SourceItems = @("app.py", "config.py", "VERSION", "core", "ui", "exporters", "utils")
+$SourceItems = @("app.py", "config.py", "VERSION", "LICENSE", "README.md", "core", "ui", "exporters", "utils")
 foreach ($item in $SourceItems) {
     $src = Join-Path $RepoRoot $item
     $dst = Join-Path $StageDir $item
