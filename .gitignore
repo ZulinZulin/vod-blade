@@ -8,3 +8,4 @@ data/exports/
 data/sessions/
 bin/
 dist/
+vendor/

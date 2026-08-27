@@ -16,9 +16,11 @@
 .PARAMETER VendorPath
     Folder containing binaries this repo doesn't check into git:
     TwitchDownloaderCLI.exe, models\yamnet.onnx, models\yamnet_class_map.csv.
-    Defaults to E:\vod-blade-vendor\bin - maintained by hand outside the repo,
-    since there's no confirmed stable "latest" download URL for
-    TwitchDownloaderCLI the way there is for Ollama/ffmpeg.
+    Defaults to .\vendor\bin (gitignored, next to this script) - maintained by hand,
+    since there's no confirmed stable "latest" download URL for TwitchDownloaderCLI
+    the way there is for Ollama/ffmpeg. Kept inside the repo folder (but out of git)
+    rather than some other absolute path so the default actually works on any
+    machine, not just the one it was first written on.
 
 .EXAMPLE
     .\build_release.ps1
@@ -26,7 +28,7 @@
 #>
 param(
     [string]$Version,
-    [string]$VendorPath = "E:\vod-blade-vendor\bin"
+    [string]$VendorPath = (Join-Path $PSScriptRoot "vendor\bin")
 )
 
 $ErrorActionPreference = "Stop"
