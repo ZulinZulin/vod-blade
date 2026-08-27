@@ -124,6 +124,11 @@ class CandidateClip:
     audio_peak_time: Optional[float] = None
     sound_events: Dict[str, float] = field(default_factory=dict)
     sound_event_time: Optional[float] = None
+    # Operator-set highlight, independent of the LLM's own judgment - one of Resolve's
+    # own clip-color names ("Red"/"Blue"/"Green"/"Purple") or None for unmarked, so
+    # exporters/davinci_api.py can hand it straight to SetClipColor with no lookup
+    # table. A clip carries at most one mark; see app.py's do_toggle_mark.
+    mark_color: Optional[str] = None
 
     @property
     def duration(self) -> float:

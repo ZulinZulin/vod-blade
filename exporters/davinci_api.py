@@ -241,7 +241,7 @@ class DavinciResolveExporter:
         except Exception as exc:
             logger.debug("Could not rename timeline item for clip '%s': %s", clip.title, exc)
         try:
-            item.SetClipColor("Orange" if clip.viral_score >= 8 else "Yellow")
+            item.SetClipColor(clip.mark_color or ("Orange" if clip.viral_score >= 8 else "Yellow"))
         except Exception:
             pass  # clip coloring is purely cosmetic; never fail the export over it
 

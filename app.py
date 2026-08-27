@@ -428,6 +428,18 @@ def _page_label(clips: List[CandidateClip], page: int) -> str:
 _TOGGLE_LABEL_ACCEPTED = "Reject this clip"
 _TOGGLE_LABEL_REJECTED = "Un-reject (restore)"
 
+# Resolve's own clip-color names, so CandidateClip.mark_color can be handed straight
+# to SetClipColor on export with no separate lookup table (see exporters/davinci_api.py).
+_HEART_COLORS = ["Red", "Blue", "Green", "Purple"]
+_HEART_FILLED_EMOJI = {"Red": "❤️", "Blue": "💙", "Green": "💚", "Purple": "💜"}
+_HEART_EMPTY_EMOJI = "🤍"  # shown for the 3 colors NOT currently marked
+
+
+def _heart_button_labels(mark_color: Optional[str]) -> List[str]:
+    """One label per _HEART_COLORS entry: the filled colored heart for whichever one
+    (if any) is the clip's current mark, a plain white heart for the other three."""
+    return [_HEART_FILLED_EMOJI[c] if c == mark_color else _HEART_EMPTY_EMOJI for c in _HEART_COLORS]
+
 
 def _card_thumbnail_update(clip: CandidateClip, source_video_path: str) -> "gr.update":
     """
@@ -447,7 +459,8 @@ def _card_thumbnail_update(clip: CandidateClip, source_video_path: str) -> "gr.u
 
 
 def _build_card_updates(clips: List[CandidateClip], page: int, source_video_path: str = ""):
-    """Returns MAX_CLIP_CARDS * (group, markdown, transcript, thumbnail, start_slider, end_slider, preview_video, toggle_btn) gr.update() tuples for one page."""
+    """Returns MAX_CLIP_CARDS * (group, markdown, transcript, thumbnail, start_slider, end_slider,
+    preview_video, toggle_btn, *4 heart-mark buttons) gr.update() tuples for one page."""
     page = _clamp_page(page, clips)
     start = page * MAX_CLIP_CARDS
     page_clips = clips[start:start + MAX_CLIP_CARDS]
@@ -471,12 +484,14 @@ def _build_card_updates(clips: List[CandidateClip], page: int, source_video_path
                 gr.update(minimum=lo, maximum=hi, value=clip.end_time, step=0.1),
                 gr.update(value=None, visible=False),
                 gr.update(value=toggle_label),
+                *[gr.update(value=lbl) for lbl in _heart_button_labels(clip.mark_color)],
             ])
         else:
             updates.extend([
                 gr.update(visible=False), gr.update(value=""), gr.update(value=""),
                 gr.update(value=None, visible=False), gr.update(), gr.update(),
                 gr.update(value=None, visible=False), gr.update(value=_TOGGLE_LABEL_ACCEPTED),
+                *[gr.update(value=_HEART_EMPTY_EMOJI)] * 4,
             ])
     return updates
 
@@ -508,7 +523,7 @@ def do_hype_plot_click(
     highlight. Anywhere else on the graph, or a rejected clip's own spike, is a
     silent no-op - the last output (hype_highlight_signal) is left empty either way.
     """
-    no_op = (gr.update(), gr.update(), *([gr.update()] * (MAX_CLIP_CARDS * 8)), "")
+    no_op = (gr.update(), gr.update(), *([gr.update()] * (MAX_CLIP_CARDS * 12)), "")
 
     x = None
     try:
@@ -562,6 +577,32 @@ def _sync_bound(
     updated = list(clips)
     updated[real_idx] = replace(target, **{field_name: value})
     return updated
+
+
+def do_toggle_mark(
+    clips: List[CandidateClip], show_rejected: bool, page: int, idx: int, color: str,
+):
+    """
+    Sets or clears one card's DaVinci Resolve clip-color mark. A clip can carry at
+    most one mark - clicking its currently-active heart clears it, clicking a
+    different one swaps to that color instead of adding a second mark, mirroring
+    how Resolve itself only lets a clip have a single clip-color. Only updates
+    clips_state plus this one card's 4 heart buttons (not a full page re-render,
+    like _sync_bound above) since marking never changes which clips are visible.
+    """
+    visible = _visible_clips(clips, show_rejected)
+    local_pos = _clamp_page(page, visible) * MAX_CLIP_CARDS + idx
+    if local_pos >= len(visible):
+        return clips, *([gr.update()] * len(_HEART_COLORS))
+
+    target = visible[local_pos]
+    new_color = None if target.mark_color == color else color
+    real_idx = next(i for i, c in enumerate(clips) if c is target)
+    updated = list(clips)
+    updated[real_idx] = replace(target, mark_color=new_color)
+
+    labels = _heart_button_labels(new_color)
+    return updated, *[gr.update(value=lbl) for lbl in labels]
 
 
 _MANUAL_REJECTION_REASON = "Manually rejected by operator"
@@ -1569,10 +1610,15 @@ def build_app() -> gr.Blocks:
                             start_slider = gr.Slider(label="Start (seconds into VOD)", minimum=0, maximum=1, step=0.1)
                             end_slider = gr.Slider(label="End (seconds into VOD)", minimum=0, maximum=1, step=0.1)
                     toggle_btn = gr.Button(_TOGGLE_LABEL_ACCEPTED, size="sm")
+                    with gr.Row(elem_classes=["vb-heart-row"]):
+                        heart_buttons = [
+                            gr.Button(_HEART_EMPTY_EMOJI, size="sm", min_width=0)
+                            for _ in _HEART_COLORS
+                        ]
                 card_components.append({
                     "group": card_group, "md": card_md, "transcript": card_transcript, "thumbnail": card_thumbnail,
                     "start": start_slider, "end": end_slider,
-                    "video": preview_video, "toggle_btn": toggle_btn,
+                    "video": preview_video, "toggle_btn": toggle_btn, "hearts": heart_buttons,
                 })
 
         gr.Markdown("### Export")
@@ -1596,7 +1642,7 @@ def build_app() -> gr.Blocks:
         for c in card_components:
             card_outputs.extend([
                 c["group"], c["md"], c["transcript"], c["thumbnail"],
-                c["start"], c["end"], c["video"], c["toggle_btn"],
+                c["start"], c["end"], c["video"], c["toggle_btn"], *c["hearts"],
             ])
 
         # api_visibility="private" on every real event below: this app runs ffmpeg on
@@ -1761,6 +1807,13 @@ def build_app() -> gr.Blocks:
                 outputs=[clips_state, page_state, page_label, *card_outputs],
                 api_visibility="private",
             )
+            for color, heart_btn in zip(_HEART_COLORS, c["hearts"]):
+                heart_btn.click(
+                    fn=partial(do_toggle_mark, idx=idx, color=color),
+                    inputs=[clips_state, show_rejected_checkbox, page_state],
+                    outputs=[clips_state, *c["hearts"]],
+                    api_visibility="private",
+                )
 
         export_files_btn.click(
             fn=do_export_files,
