@@ -39,7 +39,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 
-from config import DOWNLOADS_DIR, LOGS_DIR, SESSIONS_DIR, settings
+from config import DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SESSIONS_DIR, settings
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
@@ -2616,7 +2616,13 @@ if __name__ == "__main__":
         css_paths=[_UI_DIR / "theme.css"],
         css=_load_custom_css(),
         head=_CUSTOM_HEAD_TAGS,
-        allowed_paths=[str(_UI_DIR)],
+        # DATA_DIR/DOWNLOADS_DIR are trusted by default in a dev checkout (both sit
+        # under this file's own folder, which Gradio already allows as the cwd) but a
+        # packaged release's launcher redirects them outside the app folder entirely
+        # (%LOCALAPPDATA%, %USERPROFILE%\Videos) - without allowlisting them explicitly,
+        # any output referencing a thumbnail/export/downloaded file there 500s with
+        # gradio.exceptions.InvalidPathError instead of rendering.
+        allowed_paths=[str(_UI_DIR), str(DATA_DIR), str(DOWNLOADS_DIR)],
         favicon_path=str(_UI_DIR / "logos" / "logoverysmall.png"),
         footer_links=["gradio", "settings"],
     )
