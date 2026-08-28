@@ -44,7 +44,7 @@ from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_ch
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
     FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod, get_twitch_vod_title,
-    shift_subtitles_to_vod_clock,
+    is_local_subtitle_source, shift_subtitles_to_vod_clock,
 )
 from core.llm_agent import (
     DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError,
@@ -57,6 +57,8 @@ from core.session_store import (
 )
 from core import settings_store
 from core import ollama_setup
+from core import whisper_setup
+from core.transcriber import TranscriptionError, transcribe_locally
 from core.version import check_for_update, get_version
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
@@ -1013,7 +1015,12 @@ def run_pipeline(
     if youtube_source:
         progress(0.05, desc="Fetching subtitles...")
         try:
-            subtitles = shift_subtitles_to_vod_clock(fetch_subtitles(youtube_source), chat_offset)
+            subtitles = fetch_subtitles(youtube_source)
+            # A local file (hand-supplied, or written by local Whisper transcription)
+            # is already on source_video_path's own clock - only a real YouTube fetch
+            # needs converting onto it. See is_local_subtitle_source's docstring.
+            if not is_local_subtitle_source(youtube_source):
+                subtitles = shift_subtitles_to_vod_clock(subtitles, chat_offset)
         except FetcherError as exc:
             raise gr.Error(f"Subtitle fetch failed: {exc}")
 
@@ -1339,6 +1346,132 @@ def do_uninstall_ollama(model_name: str, api_base: str):
     return do_refresh_ollama_setup(model_name, api_base)
 
 
+# --------------------------------------------------------------------------- #
+# Local transcription (core/whisper_setup.py, core/transcriber.py) - mirrors the
+# Ollama setup block above 1:1 (same 7-value output shape, same live-detection-
+# never-a-stored-flag philosophy), simpler in one respect: whisper-cli has no
+# installer/daemon/registry entry, so there's no INSTALLED_NOT_RUNNING-equivalent
+# state and "uninstall" is just deleting a file.
+# --------------------------------------------------------------------------- #
+
+_WHISPER_MANUAL_FALLBACK_MD = (
+    "_Or get whisper.cpp yourself from "
+    "[github.com/ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp/releases), "
+    "then click Refresh._"
+)
+
+
+def _resolve_whisper_model_name(model_name: str) -> str:
+    return (model_name or "").strip() or settings.whisper.default_model_name
+
+
+def _resolve_whisper_language(language: str) -> str:
+    return (language or "").strip() or settings.whisper.default_language
+
+
+def do_refresh_whisper_setup(model_name: str):
+    """Live status check - re-run every time (page load, Refresh click, or right
+    after an install/download/remove finishes) rather than trusting a stored flag,
+    same reasoning as do_refresh_ollama_setup."""
+    model_name = _resolve_whisper_model_name(model_name)
+    binary_path = settings.whisper.binary_path
+    state = whisper_setup.detect_state(binary_path, model_name)
+
+    if state == whisper_setup.WhisperState.BINARY_MISSING:
+        vram_mb = whisper_setup.check_gpu_vram_mb()
+        if vram_mb is None:
+            vram_line = "Couldn't detect your GPU's VRAM - a GPU speeds transcription up but isn't required."
+        else:
+            vram_line = f"Your GPU reports ~{vram_mb / 1024:.1f}GB VRAM - CPU-only transcription still works, just slower."
+        status = f"whisper.cpp isn't installed. {vram_line}"
+        return (
+            status, gr.update(visible=False),
+            gr.update(visible=True), gr.update(visible=True, value=vram_line),
+            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
+        )
+    if state == whisper_setup.WhisperState.MODEL_MISSING:
+        status = f"whisper.cpp is installed, but the `{model_name}` model isn't downloaded yet."
+        return (
+            status, gr.update(visible=False),
+            gr.update(visible=False), gr.update(visible=False),
+            gr.update(visible=True, value=f"Download {model_name}"), gr.update(visible=False), gr.update(visible=False),
+        )
+    status = f"Local transcription ready - `{model_name}` model found."
+    return (
+        status, gr.update(visible=False),
+        gr.update(visible=False), gr.update(visible=False),
+        gr.update(visible=False), gr.update(visible=True), gr.update(visible=True),
+    )
+
+
+# Same reasoning as _NO_OP_STATUS_TAIL above: during a long-running step only
+# progress_md changes, and the final yield re-runs the live status check.
+_WHISPER_NO_OP_STATUS_TAIL = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
+
+
+def do_install_whisper(model_name: str):
+    """Downloads + extracts the whisper.cpp CLI binary. A bug here is never the
+    only path forward - the manual GitHub releases link is always shown alongside
+    this button."""
+    yield ("Downloading whisper.cpp...", gr.update(visible=True), *_WHISPER_NO_OP_STATUS_TAIL)
+    zip_path = Path(tempfile.gettempdir()) / "whisper-cpp-release.zip"
+    try:
+        for progress in whisper_setup.download_whisper_release_zip(zip_path):
+            percent = progress.get("percent")
+            text = (
+                f"Downloading whisper.cpp... {percent:.0f}%" if percent is not None
+                else f"Downloading whisper.cpp... {progress['downloaded_mb']:.0f}MB"
+            )
+            yield (text, gr.update(visible=True, value=text), *_WHISPER_NO_OP_STATUS_TAIL)
+
+        yield ("Extracting whisper.cpp...", gr.update(visible=True, value="Extracting whisper.cpp..."), *_WHISPER_NO_OP_STATUS_TAIL)
+        whisper_setup.install_whisper_binary(zip_path)
+    except (requests.exceptions.RequestException, whisper_setup.WhisperSetupError) as exc:
+        yield (f"Install failed: {exc}. Try the manual link below instead.", gr.update(visible=False), *_WHISPER_NO_OP_STATUS_TAIL)
+        return
+
+    status, _, install_btn, vram_md, download_btn, remove_btn, remove_bin_btn = do_refresh_whisper_setup(model_name)
+    yield (status, gr.update(visible=False), install_btn, vram_md, download_btn, remove_btn, remove_bin_btn)
+
+
+def do_download_whisper_model(model_name: str):
+    model_name = _resolve_whisper_model_name(model_name)
+    yield (f"Downloading {model_name}...", gr.update(visible=True), *_WHISPER_NO_OP_STATUS_TAIL)
+    try:
+        for progress in whisper_setup.download_model(model_name, whisper_setup.model_path_for(model_name)):
+            percent = progress.get("percent")
+            text = (
+                f"Downloading {model_name}... {percent:.0f}%" if percent is not None
+                else f"Downloading {model_name}... {progress['downloaded_mb']:.0f}MB"
+            )
+            yield (text, gr.update(visible=True, value=text), *_WHISPER_NO_OP_STATUS_TAIL)
+    except requests.exceptions.RequestException as exc:
+        yield (f"Download failed: {exc}", gr.update(visible=False), *_WHISPER_NO_OP_STATUS_TAIL)
+        return
+
+    status, _, install_btn, vram_md, download_btn, remove_btn, remove_bin_btn = do_refresh_whisper_setup(model_name)
+    yield (status, gr.update(visible=False), install_btn, vram_md, download_btn, remove_btn, remove_bin_btn)
+
+
+def do_remove_whisper_model(model_name: str):
+    model_name = _resolve_whisper_model_name(model_name)
+    whisper_setup.remove_model(model_name)
+    return do_refresh_whisper_setup(model_name)
+
+
+def do_remove_whisper_binary(model_name: str):
+    whisper_setup.remove_binary(settings.whisper.binary_path)
+    return do_refresh_whisper_setup(model_name)
+
+
+def do_persist_whisper_model(model_name: str) -> None:
+    settings_store.set_whisper_model_override(model_name)
+
+
+def do_persist_whisper_language(language: str) -> None:
+    settings_store.set_whisper_language_override(language)
+
+
 def do_check_for_app_update():
     result = check_for_update(_UPDATE_CHECK_REPO)
     if result.error:
@@ -1396,6 +1529,66 @@ def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
         f"VOD downloaded: `{video_path}`. Source video path below has been filled in automatically.",
         gr.update(interactive=True),
         gr.update(value=str(video_path)),
+        gr.update(visible=False),
+    )
+
+
+def do_generate_transcript_locally(source_video_path: str, model_name: str, language: str):
+    """
+    Transcribes the local source video file via whisper.cpp, so AI Arbitration
+    doesn't need a YouTube URL. Deliberately NOT part of run_pipeline, same
+    reasoning as do_download_vod - transcription can take a long time on a
+    multi-hour VOD, and this way it's a one-time cost (cached, see
+    core.transcriber) reusable across re-analyzing with different settings.
+
+    Same generator shape as do_download_vod: an immediate in-progress yield
+    with the spinner, the blocking work happens in between, a final yield
+    fills youtube_input (which already reactively unlocks AI Arbitration via
+    do_gate_toggle - see that function's docstring) and hides the spinner.
+    """
+    if not source_video_path or not Path(source_video_path).exists():
+        raise gr.Error(
+            "Generating a transcript locally needs the local source video path above to "
+            "already point at an existing file - download the VOD first, or fill it in manually."
+        )
+    model_name = _resolve_whisper_model_name(model_name)
+    language = _resolve_whisper_language(language)
+    state = whisper_setup.detect_state(settings.whisper.binary_path, model_name)
+    if state != whisper_setup.WhisperState.READY:
+        raise gr.Error(
+            "Local transcription isn't set up yet - open 'Local transcription settings' below "
+            "to install whisper.cpp and download a model."
+        )
+
+    yield (
+        "Transcribing locally... this can take a while for long VODs.",
+        gr.update(interactive=False),
+        gr.update(),
+        gr.update(value='<span class="vb-spinner"></span>', visible=True),
+    )
+
+    srt_path = None
+    try:
+        for progress in transcribe_locally(
+            source_video_path, whisper_setup.model_path_for(model_name), language=language,
+        ):
+            if progress.get("done"):
+                srt_path = progress["srt_path"]
+                break
+            yield (
+                f"Transcribing locally... {progress.get('status', '')}",
+                gr.update(interactive=False),
+                gr.update(),
+                gr.update(value='<span class="vb-spinner"></span>', visible=True),
+            )
+    except TranscriptionError as exc:
+        yield f"Local transcription failed: {exc}", gr.update(interactive=True), gr.update(), gr.update(visible=False)
+        return
+
+    yield (
+        f"Transcript generated: `{srt_path}`. Transcript source above has been filled in automatically.",
+        gr.update(interactive=True),
+        gr.update(value=str(srt_path)),
         gr.update(visible=False),
     )
 
@@ -2032,6 +2225,10 @@ def build_app() -> gr.Blocks:
                         label="YouTube URL or local .srt/.vtt/.txt transcript path",
                         placeholder="https://youtube.com/watch?v=... or C:\\path\\to\\transcript.srt",
                     )
+                    with gr.Row():
+                        generate_transcript_btn = gr.Button("Generate transcript locally", size="sm")
+                        transcript_progress_html = gr.HTML("", visible=False)
+                    transcript_status_md = gr.Markdown("")
                     twitch_input = gr.Textbox(
                         label="Twitch VOD URL or ID",
                         placeholder="https://twitch.tv/videos/123456789",
@@ -2160,6 +2357,33 @@ def build_app() -> gr.Blocks:
                     "_If something goes wrong, the log folder has more detail than what's "
                     "shown here - useful to include when reporting an issue._"
                 )
+
+            with gr.Accordion("Local transcription settings", open=False, elem_id="whisper_settings_accordion"):
+                with gr.Row():
+                    whisper_model_dropdown = gr.Dropdown(
+                        label="Model tier (multilingual - larger = slower, more accurate)",
+                        choices=[name for name, _size in whisper_setup.MODEL_TIERS],
+                        value=settings_store.get_whisper_model_override() or settings.whisper.default_model_name,
+                        allow_custom_value=True,
+                        info="tiny ~75MB, base ~142MB, small ~466MB (recommended), medium ~1.5GB, large-v3 ~2.9GB",
+                    )
+                    whisper_language_dropdown = gr.Dropdown(
+                        label="Language (auto-detect recommended; pin it if detection misfires)",
+                        choices=["auto", "ru", "en", "ja", "es", "de", "fr", "pt", "ko", "zh"],
+                        value=settings_store.get_whisper_language_override() or settings.whisper.default_language,
+                        allow_custom_value=True,
+                    )
+                gr.Markdown("#### Local transcription setup")
+                whisper_status_md = gr.Markdown("Checking status...")
+                whisper_vram_md = gr.Markdown(visible=False)
+                whisper_progress_md = gr.Markdown(visible=False)
+                with gr.Row():
+                    whisper_install_btn = gr.Button("Install whisper.cpp", visible=False, size="sm")
+                    whisper_download_model_btn = gr.Button("Download model", visible=False, size="sm")
+                    whisper_remove_model_btn = gr.Button("Remove downloaded model", visible=False, size="sm")
+                    whisper_remove_binary_btn = gr.Button("Remove whisper.cpp", visible=False, size="sm", variant="stop")
+                    whisper_refresh_btn = gr.Button("Refresh", size="sm")
+                gr.Markdown(_WHISPER_MANUAL_FALLBACK_MD)
 
             with gr.Accordion("DaVinci Resolve settings", open=False):
                 gr.Markdown(
@@ -2541,6 +2765,55 @@ def build_app() -> gr.Blocks:
             outputs=_ollama_status_outputs,
             api_visibility="private",
         )
+        _whisper_status_outputs = [
+            whisper_status_md, whisper_progress_md, whisper_install_btn,
+            whisper_vram_md, whisper_download_model_btn, whisper_remove_model_btn, whisper_remove_binary_btn,
+        ]
+        whisper_refresh_btn.click(
+            fn=do_refresh_whisper_setup,
+            inputs=[whisper_model_dropdown],
+            outputs=_whisper_status_outputs,
+            api_visibility="private",
+        )
+        whisper_install_btn.click(
+            fn=do_install_whisper,
+            inputs=[whisper_model_dropdown],
+            outputs=_whisper_status_outputs,
+            api_visibility="private",
+        )
+        whisper_download_model_btn.click(
+            fn=do_download_whisper_model,
+            inputs=[whisper_model_dropdown],
+            outputs=_whisper_status_outputs,
+            api_visibility="private",
+        )
+        whisper_remove_model_btn.click(
+            fn=do_remove_whisper_model,
+            inputs=[whisper_model_dropdown],
+            outputs=_whisper_status_outputs,
+            api_visibility="private",
+        )
+        whisper_remove_binary_btn.click(
+            fn=do_remove_whisper_binary,
+            inputs=[whisper_model_dropdown],
+            outputs=_whisper_status_outputs,
+            api_visibility="private",
+        )
+        whisper_model_dropdown.blur(
+            fn=do_persist_whisper_model,
+            inputs=[whisper_model_dropdown], outputs=[], api_visibility="private",
+        )
+        whisper_language_dropdown.blur(
+            fn=do_persist_whisper_language,
+            inputs=[whisper_language_dropdown], outputs=[], api_visibility="private",
+        )
+        generate_transcript_btn.click(
+            fn=do_generate_transcript_locally,
+            inputs=[source_video_input, whisper_model_dropdown, whisper_language_dropdown],
+            outputs=[transcript_status_md, generate_transcript_btn, youtube_input, transcript_progress_html],
+            api_visibility="private",
+        )
+
         check_update_btn.click(
             fn=do_check_for_app_update,
             inputs=[],
@@ -2701,6 +2974,11 @@ def build_app() -> gr.Blocks:
             fn=do_refresh_ollama_setup,
             inputs=[llm_model_input, llm_api_base_input],
             outputs=_ollama_status_outputs,
+        )
+        demo.load(
+            fn=do_refresh_whisper_setup,
+            inputs=[whisper_model_dropdown],
+            outputs=_whisper_status_outputs,
         )
         demo.load(fn=None, inputs=None, outputs=None, js=_HIDE_SCREEN_STUDIO_JS)
         demo.load(fn=None, inputs=None, outputs=None, js=_ANALYZE_BTN_SPIN_JS)

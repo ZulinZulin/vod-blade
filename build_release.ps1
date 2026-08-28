@@ -186,6 +186,32 @@ foreach ($rel in $VendorFiles) {
     Copy-Item $src $dst -Force
 }
 
+# whisper-cli.exe + its DLLs (ggml*.dll, whisper.dll, possibly SDL2.dll depending on
+# build variant) - bundled like ffmpeg (a small binary), NOT the ggml-*.bin model,
+# which follows the Ollama precedent instead (fully opt-in, downloaded from inside
+# the app - see core/whisper_setup.py). Asset name below matches
+# core.whisper_setup._WHISPER_RELEASE_ZIP_URL - keep both in sync, and
+# RE-VERIFY against the current release before relying on this: whisper.cpp's
+# Windows asset naming has changed before (CPU vs CUDA/Vulkan build variants),
+# same caveat the ffmpeg step above already carries for BtbN's layout.
+$WhisperZipPath = Join-Path $CacheDir "whisper-bin-x64.zip"
+if (-not (Test-Path $WhisperZipPath)) {
+    Write-Host "[build] Downloading whisper.cpp ..."
+    Invoke-WebRequest -Uri "https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip" -OutFile $WhisperZipPath
+} else {
+    Write-Host "[build] Using cached whisper.cpp zip."
+}
+$WhisperExtractDir = Join-Path $CacheDir "whisper-extracted"
+if (-not (Test-Path $WhisperExtractDir)) {
+    Expand-Archive -Path $WhisperZipPath -DestinationPath $WhisperExtractDir -Force
+}
+$WhisperCliBin = Get-ChildItem -Path $WhisperExtractDir -Recurse -Filter "whisper-cli.exe" | Select-Object -First 1
+if (-not $WhisperCliBin) { throw "Could not find whisper-cli.exe inside the downloaded archive - whisper.cpp's layout may have changed." }
+Copy-Item $WhisperCliBin.FullName (Join-Path $BinDir "whisper-cli.exe")
+Get-ChildItem -Path $WhisperCliBin.DirectoryName -Filter "*.dll" | ForEach-Object {
+    Copy-Item $_.FullName (Join-Path $BinDir $_.Name)
+}
+
 # --- 7. Write VERSION (overwrite with the resolved -Version, in case it
 # --- differs from the source file's) ---
 Set-Content -Path (Join-Path $StageDir "VERSION") -Value $Version -NoNewline

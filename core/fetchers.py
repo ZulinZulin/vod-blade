@@ -203,6 +203,22 @@ def _dedupe_segments(segments: List[SubtitleSegment]) -> List[SubtitleSegment]:
 # --------------------------------------------------------------------------- #
 
 
+_LOCAL_SUBTITLE_SUFFIXES = {".srt", ".vtt", ".txt"}
+
+
+def is_local_subtitle_source(source: str) -> bool:
+    """
+    True if `source` is a local subtitle/transcript file rather than a YouTube URL -
+    i.e. anything YouTubeSubtitleFetcher.fetch() routes to _parse_local_file() instead
+    of _fetch_from_youtube(). Single source of truth so a caller deciding whether to
+    apply shift_subtitles_to_vod_clock (a YouTube-clock -> VOD-clock conversion) never
+    disagrees with what was actually fetched - a local file (hand-supplied or generated
+    by local Whisper transcription) was never on YouTube's clock to begin with, so it
+    should never go through that conversion regardless of chat_offset's value.
+    """
+    return Path(source).suffix.lower() in _LOCAL_SUBTITLE_SUFFIXES
+
+
 class YouTubeSubtitleFetcher:
     """
     Fetches subtitle segments either from a YouTube URL (via yt-dlp) or from
@@ -215,8 +231,8 @@ class YouTubeSubtitleFetcher:
 
     def fetch(self, source: str) -> List[SubtitleSegment]:
         """`source` is either a YouTube URL or a path to a local subtitle file."""
-        path = Path(source)
-        if path.suffix.lower() in {".srt", ".vtt", ".txt"}:
+        if is_local_subtitle_source(source):
+            path = Path(source)
             if not path.exists():
                 raise SubtitleFetchError(f"Local subtitle file not found: {source}")
             return self._parse_local_file(path)
@@ -628,6 +644,11 @@ def shift_subtitles_to_vod_clock(subtitles: List[SubtitleSegment], chat_offset_s
     A subtitle that lands before this VOD's own start (or after its end) isn't
     dropped here - it simply won't overlap any candidate window and will never get
     selected by select_subtitle_window downstream.
+
+    Only ever call this on subtitles that actually came from YouTube - check
+    is_local_subtitle_source(source) first. A local file (hand-supplied, or written
+    by local Whisper transcription) is already on the VOD's own clock; running it
+    through here too would double-shift it.
     """
     if not chat_offset_seconds:
         return subtitles

@@ -321,6 +321,59 @@ class SoundEventConfig:
 
 
 # --------------------------------------------------------------------------- #
+# Local transcription (core/whisper_setup.py, core/transcriber.py)
+# --------------------------------------------------------------------------- #
+
+
+def _default_whisper_binary_name() -> str:
+    return "whisper-cli.exe" if platform.system() == "Windows" else "whisper-cli"
+
+
+@dataclass(frozen=True)
+class WhisperConfig:
+    """
+    Local whisper.cpp transcription - fully opt-in, matching core.ollama_setup's
+    "live-detected, never a stored flag" philosophy. binary_path follows
+    BinaryConfig's bundled-or-override convention (like TwitchDownloaderCLI);
+    the model is NOT auto-bundled or checked here, same split SoundEventConfig
+    uses for yamnet.onnx vs. its own thresholds - model presence is a live,
+    user-chosen-tier concern handled by core.whisper_setup.detect_state(), not
+    something that should block app startup.
+
+    default_model_name defaults to a MULTILINGUAL tier ("small"), deliberately
+    never a ".en" variant - this project's own real content is Russian-language
+    (see FetcherConfig.subtitle_langs' own "ru,ru-orig,en,en-orig" default); an
+    English-only model would silently mistranscribe it, not just underperform.
+    """
+
+    binary_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv("WHISPER_CLI_PATH", str(BIN_DIR / _default_whisper_binary_name()))
+        )
+    )
+    default_model_name: str = os.getenv("WHISPER_MODEL", "small")
+    default_language: str = os.getenv("WHISPER_LANGUAGE", "auto")
+    threads: int = int(os.getenv("WHISPER_THREADS", str(os.cpu_count() or 4)))
+    # CPU-only transcription of a multi-hour VOD on a mid-size model can genuinely
+    # take a long time without a GPU whisper.cpp build - mirrors
+    # twitch_video_download_timeout_s's same "long but not unbounded" reasoning.
+    transcription_timeout_s: int = int(os.getenv("WHISPER_TIMEOUT_S", "7200"))
+    extraction_timeout_s: int = 1800
+    cache_enabled: bool = True
+
+    def validate(self) -> List[str]:
+        """Binary-only, matching BinaryConfig's scope - see the class docstring for
+        why model presence isn't checked here."""
+        problems = []
+        if not self.binary_path.exists():
+            problems.append(
+                f"whisper.cpp CLI not found at '{self.binary_path}'. Set WHISPER_CLI_PATH or "
+                "install it from the Local transcription settings panel."
+            )
+        return problems
+
+
+# --------------------------------------------------------------------------- #
 # LLM agent (core/llm_agent.py)
 # --------------------------------------------------------------------------- #
 
@@ -462,6 +515,7 @@ class Settings:
     hype: HypeScoreConfig = field(default_factory=HypeScoreConfig)
     audio: AudioScoreConfig = field(default_factory=AudioScoreConfig)
     sound_event: SoundEventConfig = field(default_factory=SoundEventConfig)
+    whisper: WhisperConfig = field(default_factory=WhisperConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
 

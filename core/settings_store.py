@@ -79,6 +79,24 @@ def set_resolve_script_lib_override(path: str) -> None:
     save_settings({"resolve_script_lib": path})
 
 
+def get_whisper_model_override() -> str:
+    """The last user-chosen local-transcription model tier, or "" if never set."""
+    return load_settings().get("whisper_model", "")
+
+
+def set_whisper_model_override(model_name: str) -> None:
+    save_settings({"whisper_model": model_name})
+
+
+def get_whisper_language_override() -> str:
+    """The last user-chosen local-transcription language (or "auto"), or "" if never set."""
+    return load_settings().get("whisper_language", "")
+
+
+def set_whisper_language_override(language: str) -> None:
+    save_settings({"whisper_language": language})
+
+
 def is_onboarding_completed() -> bool:
     """Whether the first-run setup panel has been finished or skipped -
     default False so a fresh install shows it on the very first page load."""
