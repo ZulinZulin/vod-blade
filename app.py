@@ -1318,7 +1318,10 @@ def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
     A generator so the UI shows an immediate "in progress" state without
     needing real progress-percentage tracking: Gradio renders each yielded
     tuple as it's produced, so the first yield shows up right away and the
-    second lands whenever the (blocking) download actually finishes.
+    second lands whenever the (blocking) download actually finishes. The
+    spinner is a CSS animation, so it keeps spinning in the browser for
+    however long that blocking call takes, with no polling/threading needed
+    on our end - it just runs until the second yield replaces it.
     """
     if not twitch_source:
         raise gr.Error("Please provide a Twitch VOD URL or ID first.")
@@ -1329,6 +1332,7 @@ def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
         "This message will update when the download finishes.",
         gr.update(interactive=False),
         gr.update(),
+        gr.update(value='<span class="vb-spinner"></span>', visible=True),
     )
 
     try:
@@ -1337,13 +1341,14 @@ def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
             downloads_dir=Path(downloads_dir) if downloads_dir and downloads_dir.strip() else None,
         )
     except FetcherError as exc:
-        yield f"VOD download failed: {exc}", gr.update(interactive=True), gr.update()
+        yield f"VOD download failed: {exc}", gr.update(interactive=True), gr.update(), gr.update(visible=False)
         return
 
     yield (
         f"VOD downloaded: `{video_path}`. Source video path below has been filled in automatically.",
         gr.update(interactive=True),
         gr.update(value=str(video_path)),
+        gr.update(visible=False),
     )
 
 
@@ -1398,12 +1403,14 @@ def _browse_folder_tkinter(initial_dir: str) -> Optional[str]:
         root.destroy()
 
 
-def do_browse_downloads_dir(current_dir: str):
+def do_browse_downloads_dir(current_dir: str) -> Optional[str]:
     """
     Opens a native OS folder picker - browsers have no API that hands a web page a
     real filesystem path, only file *contents*, so this has to run in the Python
     backend, which for a local app like this one shares the same machine/filesystem
-    as the person clicking the button.
+    as the person clicking the button. Returns the chosen path, or None if the
+    dialog was cancelled - callers build their own gr.update() from this rather
+    than getting one back directly (see do_browse_downloads_dir_synced below).
     """
     initial_dir = current_dir if current_dir and Path(current_dir).is_dir() else str(DOWNLOADS_DIR)
     try:
@@ -1413,9 +1420,7 @@ def do_browse_downloads_dir(current_dir: str):
         logger.warning("Folder picker unavailable (%s); type the path in manually instead.", exc)
         raise gr.Error(f"Couldn't open the folder picker ({exc}). Type the path in manually instead.")
 
-    if not chosen:
-        return gr.update()  # user cancelled the dialog
-    return gr.update(value=chosen)
+    return chosen or None
 
 
 def do_open_downloads_folder(downloads_dir: str):
@@ -1749,19 +1754,25 @@ def do_onboarding_reopen():
     )
 
 
-def do_onboarding_browse_downloads_dir(current_dir: str):
+def do_browse_downloads_dir_synced(current_dir: str):
     """Thin wrapper around the real do_browse_downloads_dir so the wizard's copy of
     the downloads-folder field and the main one under 'Download VOD' stay in sync,
-    without duplicating the actual OS folder-picker logic."""
-    result = do_browse_downloads_dir(current_dir)
-    return result, result
+    without duplicating the actual OS folder-picker logic - used by both fields'
+    own Browse button, so whichever one is clicked updates both. Builds two separate
+    gr.update() calls rather than reusing one object for both outputs - Gradio only
+    actually applies the first of two outputs given the identical update object twice,
+    silently dropping the second."""
+    chosen = do_browse_downloads_dir(current_dir)
+    if not chosen:
+        return gr.update(), gr.update()  # user cancelled the dialog
+    return gr.update(value=chosen), gr.update(value=chosen)
 
 
-def _sync_checkbox_if_different(new_value: bool, other_current: bool):
-    """Mirrors a checkbox toggle onto its paired copy (wizard <-> main page), both
-    directions using this same guarded function - only emits an update when the
-    values actually differ, so wiring both directions can't turn into an infinite
-    ping-pong between the two checkboxes."""
+def _sync_paired_field_if_different(new_value, other_current):
+    """Mirrors a field onto its paired copy (wizard <-> main page - checkboxes and,
+    below, the downloads-folder textbox), both directions using this same guarded
+    function - only emits an update when the values actually differ, so wiring both
+    directions can't turn into an infinite ping-pong between the two fields."""
     return gr.update() if new_value == other_current else gr.update(value=new_value)
 
 
@@ -1837,7 +1848,7 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="VOD BLADE") as demo:
         gr.HTML(_logo_header_html())
 
-        with gr.Group(visible=False) as onboarding_panel:
+        with gr.Group(visible=False, elem_classes=["vb-onboarding-glow"]) as onboarding_panel:
             gr.Markdown("## 🩷 LOOK HERE FIRST 🩷", elem_classes=["vb-onboarding-header"])
             onboarding_step_state = gr.State(0)
 
@@ -1906,7 +1917,7 @@ def build_app() -> gr.Blocks:
                 )
 
             with gr.Row():
-                onboarding_skip_btn = gr.Button("Skip setup", size="sm")
+                onboarding_skip_btn = gr.Button("Skip setup", size="sm", elem_classes=["vb-skip-muted"])
                 onboarding_back_btn = gr.Button("Back", size="sm", visible=False)
                 onboarding_next_btn = gr.Button("Next", size="sm", variant="primary")
 
@@ -1965,7 +1976,9 @@ def build_app() -> gr.Blocks:
                         with gr.Row():
                             browse_downloads_dir_btn = gr.Button("Browse...", size="sm")
                             open_downloads_folder_btn = gr.Button("Open Download Folder", size="sm")
-            download_status = gr.Markdown("")
+            with gr.Row():
+                download_progress_html = gr.HTML("", visible=False)
+                download_status = gr.Markdown("")
 
             clips_state = gr.State([])
             page_state = gr.State(0)
@@ -2323,13 +2336,13 @@ def build_app() -> gr.Blocks:
         download_vod_btn.click(
             fn=do_download_vod,
             inputs=[twitch_input, vod_quality_input, downloads_dir_input],
-            outputs=[download_status, download_vod_btn, source_video_input],
+            outputs=[download_status, download_vod_btn, source_video_input, download_progress_html],
             api_visibility="private",
         )
         browse_downloads_dir_btn.click(
-            fn=do_browse_downloads_dir,
+            fn=do_browse_downloads_dir_synced,
             inputs=[downloads_dir_input],
-            outputs=[downloads_dir_input],
+            outputs=[downloads_dir_input, onboarding_downloads_dir_input],
             api_visibility="private",
         )
         open_downloads_folder_btn.click(
@@ -2342,6 +2355,16 @@ def build_app() -> gr.Blocks:
             fn=do_persist_downloads_dir,
             inputs=[downloads_dir_input],
             outputs=[],
+            api_visibility="private",
+        )
+        downloads_dir_input.blur(
+            fn=_sync_paired_field_if_different,
+            inputs=[downloads_dir_input, onboarding_downloads_dir_input], outputs=[onboarding_downloads_dir_input],
+            api_visibility="private",
+        )
+        onboarding_downloads_dir_input.blur(
+            fn=_sync_paired_field_if_different,
+            inputs=[onboarding_downloads_dir_input, downloads_dir_input], outputs=[downloads_dir_input],
             api_visibility="private",
         )
 
@@ -2459,7 +2482,7 @@ def build_app() -> gr.Blocks:
             api_visibility="private",
         )
         onboarding_browse_btn.click(
-            fn=do_onboarding_browse_downloads_dir,
+            fn=do_browse_downloads_dir_synced,
             inputs=[onboarding_downloads_dir_input],
             outputs=[onboarding_downloads_dir_input, downloads_dir_input],
             api_visibility="private",
@@ -2471,32 +2494,32 @@ def build_app() -> gr.Blocks:
             api_visibility="private",
         )
         onboarding_audio_checkbox.change(
-            fn=_sync_checkbox_if_different,
+            fn=_sync_paired_field_if_different,
             inputs=[onboarding_audio_checkbox, audio_enable_checkbox], outputs=[audio_enable_checkbox],
             api_visibility="private",
         )
         audio_enable_checkbox.change(
-            fn=_sync_checkbox_if_different,
+            fn=_sync_paired_field_if_different,
             inputs=[audio_enable_checkbox, onboarding_audio_checkbox], outputs=[onboarding_audio_checkbox],
             api_visibility="private",
         )
         onboarding_sound_event_checkbox.change(
-            fn=_sync_checkbox_if_different,
+            fn=_sync_paired_field_if_different,
             inputs=[onboarding_sound_event_checkbox, sound_event_enable_checkbox], outputs=[sound_event_enable_checkbox],
             api_visibility="private",
         )
         sound_event_enable_checkbox.change(
-            fn=_sync_checkbox_if_different,
+            fn=_sync_paired_field_if_different,
             inputs=[sound_event_enable_checkbox, onboarding_sound_event_checkbox], outputs=[onboarding_sound_event_checkbox],
             api_visibility="private",
         )
         onboarding_llm_checkbox.change(
-            fn=_sync_checkbox_if_different,
+            fn=_sync_paired_field_if_different,
             inputs=[onboarding_llm_checkbox, llm_judging_enabled_checkbox], outputs=[llm_judging_enabled_checkbox],
             api_visibility="private",
         )
         llm_judging_enabled_checkbox.change(
-            fn=_sync_checkbox_if_different,
+            fn=_sync_paired_field_if_different,
             inputs=[llm_judging_enabled_checkbox, onboarding_llm_checkbox], outputs=[onboarding_llm_checkbox],
             api_visibility="private",
         )

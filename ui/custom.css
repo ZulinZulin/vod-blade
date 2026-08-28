@@ -489,6 +489,57 @@ gradio-app {
     margin: 0;
 }
 
+/* Skip setup deliberately looks the least appealing of the three onboarding nav
+   buttons - it shouldn't visually compete with Next/Back for someone's first click,
+   the way Gradio's default secondary-button styling otherwise makes it do. */
+.vb-skip-muted {
+    background: none !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+    color: var(--body-text-color-subdued) !important;
+}
+.vb-skip-muted:hover {
+    background: none !important;
+    color: var(--body-text-color) !important;
+}
+
+/* Glows the whole setup panel's own border for as long as it's open (unlike
+   .vb-glow-blue below, which points at one specific control for one specific step) -
+   people reliably miss that this panel exists at all otherwise. Padding here too,
+   since the glow makes the border itself more prominent, and Gradio's default Group
+   padding otherwise leaves the content sitting right against it. */
+.vb-onboarding-glow {
+    animation: vb-glow-pink-pulse 2.2s ease-in-out infinite;
+    border-radius: var(--radius-lg, 8px);
+    padding: 20px !important;
+}
+@keyframes vb-glow-pink-pulse {
+    0%, 100% {
+        box-shadow: 0 0 0 2px var(--border-color-accent), 0 0 14px 3px color-mix(in srgb, var(--border-color-accent) 55%, transparent);
+    }
+    50% {
+        box-shadow: 0 0 0 3px var(--border-color-accent), 0 0 26px 8px color-mix(in srgb, var(--border-color-accent) 70%, transparent);
+    }
+}
+
+/* "Still working" spinner for VOD downloads - TwitchDownloaderCLI's own output isn't
+   currently parsed for a real percentage, and a download can run for many minutes
+   with the status text otherwise sitting completely static the whole time, which
+   reads as "did this hang?" rather than "this is still going". */
+.vb-spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 3px solid color-mix(in srgb, var(--border-color-accent) 25%, transparent);
+    border-top-color: var(--border-color-accent);
+    border-radius: 50%;
+    animation: vb-spin 0.8s linear infinite;
+    vertical-align: middle;
+}
+@keyframes vb-spin {
+    to { transform: rotate(360deg); }
+}
+
 /* Points at whichever real control the current onboarding page is talking about -
    #00c7e6 matches one of the stops already used in the rainbow-spin gradient above,
    rather than introducing an unrelated blue. */
