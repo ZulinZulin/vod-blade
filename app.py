@@ -2042,7 +2042,12 @@ def build_app() -> gr.Blocks:
                     "_Only needed if 'Inject into DaVinci Resolve' can't find Resolve on its own - "
                     "usually because it's installed somewhere other than the default location. "
                     "Leave both blank to use the default. Restarting the app isn't needed after "
-                    "changing these._"
+                    "changing these._\n\n"
+                    "_**Resolve 21 or later is recommended.** Older versions ship a scripting module "
+                    "that can fail to load under this app's bundled Python - confirmed broken on "
+                    "20.2.3, working on 21.0 (the exact cutoff in between is unconfirmed). No path "
+                    "here fixes that; use the FCPXML/EDL download instead if you're on an older "
+                    "version._"
                 )
                 resolve_script_lib_input = gr.Textbox(
                     label="DaVinci Resolve library path override (fusionscript.dll / fusionscript.so)",

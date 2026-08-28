@@ -38,6 +38,10 @@ worth clipping and pick precise in/out points.
   pull the model for you from the Settings panel; needs an NVIDIA GPU with roughly 9GB+
   VRAM for the default model. Without it, chat/audio/sound-event analysis alone still
   works.
+- **DaVinci Resolve 21 or later** (optional) - only needed for "Inject into DaVinci
+  Resolve". Older Resolve versions ship a scripting module that can fail to load under
+  this app's bundled Python. The FCPXML/EDL download works with any Resolve version and
+  any other NLE that can import one.
 
 ## Getting started
 
