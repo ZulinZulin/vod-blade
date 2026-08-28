@@ -20,6 +20,7 @@ Layout:
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import platform
 import re
@@ -37,7 +38,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 
-from config import DOWNLOADS_DIR, SESSIONS_DIR, settings
+from config import DOWNLOADS_DIR, LOGS_DIR, SESSIONS_DIR, settings
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
@@ -59,7 +60,19 @@ from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
 from exporters.xml_exporter import ExportError, export_edl_file, export_fcpxml_file
 
-logging.basicConfig(level=settings.log_level)
+_LOG_FILE = LOGS_DIR / "vodblade.log"
+# Console-only logging turned out to be unreliable for actually getting diagnostics
+# from real users in the wild - a genuine bug report showed nothing in the .bat
+# console beyond the two static startup lines, even though logger.info() calls fire
+# unconditionally on that code path. A rotating file survives regardless of whether
+# anyone thought to keep the console window open or scroll back through it.
+_file_handler = logging.handlers.RotatingFileHandler(
+    _LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+)
+logging.basicConfig(
+    level=settings.log_level,
+    handlers=[logging.StreamHandler(), _file_handler],
+)
 logger = logging.getLogger(__name__)
 
 
@@ -1300,7 +1313,15 @@ def do_browse_downloads_dir(current_dir: str):
     try:
         import tkinter
         from tkinter import filedialog
+    except ModuleNotFoundError:
+        # Python's embeddable distribution (what the packaged release bundles)
+        # deliberately ships without tkinter - not a bug to fix, just a real gap in
+        # that build. A raw "No module named 'tkinter'" would look like a crash to
+        # someone who doesn't know what tkinter is, so this case gets its own
+        # message rather than falling through to the generic one below.
+        raise gr.Error("Folder picker isn't available in this build. Type the path in the box above instead.")
 
+    try:
         root = tkinter.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
@@ -1340,6 +1361,23 @@ def do_open_downloads_folder(downloads_dir: str):
             subprocess.run(["xdg-open", str(path)], check=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise gr.Error(f"Could not open '{path}' in the file browser: {exc}")
+
+
+def do_open_logs_folder():
+    """Opens the log folder - the practical way to actually get diagnostics out of a
+    real user in the wild, since asking someone to read a console window has already
+    proven unreliable (a genuine bug report showed nothing there beyond the two
+    static startup lines, even for a code path that always logs on every run)."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            os.startfile(LOGS_DIR)  # noqa: S606 - opening the app's own log folder
+        elif system == "Darwin":
+            subprocess.run(["open", str(LOGS_DIR)], check=True)
+        else:
+            subprocess.run(["xdg-open", str(LOGS_DIR)], check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise gr.Error(f"Could not open '{LOGS_DIR}' in the file browser: {exc}")
 
 
 def do_persist_downloads_dir(downloads_dir: str) -> None:
@@ -1643,7 +1681,12 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     gr.Markdown(f"VOD BLADE v{get_version()}")
                     check_update_btn = gr.Button("Check for updates", size="sm")
+                    open_logs_folder_btn = gr.Button("Open log folder", size="sm")
                 update_check_md = gr.Markdown(visible=False)
+                gr.Markdown(
+                    "_If something goes wrong, the log folder has more detail than what's "
+                    "shown here - useful to include when reporting an issue._"
+                )
 
             with gr.Accordion("Chat spikes detection settings", open=False):
                 with gr.Row():
@@ -1937,6 +1980,12 @@ def build_app() -> gr.Blocks:
             fn=do_check_for_app_update,
             inputs=[],
             outputs=[update_check_md],
+            api_visibility="private",
+        )
+        open_logs_folder_btn.click(
+            fn=do_open_logs_folder,
+            inputs=[],
+            outputs=[],
             api_visibility="private",
         )
 

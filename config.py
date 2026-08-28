@@ -36,12 +36,13 @@ SOUND_EVENT_CACHE_DIR: Final[Path] = CACHE_DIR / "sound_events"
 DOWNLOADS_DIR: Final[Path] = Path(os.getenv("VOD_BLADE_DOWNLOADS_DIR", str(DATA_DIR / "downloads")))
 EXPORTS_DIR: Final[Path] = DATA_DIR / "exports"
 SESSIONS_DIR: Final[Path] = DATA_DIR / "sessions"
+LOGS_DIR: Final[Path] = DATA_DIR / "logs"
 BIN_DIR: Final[Path] = BASE_DIR / "bin"
 MODELS_DIR: Final[Path] = BIN_DIR / "models"
 
 for _dir in (
     DATA_DIR, CACHE_DIR, THUMBNAILS_DIR, AUDIO_RMS_CACHE_DIR, SOUND_EVENT_CACHE_DIR,
-    DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, BIN_DIR, MODELS_DIR,
+    DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, LOGS_DIR, BIN_DIR, MODELS_DIR,
 ):
     _dir.mkdir(parents=True, exist_ok=True)
 

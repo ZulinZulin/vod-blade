@@ -107,6 +107,26 @@ def _cache_key(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
+def _describe_cli_failure(result: "subprocess.CompletedProcess[str]", max_lines: int = 5) -> str:
+    """
+    TwitchDownloaderCLI logs its own [STATUS]/[WARNING]/[ERROR] progress and failure
+    reasons to stdout (progress updates are '\\r'-separated, not '\\n') and reserves
+    stderr for unhandled .NET exceptions - a graceful failure (e.g. "not enough disk
+    space") only shows up in stdout. Relying on stderr alone (as this used to) shows
+    an empty, useless error whenever the CLI fails gracefully instead of crashing.
+
+    An unhandled .NET exception dumps its full stack trace to stderr, but the
+    human-readable reason is always its first line - everything after is stack
+    frames a user can't act on, so only that first line is kept.
+    """
+    stdout_lines = [line.strip() for line in result.stdout.replace("\r", "\n").splitlines() if line.strip()]
+    stderr_first_line = result.stderr.strip().splitlines()[0].strip() if result.stderr.strip() else ""
+    tail = "\n".join(stdout_lines[-max_lines:])
+    if stderr_first_line:
+        return f"{tail}\n{stderr_first_line}" if tail else stderr_first_line
+    return tail or "(no output captured)"
+
+
 def extract_twitch_vod_id(vod_url_or_id: str) -> str:
     """Accepts a full Twitch VOD URL or a bare numeric VOD id, returns the id."""
     candidate = vod_url_or_id.strip()
@@ -428,9 +448,17 @@ class TwitchChatFetcher:
             raise ChatFetchError(f"TwitchDownloaderCLI timed out for VOD {vod_id}") from exc
 
         if result.returncode != 0 or not out_path.exists():
+            # Full, untruncated output goes to the log even though the raised message
+            # is trimmed - the first real-world failure of this kind turned out to
+            # have neither low disk space nor anything else we'd already guessed at,
+            # so whatever it actually was needs to be in the log to diagnose next time.
+            logger.error(
+                "TwitchDownloaderCLI chat download failed for VOD %s (exit %s)\nstdout:\n%s\nstderr:\n%s",
+                vod_id, result.returncode, result.stdout, result.stderr,
+            )
             raise ChatFetchError(
                 f"TwitchDownloaderCLI failed for VOD {vod_id} "
-                f"(exit {result.returncode}): {result.stderr.strip()}"
+                f"(exit {result.returncode}): {_describe_cli_failure(result)}"
             )
         return out_path
 
@@ -569,9 +597,13 @@ class TwitchVideoFetcher:
             ) from exc
 
         if result.returncode != 0 or not out_path.exists():
+            logger.error(
+                "TwitchDownloaderCLI video download failed for VOD %s (exit %s)\nstdout:\n%s\nstderr:\n%s",
+                vod_id, result.returncode, result.stdout, result.stderr,
+            )
             raise VideoFetchError(
                 f"TwitchDownloaderCLI failed to download VOD {vod_id} "
-                f"(exit {result.returncode}): {result.stderr.strip()}"
+                f"(exit {result.returncode}): {_describe_cli_failure(result)}"
             )
         logger.info("Downloaded VOD %s -> %s", vod_id, out_path)
         return out_path

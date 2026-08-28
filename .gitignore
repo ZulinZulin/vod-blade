@@ -6,6 +6,7 @@ data/cache/
 data/downloads/
 data/exports/
 data/sessions/
+data/logs/
 bin/
 dist/
 vendor/
