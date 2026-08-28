@@ -757,8 +757,13 @@ def do_save_session(
     clips: List[CandidateClip], source_video_path: str, youtube_source: str,
     twitch_source: str, chat_offset: float, session_path: Optional[str],
 ):
-    if not clips:
-        raise gr.Error("No clips to save yet - run an analysis first.")
+    """
+    Deliberately doesn't require clips - saving before an analysis has even run is
+    exactly the point for someone who just wants to keep their entered URLs/offset
+    without losing them, e.g. to pick a stream back up later. An empty-clips session
+    loads back in fine (core/session_store.py's schema has never required a non-empty
+    clips list), so there's nothing downstream that actually needs this guard.
+    """
     try:
         out_path = save_session(
             clips, source_video_path, youtube_source, twitch_source, chat_offset,
@@ -1736,6 +1741,70 @@ def _sync_checkbox_if_different(new_value: bool, other_current: bool):
     return gr.update() if new_value == other_current else gr.update(value=new_value)
 
 
+# --------------------------------------------------------------------------- #
+# Persisted analysis settings (survive a restart; separate from sessions,
+# which stay scoped to clips + the source URLs needed to reload them - see
+# do_save_session above)
+# --------------------------------------------------------------------------- #
+
+# One ordered list drives both the defaults lookup and each handler's outputs list,
+# so the two can't silently drift out of sync with each other as fields get added.
+_ANALYSIS_SETTINGS_KEYS = [
+    "z_threshold", "min_gap", "pre_spike", "post_spike", "max_merged_duration",
+    "audio_z_threshold", "audio_allow_new",
+    "sound_event_classes", "sound_event_confidence", "sound_event_allow_new",
+    "min_viral_score", "system_prompt",
+    "audio_enable", "sound_event_enable", "llm_judging_enabled", "autosave_enabled",
+]
+
+
+def _analysis_settings_defaults() -> dict:
+    """The original hardcoded defaults (from config.py's dataclasses, same as this
+    file used inline before persistence existed) - also what "reset to default"
+    resets back to. A function, not a module-level constant, so it always reflects
+    the current `settings` object rather than whatever it was at import time."""
+    return {
+        "z_threshold": settings.hype.z_score_threshold,
+        "min_gap": settings.hype.min_seconds_between_spikes,
+        "pre_spike": settings.hype.pre_spike_seconds,
+        "post_spike": settings.hype.post_spike_seconds,
+        "max_merged_duration": settings.hype.max_merged_duration_seconds,
+        "audio_z_threshold": settings.audio.z_score_threshold,
+        "audio_allow_new": settings.audio.allow_new_candidates,
+        "sound_event_classes": settings.sound_event.target_classes,
+        "sound_event_confidence": settings.sound_event.confidence_threshold,
+        "sound_event_allow_new": settings.sound_event.allow_new_candidates,
+        "min_viral_score": settings.llm.min_viral_score,
+        "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "audio_enable": False,
+        "sound_event_enable": False,
+        "llm_judging_enabled": True,
+        "autosave_enabled": True,
+    }
+
+
+def _persisted_setting(key: str):
+    """The last-saved value for one analysis setting, or its hardcoded default if
+    never changed - used as each component's initial `value=` at Blocks-build time."""
+    return settings_store.load_settings().get(key, _analysis_settings_defaults()[key])
+
+
+def _persist_setting(key: str):
+    """Returns a handler that saves one setting under its own key - reused across
+    every analysis-setting component's change/blur event below."""
+    def handler(value):
+        settings_store.save_settings({key: value})
+    return handler
+
+
+def do_reset_analysis_settings():
+    defaults = _analysis_settings_defaults()
+    for key in _ANALYSIS_SETTINGS_KEYS:
+        settings_store.save_settings({key: defaults[key]})
+    gr.Info("All analysis settings reset to default.")
+    return tuple(gr.update(value=defaults[key]) for key in _ANALYSIS_SETTINGS_KEYS)
+
+
 def do_check_onboarding_visibility():
     return gr.update(visible=not settings_store.is_onboarding_completed())
 
@@ -1779,17 +1848,17 @@ def build_app() -> gr.Blocks:
                     "Sources panel."
                 )
                 onboarding_audio_checkbox = gr.Checkbox(
-                    label="Enable audio peak analysis", value=False,
+                    label="Enable audio peak analysis", value=_persisted_setting("audio_enable"),
                     info="Flags loud moments in the VOD's own audio, independent of chat. "
                          "Needs the VOD's video file.",
                 )
                 onboarding_sound_event_checkbox = gr.Checkbox(
-                    label="Enable sound event detection", value=False,
+                    label="Enable sound event detection", value=_persisted_setting("sound_event_enable"),
                     info="Detects specific sounds (laughter, screams, etc.) with a local audio "
                          "classifier. Also needs the video file.",
                 )
                 onboarding_llm_checkbox = gr.Checkbox(
-                    label="Enable AI Arbitration", value=True,
+                    label="Enable AI Arbitration", value=_persisted_setting("llm_judging_enabled"),
                     info="Uses a local AI model to filter false positives, tighten clip "
                          "boundaries, and write titles - set up on the next page. Heavy on the "
                          "GPU. Optional. Nice to have.",
@@ -1841,15 +1910,15 @@ def build_app() -> gr.Blocks:
                 with gr.Column():
                     with gr.Group() as analysis_features_group:
                         audio_enable_checkbox = gr.Checkbox(
-                            label="Enable audio peak analysis", value=False,
+                            label="Enable audio peak analysis", value=_persisted_setting("audio_enable"),
                             elem_classes=["vb-toggle"],
                         )
                         sound_event_enable_checkbox = gr.Checkbox(
-                            label="Enable sound event detection", value=False,
+                            label="Enable sound event detection", value=_persisted_setting("sound_event_enable"),
                             elem_classes=["vb-toggle"],
                         )
                         llm_judging_enabled_checkbox = gr.Checkbox(
-                            label="Enable AI Arbitration", value=True,
+                            label="Enable AI Arbitration", value=_persisted_setting("llm_judging_enabled"),
                             elem_classes=["vb-toggle"],
                         )
                     with gr.Group() as download_vod_group:
@@ -1887,10 +1956,10 @@ def build_app() -> gr.Blocks:
                 with gr.Column():
                     save_session_btn = gr.Button("Save session", size="sm")
                     autosave_enabled_checkbox = gr.Checkbox(
-                        label="Auto-save after each run", value=True,
+                        label="Auto-save after each run", value=_persisted_setting("autosave_enabled"),
                         elem_classes=["vb-toggle"],
                     )
-            with gr.Accordion("Delete / purge saves (advanced)", open=False):
+            with gr.Accordion("Delete / purge saves", open=False):
                 with gr.Row():
                     delete_session_btn = gr.Button(_DELETE_SESSION_LABEL, size="sm")
                     confirm_purge_checkbox = gr.Checkbox(
@@ -1949,28 +2018,28 @@ def build_app() -> gr.Blocks:
                     z_threshold_input = gr.Slider(
                         label="Z-score threshold (higher = fewer, stronger-only spikes)",
                         minimum=1.0, maximum=6.0, step=0.1,
-                        value=settings.hype.z_score_threshold,
+                        value=_persisted_setting("z_threshold"),
                     )
                     min_gap_input = gr.Slider(
                         label="Min seconds between spikes",
                         minimum=0, maximum=300, step=5,
-                        value=settings.hype.min_seconds_between_spikes,
+                        value=_persisted_setting("min_gap"),
                     )
                 with gr.Row():
                     pre_spike_input = gr.Slider(
                         label="Seconds before spike (window start)",
                         minimum=0, maximum=180, step=5,
-                        value=settings.hype.pre_spike_seconds,
+                        value=_persisted_setting("pre_spike"),
                     )
                     post_spike_input = gr.Slider(
                         label="Seconds after spike (window end)",
                         minimum=0, maximum=180, step=5,
-                        value=settings.hype.post_spike_seconds,
+                        value=_persisted_setting("post_spike"),
                     )
                 max_merged_duration_input = gr.Slider(
                     label="Max merged candidate duration (s) - caps how many nearby spikes can chain-merge into one window",
                     minimum=30, maximum=600, step=10,
-                    value=settings.hype.max_merged_duration_seconds,
+                    value=_persisted_setting("max_merged_duration"),
                 )
             with gr.Accordion("Audio analysis settings", open=False):
                 with gr.Row(elem_classes=["vb-two-col"]):
@@ -1984,11 +2053,11 @@ def build_app() -> gr.Blocks:
                         audio_z_threshold_input = gr.Slider(
                             label="Audio Z-score threshold (higher = fewer, louder-only peaks)",
                             minimum=1.0, maximum=6.0, step=0.1,
-                            value=settings.audio.z_score_threshold,
+                            value=_persisted_setting("audio_z_threshold"),
                         )
                         audio_allow_new_checkbox = gr.Checkbox(
                             label="Allow audio-only peaks (no matching chat spike) to become their own candidates",
-                            value=settings.audio.allow_new_candidates,
+                            value=_persisted_setting("audio_allow_new"),
                         )
                     with gr.Column():
                         _sound_event_problems = settings.sound_event.validate()
@@ -2005,23 +2074,23 @@ def build_app() -> gr.Blocks:
                         sound_event_classes_input = gr.CheckboxGroup(
                             label="Event types to detect",
                             choices=settings.sound_event.target_classes,
-                            value=settings.sound_event.target_classes,
+                            value=_persisted_setting("sound_event_classes"),
                         )
                         sound_event_confidence_input = gr.Slider(
                             label="Confidence threshold (higher = fewer, more certain events)",
                             minimum=0.05, maximum=0.95, step=0.05,
-                            value=settings.sound_event.confidence_threshold,
+                            value=_persisted_setting("sound_event_confidence"),
                         )
                         sound_event_allow_new_checkbox = gr.Checkbox(
                             label="Allow event-only peaks (no matching chat/audio spike) to become their own candidates",
-                            value=settings.sound_event.allow_new_candidates,
+                            value=_persisted_setting("sound_event_allow_new"),
                         )
             with gr.Accordion("AI Arbitration settings", open=False):
                 min_viral_score_input = gr.Slider(
                     label="Minimum viral score to keep (1-10) - clips the LLM itself scores below "
                           "this are rejected even if it called them worthy",
                     minimum=1, maximum=10, step=1,
-                    value=settings.llm.min_viral_score,
+                    value=_persisted_setting("min_viral_score"),
                 )
                 content_hint_input = gr.Textbox(
                     label="Stream context hint for the LLM (optional)",
@@ -2037,12 +2106,15 @@ def build_app() -> gr.Blocks:
                     "candidates fall back to their raw chat-spike window instead of crashing._"
                 )
                 system_prompt_input = gr.Textbox(
-                    value=DEFAULT_SYSTEM_PROMPT,
+                    value=_persisted_setting("system_prompt"),
                     lines=20,
                     max_lines=60,
                     show_label=False,
                 )
                 reset_system_prompt_btn = gr.Button("Reset to default", size="sm")
+            reset_analysis_settings_btn = gr.Button(
+                "Reset all analysis settings to default", size="sm",
+            )
             with gr.Group(elem_classes=["vb-analyze-frame"]):
                 run_btn = gr.Button("Analyze Stream", variant="primary", elem_id="analyze_stream_btn")
             analyze_quote_md = gr.Markdown("", elem_id="analyze_quote_md")
@@ -2144,6 +2216,29 @@ def build_app() -> gr.Blocks:
             fn=lambda: DEFAULT_SYSTEM_PROMPT,
             inputs=[],
             outputs=[system_prompt_input],
+            api_visibility="private",
+        )
+
+        _analysis_settings_components = [
+            z_threshold_input, min_gap_input, pre_spike_input, post_spike_input, max_merged_duration_input,
+            audio_z_threshold_input, audio_allow_new_checkbox,
+            sound_event_classes_input, sound_event_confidence_input, sound_event_allow_new_checkbox,
+            min_viral_score_input, system_prompt_input,
+            audio_enable_checkbox, sound_event_enable_checkbox, llm_judging_enabled_checkbox, autosave_enabled_checkbox,
+        ]
+        # Sliders/checkboxes/CheckboxGroup persist on every change (a slider's own
+        # change event already only fires on release, not per-pixel-drag); the two
+        # Textboxes (system prompt is the only one here - content_hint is
+        # deliberately per-stream, not persisted) use blur instead, matching the
+        # downloads-folder field elsewhere, so a save doesn't fire on every keystroke.
+        for _key, _component in zip(_ANALYSIS_SETTINGS_KEYS, _analysis_settings_components):
+            _event = _component.blur if _key == "system_prompt" else _component.change
+            _event(fn=_persist_setting(_key), inputs=[_component], outputs=[], api_visibility="private")
+
+        reset_analysis_settings_btn.click(
+            fn=do_reset_analysis_settings,
+            inputs=[],
+            outputs=_analysis_settings_components,
             api_visibility="private",
         )
 
