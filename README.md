@@ -32,7 +32,8 @@ worth clipping and pick precise in/out points.
 
 ## Requirements
 
-- Windows.
+- Windows 10 or later, 64-bit (the bundled Python 3.14 runtime dropped support for
+  Windows 8.1/7).
 - **Ollama** (optional) - only needed for AI Arbitration. The app can install it and
   pull the model for you from the Settings panel; needs an NVIDIA GPU with roughly 9GB+
   VRAM for the default model. Without it, chat/audio/sound-event analysis alone still
