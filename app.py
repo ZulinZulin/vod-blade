@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import replace
 from datetime import datetime
 from functools import partial
@@ -881,6 +882,33 @@ def do_preview_clip(source_video_path: str, start_time: float, end_time: float):
 # --------------------------------------------------------------------------- #
 
 
+def _check_aborted(abort_event: threading.Event) -> None:
+    """
+    Raises the same gr.Error mechanism the pipeline already uses for every other
+    recoverable failure - Gradio treats it as a controlled stop, not a crash, so the
+    UI returns to its normal, retry-ready state automatically. Checked between each
+    major stage (and once per LLM-judged candidate) rather than able to interrupt
+    mid-call: a real stop signal, verified to actually work concurrently with a
+    still-running analysis, just not an instant kill of whatever network call happens
+    to be in flight at that exact moment.
+    """
+    if abort_event.is_set():
+        raise gr.Error("Analysis aborted.")
+
+
+def do_abort_analysis(abort_event: threading.Event) -> None:
+    """
+    Registered with queue=False so it's dispatched immediately even while
+    run_pipeline is still occupying the queue for this session - verified live that
+    this actually runs concurrently rather than waiting in line behind it. Setting
+    the flag is all this does; run_pipeline notices it at its next checkpoint
+    (between pipeline stages, or between LLM-judged candidates) and stops itself
+    there, which is also what puts the UI back into a normal, retry-ready state.
+    """
+    abort_event.set()
+    gr.Info("Aborting... this stops at the next checkpoint, not necessarily instantly.")
+
+
 def run_pipeline(
     youtube_source: str,
     twitch_source: str,
@@ -905,8 +933,13 @@ def run_pipeline(
     sound_event_confidence: float,
     sound_event_allow_new: bool,
     autosave_enabled: bool,
+    abort_event: threading.Event,
     progress=gr.Progress(),
 ):
+    # Cleared at the start of every run - otherwise a flag left set by a previous
+    # aborted run would immediately abort the very next one before it starts.
+    abort_event.clear()
+
     # Gradio Textbox/Dropdown components default to value=None (not "") when left
     # untouched and no explicit `value=""` was set on the component - normalize once
     # here so nothing downstream has to guard against None on what's conceptually an
@@ -943,12 +976,14 @@ def run_pipeline(
     except FetcherError as exc:
         raise gr.Error(f"Subtitle fetch failed: {exc}")
 
+    _check_aborted(abort_event)
     progress(0.3, desc="Downloading Twitch chat log...")
     try:
         messages = fetch_twitch_chat(twitch_source, chat_offset_seconds=chat_offset)
     except FetcherError as exc:
         raise gr.Error(f"Twitch chat fetch failed: {exc}")
 
+    _check_aborted(abort_event)
     progress(0.55, desc="Scoring chat hype...")
     # Only the spike-detection knobs are overridden here; scoring weights/emote lists/bin
     # width stay at their config.py defaults (those are stable across streams, unlike
@@ -971,6 +1006,7 @@ def run_pipeline(
     audio_timeline_df = None
     audio_candidates: List[ClipCandidate] = []
     if audio_enable:
+        _check_aborted(abort_event)
         progress(0.65, desc="Analyzing audio peaks...")
         audio_cfg = replace(
             settings.audio, z_score_threshold=audio_z_threshold, allow_new_candidates=audio_allow_new,
@@ -987,6 +1023,7 @@ def run_pipeline(
         )
 
     if sound_event_enable:
+        _check_aborted(abort_event)
         progress(0.68, desc="Classifying acoustic events...")
         sound_event_cfg = replace(
             settings.sound_event,
@@ -1004,6 +1041,7 @@ def run_pipeline(
             overlap_tolerance_s=settings.sound_event.overlap_tolerance_s,
         )
 
+    _check_aborted(abort_event)
     if not llm_judging_enabled:
         # Fast path for tuning hype detection or testing the UI without waiting on real LLM
         # calls: build clips straight from the raw statistical candidates, no judgment at all.
@@ -1030,6 +1068,9 @@ def run_pipeline(
             # LLM judging is the slowest, most opaque phase of a run (real calls against
             # a local/cloud model, one per candidate) - a per-candidate readout here
             # replaces the single static "judging..." message with visible forward motion.
+            # Also the natural place to check for an abort mid-batch: it's the only
+            # point refine_candidates() calls back into app.py between candidates.
+            _check_aborted(abort_event)
             fraction = 0.75 + 0.25 * (completed / total if total else 1.0)
             progress(fraction, desc=f"Judging candidate {completed}/{total}...")
 
@@ -1557,11 +1598,29 @@ _ANALYZE_BTN_SPIN_JS = """
         "Humanity restored",
     ];
 
+    // A separate, calmer list for the line under the button - analysis can take a
+    // while, so this is "hang tight" flavor text, distinct from the button's own
+    // pop-culture quote-swap above.
+    const patienceQuotes = [
+        "Patience is a virtue.",
+        "He that can have patience can have what he will.",
+        "Patience is bitter, but its fruit is sweet.",
+        "Patience is the strength of the weak, impatience the weakness of the strong.",
+        "The two most powerful warriors are patience and time.",
+        "How poor are they that have not patience! What wound did ever heal but by degrees?",
+        "Patience is the companion of wisdom.",
+    ];
+    const quoteEl = document.getElementById('analyze_quote_md');
+
     btn.addEventListener('click', () => {
         labelNode.nodeValue = quotes[Math.floor(Math.random() * quotes.length)];
         frame.classList.remove('vb-rainbow-spin');
         void frame.offsetWidth;
         frame.classList.add('vb-rainbow-spin');
+        if (quoteEl) {
+            const target = quoteEl.querySelector('.prose') || quoteEl;
+            target.textContent = patienceQuotes[Math.floor(Math.random() * patienceQuotes.length)];
+        }
     });
     frame.addEventListener('animationend', (e) => {
         if (e.animationName === 'vb-rainbow-spin') {
@@ -1820,6 +1879,9 @@ def build_app() -> gr.Blocks:
                 reset_system_prompt_btn = gr.Button("Reset to default", size="sm")
             with gr.Group(elem_classes=["vb-analyze-frame"]):
                 run_btn = gr.Button("Analyze Stream", variant="primary", elem_id="analyze_stream_btn")
+            analyze_quote_md = gr.Markdown("", elem_id="analyze_quote_md")
+            abort_btn = gr.Button("Abort analysis", variant="stop", size="sm")
+            abort_event_state = gr.State(threading.Event)
             status_box = gr.Markdown("")
 
         gr.Markdown(
@@ -1932,6 +1994,7 @@ def build_app() -> gr.Blocks:
                 sound_event_enable_checkbox, sound_event_classes_input,
                 sound_event_confidence_input, sound_event_allow_new_checkbox,
                 autosave_enabled_checkbox,
+                abort_event_state,
             ],
             outputs=[
                 hype_plot, clips_state, status_box, page_state,
@@ -1939,6 +2002,12 @@ def build_app() -> gr.Blocks:
                 session_path_state, session_dropdown, *card_outputs,
             ],
             api_visibility="private",
+        )
+        abort_btn.click(
+            fn=do_abort_analysis,
+            inputs=[abort_event_state],
+            outputs=[],
+            queue=False,
         )
 
         download_vod_btn.click(
