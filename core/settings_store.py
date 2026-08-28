@@ -57,3 +57,13 @@ def get_downloads_dir_override() -> Optional[Path]:
 
 def set_downloads_dir_override(path: Path) -> None:
     save_settings({"downloads_dir": str(path)})
+
+
+def is_onboarding_completed() -> bool:
+    """Whether the first-run setup panel has been finished or skipped -
+    default False so a fresh install shows it on the very first page load."""
+    return bool(load_settings().get("onboarding_completed", False))
+
+
+def mark_onboarding_completed() -> None:
+    save_settings({"onboarding_completed": True})

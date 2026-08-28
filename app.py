@@ -1648,9 +1648,174 @@ def _logo_header_html() -> str:
     return f'<div class="vb-header"><div class="vb-header-glow"></div>{media}</div>'
 
 
+# --------------------------------------------------------------------------- #
+# First-run setup panel
+# --------------------------------------------------------------------------- #
+
+_ONBOARDING_STEP_COUNT = 5
+_SCROLL_TO_OLLAMA_JS = (
+    "() => { document.getElementById('ollama_settings_accordion')"
+    ".scrollIntoView({behavior: 'smooth', block: 'start'}); }"
+)
+
+
+def _onboarding_page_updates(step: int) -> tuple:
+    """One gr.update(visible=...) per page, only `step` visible - shared by every
+    nav handler below so a page's visibility logic lives in exactly one place."""
+    return tuple(gr.update(visible=(i == step)) for i in range(_ONBOARDING_STEP_COUNT))
+
+
+def _onboarding_highlight_updates(step: int) -> tuple:
+    """Glows whichever real on-page control the current step is talking about, so
+    it's obvious where to look while reading about it - downloads folder on step 1,
+    the three analysis toggles on step 2, the Ollama settings accordion on step 3,
+    nothing on every other step."""
+    return (
+        gr.update(elem_classes=["vb-glow-blue"] if step == 1 else []),
+        gr.update(elem_classes=["vb-glow-blue"] if step == 2 else []),
+        gr.update(elem_classes=["vb-glow-blue"] if step == 3 else []),
+    )
+
+
+def do_onboarding_next_or_finish(step: int):
+    on_last_page = step >= _ONBOARDING_STEP_COUNT - 1
+    if on_last_page:
+        settings_store.mark_onboarding_completed()
+        return (
+            step, gr.update(visible=False), *_onboarding_page_updates(step),
+            gr.update(), gr.update(), *_onboarding_highlight_updates(step),
+        )
+
+    new_step = step + 1
+    is_last = new_step == _ONBOARDING_STEP_COUNT - 1
+    return (
+        new_step, gr.update(visible=True), *_onboarding_page_updates(new_step),
+        gr.update(visible=True), gr.update(value="Finish" if is_last else "Next"),
+        *_onboarding_highlight_updates(new_step),
+    )
+
+
+def do_onboarding_back(step: int):
+    new_step = max(step - 1, 0)
+    return (
+        new_step, *_onboarding_page_updates(new_step),
+        gr.update(visible=new_step > 0), gr.update(value="Next"),
+        *_onboarding_highlight_updates(new_step),
+    )
+
+
+def do_onboarding_skip():
+    settings_store.mark_onboarding_completed()
+    return (gr.update(visible=False), *_onboarding_highlight_updates(-1))
+
+
+def do_onboarding_reopen():
+    """Lets someone revisit setup later (e.g. from Settings) without needing to
+    delete their settings.json - always restarts at page 1 rather than wherever
+    they left off, since a re-visit is presumably deliberate, not a resumed session."""
+    return (
+        gr.update(visible=True), 0, *_onboarding_page_updates(0),
+        gr.update(visible=False), gr.update(value="Next"),
+        *_onboarding_highlight_updates(0),
+    )
+
+
+def do_onboarding_browse_downloads_dir(current_dir: str):
+    """Thin wrapper around the real do_browse_downloads_dir so the wizard's copy of
+    the downloads-folder field and the main one under 'Download VOD' stay in sync,
+    without duplicating the actual OS folder-picker logic."""
+    result = do_browse_downloads_dir(current_dir)
+    return result, result
+
+
+def _sync_checkbox_if_different(new_value: bool, other_current: bool):
+    """Mirrors a checkbox toggle onto its paired copy (wizard <-> main page), both
+    directions using this same guarded function - only emits an update when the
+    values actually differ, so wiring both directions can't turn into an infinite
+    ping-pong between the two checkboxes."""
+    return gr.update() if new_value == other_current else gr.update(value=new_value)
+
+
+def do_check_onboarding_visibility():
+    return gr.update(visible=not settings_store.is_onboarding_completed())
+
+
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="VOD BLADE") as demo:
         gr.HTML(_logo_header_html())
+
+        with gr.Group(visible=False) as onboarding_panel:
+            gr.Markdown("## 🩷 LOOK HERE FIRST 🩷", elem_classes=["vb-onboarding-header"])
+            onboarding_step_state = gr.State(0)
+
+            with gr.Group(visible=True) as onboarding_page_0:
+                gr.Markdown(
+                    "### Welcome to VOD BLADE\n"
+                    "VOD BLADE finds the moments in a Twitch stream worth clipping - chat hype "
+                    "spikes, loud audio moments, and notable non-speech sounds - then uses a "
+                    "local AI model to judge which ones are worth keeping before injecting them "
+                    "straight into your Davinci Resolve project.\n\n"
+                    "This quick setup covers a few things worth knowing before your first run. "
+                    "Skip it anytime with the button below."
+                )
+            with gr.Group(visible=False) as onboarding_page_1:
+                gr.Markdown(
+                    "### Downloads folder\n"
+                    "Downloaded VODs (the full stream video, several GB each) go here by "
+                    "default. Change it now, or anytime later next to the \"Download VOD\" "
+                    "button."
+                )
+                onboarding_downloads_dir_input = gr.Textbox(
+                    label="Downloads folder",
+                    value=str(settings_store.get_downloads_dir_override() or DOWNLOADS_DIR),
+                    placeholder=str(DOWNLOADS_DIR),
+                )
+                onboarding_browse_btn = gr.Button("Browse...", size="sm")
+            with gr.Group(visible=False) as onboarding_page_2:
+                gr.Markdown(
+                    "### Analysis features\n"
+                    "Three independent signals feed into finding clip-worthy moments - turn on "
+                    "whichever you want here. You can change these anytime, per run, from the "
+                    "Sources panel."
+                )
+                onboarding_audio_checkbox = gr.Checkbox(
+                    label="Enable audio peak analysis", value=False,
+                    info="Flags loud moments in the VOD's own audio, independent of chat. "
+                         "Needs the VOD's video file.",
+                )
+                onboarding_sound_event_checkbox = gr.Checkbox(
+                    label="Enable sound event detection", value=False,
+                    info="Detects specific sounds (laughter, screams, etc.) with a local audio "
+                         "classifier. Also needs the video file.",
+                )
+                onboarding_llm_checkbox = gr.Checkbox(
+                    label="Enable AI Arbitration", value=True,
+                    info="Uses a local AI model to filter false positives, tighten clip "
+                         "boundaries, and write titles - set up on the next page. Heavy on the "
+                         "GPU. Optional. Nice to have.",
+                )
+            with gr.Group(visible=False) as onboarding_page_3:
+                gr.Markdown(
+                    "### Local AI (optional)\n"
+                    "AI Arbitration needs [Ollama](https://ollama.com) - a free, local AI "
+                    "runner - plus a roughly 9GB model download, and an NVIDIA GPU with "
+                    "roughly 9GB+ VRAM for good performance. Everything else in VOD BLADE works "
+                    "fine without it. Set it up now, or skip and do it later from the Ollama "
+                    "settings area."
+                )
+                onboarding_open_ollama_btn = gr.Button("Open Local AI Setup ↓", size="sm")
+            with gr.Group(visible=False) as onboarding_page_4:
+                gr.Markdown(
+                    "### You're all set\n"
+                    "Provide a subtitle source and a Twitch VOD URL above, then click "
+                    "**Analyze Stream** to find your first clips. You can reopen this setup "
+                    "anytime from the Ollama settings area below."
+                )
+
+            with gr.Row():
+                onboarding_skip_btn = gr.Button("Skip setup", size="sm")
+                onboarding_back_btn = gr.Button("Back", size="sm", visible=False)
+                onboarding_next_btn = gr.Button("Next", size="sm", variant="primary")
 
         with gr.Accordion("Sources & Settings", open=True):
             gr.Markdown("### Sources")
@@ -1674,7 +1839,7 @@ def build_app() -> gr.Blocks:
                         value=settings.fetcher.default_chat_offset_seconds,
                     )
                 with gr.Column():
-                    with gr.Group():
+                    with gr.Group() as analysis_features_group:
                         audio_enable_checkbox = gr.Checkbox(
                             label="Enable audio peak analysis", value=False,
                             elem_classes=["vb-toggle"],
@@ -1687,7 +1852,7 @@ def build_app() -> gr.Blocks:
                             label="Enable AI Arbitration", value=True,
                             elem_classes=["vb-toggle"],
                         )
-                    with gr.Group():
+                    with gr.Group() as download_vod_group:
                         download_vod_btn = gr.Button("Download VOD")
                         vod_quality_input = gr.Dropdown(
                             label="VOD download quality",
@@ -1733,7 +1898,7 @@ def build_app() -> gr.Blocks:
                     )
                     purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
 
-            with gr.Accordion("Ollama settings", open=False):
+            with gr.Accordion("Ollama settings", open=False, elem_id="ollama_settings_accordion") as ollama_settings_accordion:
                 with gr.Row():
                     llm_model_input = gr.Dropdown(
                         label="Model (optional - blank uses the default model; type to search, "
@@ -1772,6 +1937,7 @@ def build_app() -> gr.Blocks:
                     gr.Markdown(f"VOD BLADE v{get_version()}")
                     check_update_btn = gr.Button("Check for updates", size="sm")
                     open_logs_folder_btn = gr.Button("Open log folder", size="sm")
+                    reopen_onboarding_btn = gr.Button("Run first-time setup again", size="sm")
                 update_check_md = gr.Markdown(visible=False)
                 gr.Markdown(
                     "_If something goes wrong, the log folder has more detail than what's "
@@ -2089,6 +2255,99 @@ def build_app() -> gr.Blocks:
             api_visibility="private",
         )
 
+        _onboarding_pages = [
+            onboarding_page_0, onboarding_page_1, onboarding_page_2,
+            onboarding_page_3, onboarding_page_4,
+        ]
+        onboarding_next_btn.click(
+            fn=do_onboarding_next_or_finish,
+            inputs=[onboarding_step_state],
+            outputs=[
+                onboarding_step_state, onboarding_panel, *_onboarding_pages,
+                onboarding_back_btn, onboarding_next_btn,
+                download_vod_group, analysis_features_group, ollama_settings_accordion,
+            ],
+            api_visibility="private",
+        )
+        onboarding_back_btn.click(
+            fn=do_onboarding_back,
+            inputs=[onboarding_step_state],
+            outputs=[
+                onboarding_step_state, *_onboarding_pages,
+                onboarding_back_btn, onboarding_next_btn,
+                download_vod_group, analysis_features_group, ollama_settings_accordion,
+            ],
+            api_visibility="private",
+        )
+        onboarding_skip_btn.click(
+            fn=do_onboarding_skip,
+            inputs=[],
+            outputs=[onboarding_panel, download_vod_group, analysis_features_group, ollama_settings_accordion],
+            api_visibility="private",
+        )
+        reopen_onboarding_btn.click(
+            fn=do_onboarding_reopen,
+            inputs=[],
+            outputs=[
+                onboarding_panel, onboarding_step_state, *_onboarding_pages,
+                onboarding_back_btn, onboarding_next_btn,
+                download_vod_group, analysis_features_group, ollama_settings_accordion,
+            ],
+            api_visibility="private",
+        )
+        onboarding_browse_btn.click(
+            fn=do_onboarding_browse_downloads_dir,
+            inputs=[onboarding_downloads_dir_input],
+            outputs=[onboarding_downloads_dir_input, downloads_dir_input],
+            api_visibility="private",
+        )
+        onboarding_downloads_dir_input.blur(
+            fn=do_persist_downloads_dir,
+            inputs=[onboarding_downloads_dir_input],
+            outputs=[],
+            api_visibility="private",
+        )
+        onboarding_audio_checkbox.change(
+            fn=_sync_checkbox_if_different,
+            inputs=[onboarding_audio_checkbox, audio_enable_checkbox], outputs=[audio_enable_checkbox],
+            api_visibility="private",
+        )
+        audio_enable_checkbox.change(
+            fn=_sync_checkbox_if_different,
+            inputs=[audio_enable_checkbox, onboarding_audio_checkbox], outputs=[onboarding_audio_checkbox],
+            api_visibility="private",
+        )
+        onboarding_sound_event_checkbox.change(
+            fn=_sync_checkbox_if_different,
+            inputs=[onboarding_sound_event_checkbox, sound_event_enable_checkbox], outputs=[sound_event_enable_checkbox],
+            api_visibility="private",
+        )
+        sound_event_enable_checkbox.change(
+            fn=_sync_checkbox_if_different,
+            inputs=[sound_event_enable_checkbox, onboarding_sound_event_checkbox], outputs=[onboarding_sound_event_checkbox],
+            api_visibility="private",
+        )
+        onboarding_llm_checkbox.change(
+            fn=_sync_checkbox_if_different,
+            inputs=[onboarding_llm_checkbox, llm_judging_enabled_checkbox], outputs=[llm_judging_enabled_checkbox],
+            api_visibility="private",
+        )
+        llm_judging_enabled_checkbox.change(
+            fn=_sync_checkbox_if_different,
+            inputs=[llm_judging_enabled_checkbox, onboarding_llm_checkbox], outputs=[onboarding_llm_checkbox],
+            api_visibility="private",
+        )
+        onboarding_open_ollama_btn.click(
+            fn=lambda: gr.update(open=True),
+            inputs=[],
+            outputs=[ollama_settings_accordion],
+            api_visibility="private",
+        ).then(fn=None, inputs=None, outputs=None, js=_SCROLL_TO_OLLAMA_JS)
+
+        demo.load(
+            fn=do_check_onboarding_visibility,
+            outputs=[onboarding_panel],
+        )
         demo.load(
             fn=do_refresh_ollama_setup,
             inputs=[llm_model_input, llm_api_base_input],
