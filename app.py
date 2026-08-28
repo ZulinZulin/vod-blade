@@ -1301,37 +1301,68 @@ def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
     )
 
 
+_BROWSE_FOLDER_PS_SCRIPT = (
+    "Add-Type -AssemblyName System.Windows.Forms\n"
+    "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog\n"
+    "$dialog.Description = 'Choose a downloads folder'\n"
+    "$initial = $env:VOD_BLADE_BROWSE_INITIAL_DIR\n"
+    "if ($initial -and (Test-Path $initial)) { $dialog.SelectedPath = $initial }\n"
+    "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {\n"
+    "    Write-Output $dialog.SelectedPath\n"
+    "}\n"
+)
+
+
+def _browse_folder_windows(initial_dir: str) -> Optional[str]:
+    """
+    Native folder picker via PowerShell's System.Windows.Forms.FolderBrowserDialog -
+    .NET WinForms ships with every Windows install, so nothing needs bundling and
+    nothing can go missing the way tkinter does from Python's embeddable distribution
+    (what the packaged release uses). Deliberately not pywin32 either: it needs a
+    post-install step to register DLLs that assumes a normal Python install and is
+    known to be unreliable in a --target-style/embeddable one.
+
+    The initial directory is handed over via an environment variable rather than
+    interpolated into the script text, so a path containing quotes or other special
+    characters can't break the script.
+    """
+    env = os.environ.copy()
+    env["VOD_BLADE_BROWSE_INITIAL_DIR"] = initial_dir
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _BROWSE_FOLDER_PS_SCRIPT],
+        capture_output=True, text=True, timeout=300, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"powershell.exe exited with code {result.returncode}")
+    return result.stdout.strip() or None
+
+
+def _browse_folder_tkinter(initial_dir: str) -> Optional[str]:
+    """Fallback for non-Windows platforms - not the confirmed-broken path (that was
+    Windows/the packaged embeddable Python specifically), so left as-is here."""
+    import tkinter
+    from tkinter import filedialog
+
+    root = tkinter.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return filedialog.askdirectory(initialdir=initial_dir, title="Choose a downloads folder") or None
+    finally:
+        root.destroy()
+
+
 def do_browse_downloads_dir(current_dir: str):
     """
-    Opens a native OS folder picker (tkinter, not a Gradio component - browsers have
-    no API that hands a web page a real filesystem path, only file *contents*, so this
-    has to run in the Python backend, which for a local app like this one shares the
-    same machine/filesystem as the person clicking the button). Falls back to leaving
-    the field untouched if tkinter can't display anything (e.g. headless server with no
-    display) rather than crashing the request - typing the path by hand still works.
+    Opens a native OS folder picker - browsers have no API that hands a web page a
+    real filesystem path, only file *contents*, so this has to run in the Python
+    backend, which for a local app like this one shares the same machine/filesystem
+    as the person clicking the button.
     """
+    initial_dir = current_dir if current_dir and Path(current_dir).is_dir() else str(DOWNLOADS_DIR)
     try:
-        import tkinter
-        from tkinter import filedialog
-    except ModuleNotFoundError:
-        # Python's embeddable distribution (what the packaged release bundles)
-        # deliberately ships without tkinter - not a bug to fix, just a real gap in
-        # that build. A raw "No module named 'tkinter'" would look like a crash to
-        # someone who doesn't know what tkinter is, so this case gets its own
-        # message rather than falling through to the generic one below.
-        raise gr.Error("Folder picker isn't available in this build. Type the path in the box above instead.")
-
-    try:
-        root = tkinter.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        try:
-            chosen = filedialog.askdirectory(
-                initialdir=current_dir if current_dir and Path(current_dir).is_dir() else str(DOWNLOADS_DIR),
-                title="Choose a downloads folder",
-            )
-        finally:
-            root.destroy()
+        browse = _browse_folder_windows if platform.system() == "Windows" else _browse_folder_tkinter
+        chosen = browse(initial_dir)
     except Exception as exc:
         logger.warning("Folder picker unavailable (%s); type the path in manually instead.", exc)
         raise gr.Error(f"Couldn't open the folder picker ({exc}). Type the path in manually instead.")
