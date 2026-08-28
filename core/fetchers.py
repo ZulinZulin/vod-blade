@@ -572,6 +572,12 @@ class TwitchVideoFetcher:
             "--id", vod_id,
             "--quality", quality,
             "-o", str(out_path),
+            # Without this, TwitchDownloaderCLI does its own ffmpeg lookup - which
+            # fails outright ("Unable to find FFmpeg, exiting") on a machine with no
+            # system-wide ffmpeg on PATH, since it has no idea about the copy bundled
+            # in bin/ for exactly this reason. Passing this also guarantees it uses
+            # the same ffmpeg our own code does, dev checkout or packaged release.
+            "--ffmpeg-path", settings.export.ffmpeg_binary,
             # Non-interactive: without this, a stale/partial file from a prior failed run
             # would make TwitchDownloaderCLI block on an interactive overwrite prompt,
             # which would just hang until our timeout fires instead of failing fast.

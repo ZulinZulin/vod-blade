@@ -51,6 +51,21 @@ def _default_twitch_cli_name() -> str:
     return "TwitchDownloaderCLI.exe" if platform.system() == "Windows" else "TwitchDownloaderCLI"
 
 
+def _default_ffmpeg_binary(name: str) -> str:
+    """
+    Prefers the packaged release's bundled copy (build_release.ps1 puts a static
+    ffmpeg/ffprobe build in bin/) if it's actually there, falling back to a bare
+    command name for a dev checkout to resolve via PATH - bin/ffmpeg.exe only exists
+    in a packaged build, never in a source checkout. Without this, the bundled copy
+    just sits in bin/ unused: a real bug found via a real Windows Sandbox test, where
+    TwitchDownloaderCLI failed outright with "Unable to find FFmpeg" since Sandbox
+    has no system-wide ffmpeg on PATH and nothing pointed it at the bundled one.
+    """
+    exe_name = f"{name}.exe" if platform.system() == "Windows" else name
+    bundled = BIN_DIR / exe_name
+    return str(bundled) if bundled.exists() else name
+
+
 # --------------------------------------------------------------------------- #
 # External binaries
 # --------------------------------------------------------------------------- #
@@ -390,8 +405,8 @@ class ExportConfig:
     default_timeline_width: int = 1920
     default_timeline_height: int = 1080
     export_dir: Path = EXPORTS_DIR
-    ffprobe_binary: str = os.getenv("FFPROBE_BINARY", "ffprobe")
-    ffmpeg_binary: str = os.getenv("FFMPEG_BINARY", "ffmpeg")
+    ffprobe_binary: str = os.getenv("FFPROBE_BINARY") or _default_ffmpeg_binary("ffprobe")
+    ffmpeg_binary: str = os.getenv("FFMPEG_BINARY") or _default_ffmpeg_binary("ffmpeg")
 
     # DaVinci Resolve scripting API integration paths (per-OS defaults;
     # override via env if Resolve is installed non-standard).
