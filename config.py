@@ -414,26 +414,37 @@ class ExportConfig:
     resolve_script_lib: Optional[str] = os.getenv("RESOLVE_SCRIPT_LIB")
 
     def resolved_script_paths(self) -> Dict[str, str]:
+        # Local import: core/settings_store.py imports DATA_DIR from this module, so
+        # importing it at module scope here would be circular. Checked at call time
+        # (not baked into the dataclass default above) so a path saved from the
+        # Settings UI takes effect immediately, without an app restart - and takes
+        # priority over .env, since it's the option available to someone running a
+        # packaged build with no .env file at all.
+        from core.settings_store import get_resolve_script_api_override, get_resolve_script_lib_override
+
+        ui_api = get_resolve_script_api_override()
+        ui_lib = get_resolve_script_lib_override()
+
         system = platform.system()
         if system == "Windows":
-            api = self.resolve_script_api or (
+            api = ui_api or self.resolve_script_api or (
                 r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting"
             )
-            lib = self.resolve_script_lib or (
+            lib = ui_lib or self.resolve_script_lib or (
                 r"C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll"
             )
         elif system == "Darwin":
-            api = self.resolve_script_api or (
+            api = ui_api or self.resolve_script_api or (
                 "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
             )
-            lib = self.resolve_script_lib or (
+            lib = ui_lib or self.resolve_script_lib or (
                 "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so"
             )
         else:
-            api = self.resolve_script_api or (
+            api = ui_api or self.resolve_script_api or (
                 "/opt/resolve/Developer/Scripting"
             )
-            lib = self.resolve_script_lib or (
+            lib = ui_lib or self.resolve_script_lib or (
                 "/opt/resolve/libs/Fusion/fusionscript.so"
             )
         return {"api": api, "lib": lib, "modules": str(Path(api) / "Modules")}

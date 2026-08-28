@@ -74,7 +74,8 @@ def _load_resolve_script_module(export_config: Optional[ExportConfig] = None) ->
         raise DavinciAPIError(
             "Could not import DaVinciResolveScript. Ensure DaVinci Resolve is installed and "
             f"its Modules directory is reachable at '{modules_dir}'. If it's installed elsewhere, "
-            "set RESOLVE_SCRIPT_API / RESOLVE_SCRIPT_LIB in your .env."
+            "set the path in VOD BLADE's 'DaVinci Resolve settings' section (or RESOLVE_SCRIPT_API / "
+            "RESOLVE_SCRIPT_LIB in your .env if running from source)."
         ) from exc
 
 
@@ -88,7 +89,13 @@ def is_available(export_config: Optional[ExportConfig] = None) -> bool:
         resolve = dvr_script.scriptapp("Resolve")
         return resolve is not None
     except Exception as exc:
-        logger.debug("DaVinci Resolve scripting API not available: %s", exc)
+        # .info(), not .debug(): this is checked on every page load (see the
+        # resolve_hint markdown in app.py) so it fires constantly for anyone who
+        # doesn't use Resolve - but burying the *reason* at debug level means a
+        # real misconfiguration (wrong path, Resolve's "External scripting" pref
+        # off, .env not actually being read) is invisible in the log file someone
+        # would send us when reporting exactly this kind of "can't detect it" bug.
+        logger.info("DaVinci Resolve scripting API not available: %s", exc)
         return False
 
 

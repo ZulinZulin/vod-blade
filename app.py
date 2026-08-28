@@ -1464,6 +1464,28 @@ def do_persist_downloads_dir(downloads_dir: str) -> None:
         settings_store.set_downloads_dir_override(Path(downloads_dir.strip()))
 
 
+def do_persist_resolve_script_api(path: str) -> None:
+    settings_store.set_resolve_script_api_override(path.strip())
+
+
+def do_persist_resolve_script_lib(path: str) -> None:
+    settings_store.set_resolve_script_lib_override(path.strip())
+
+
+def do_test_resolve_connection():
+    """Re-checks reachability on demand - the static hint above the Export section
+    (see resolve_hint below) is only ever computed once, at page-build time, so it
+    can't reflect a path just typed into the fields above without this."""
+    if resolve_is_available():
+        return gr.update(value="Success - DaVinci Resolve detected and reachable.", visible=True)
+    return gr.update(
+        value="Still can't reach DaVinci Resolve. Make sure it's running with Preferences > "
+              "General > 'External scripting using' set to Local, and that the path above "
+              "points at the actual fusionscript.dll/.so location.",
+        visible=True,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Export handlers
 # --------------------------------------------------------------------------- #
@@ -1501,7 +1523,9 @@ def do_inject_resolve(clips: List[CandidateClip], source_video_path: str):
     if not resolve_is_available():
         raise gr.Error(
             "DaVinci Resolve isn't reachable. Make sure it's running with Preferences > General > "
-            "'External scripting using' set to Local, or use the FCPXML/EDL download instead."
+            "'External scripting using' set to Local, that Resolve is installed in the default "
+            "location (or its path is set in 'DaVinci Resolve settings' below), or use the "
+            "FCPXML/EDL download instead."
         )
     try:
         result = inject_into_resolve(accepted, source_video_path)
@@ -2013,6 +2037,26 @@ def build_app() -> gr.Blocks:
                     "shown here - useful to include when reporting an issue._"
                 )
 
+            with gr.Accordion("DaVinci Resolve settings", open=False):
+                gr.Markdown(
+                    "_Only needed if 'Inject into DaVinci Resolve' can't find Resolve on its own - "
+                    "usually because it's installed somewhere other than the default location. "
+                    "Leave both blank to use the default. Restarting the app isn't needed after "
+                    "changing these._"
+                )
+                resolve_script_lib_input = gr.Textbox(
+                    label="DaVinci Resolve library path override (fusionscript.dll / fusionscript.so)",
+                    value=settings_store.get_resolve_script_lib_override(),
+                    placeholder=r"e.g. D:\Programs\Blackmagic Design\DaVinci Resolve\fusionscript.dll",
+                )
+                resolve_script_api_input = gr.Textbox(
+                    label="DaVinci Resolve scripting API folder override (rarely needed)",
+                    value=settings_store.get_resolve_script_api_override(),
+                    placeholder=r"e.g. C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting",
+                )
+                resolve_test_btn = gr.Button("Test connection", size="sm")
+                resolve_test_result_md = gr.Markdown(visible=False)
+
             with gr.Accordion("Chat spikes detection settings", open=False):
                 with gr.Row():
                     z_threshold_input = gr.Slider(
@@ -2293,6 +2337,25 @@ def build_app() -> gr.Blocks:
             fn=do_persist_downloads_dir,
             inputs=[downloads_dir_input],
             outputs=[],
+            api_visibility="private",
+        )
+
+        resolve_script_lib_input.blur(
+            fn=do_persist_resolve_script_lib,
+            inputs=[resolve_script_lib_input],
+            outputs=[],
+            api_visibility="private",
+        )
+        resolve_script_api_input.blur(
+            fn=do_persist_resolve_script_api,
+            inputs=[resolve_script_api_input],
+            outputs=[],
+            api_visibility="private",
+        )
+        resolve_test_btn.click(
+            fn=do_test_resolve_connection,
+            inputs=[],
+            outputs=[resolve_test_result_md],
             api_visibility="private",
         )
 

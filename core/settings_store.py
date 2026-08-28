@@ -59,6 +59,26 @@ def set_downloads_dir_override(path: Path) -> None:
     save_settings({"downloads_dir": str(path)})
 
 
+def get_resolve_script_api_override() -> str:
+    """The last user-entered DaVinci Resolve scripting-API folder override, or ""
+    if never set - lets someone running a packaged build (no .env available) fix a
+    non-default Resolve install from the Settings UI instead of hand-editing a file."""
+    return load_settings().get("resolve_script_api", "")
+
+
+def set_resolve_script_api_override(path: str) -> None:
+    save_settings({"resolve_script_api": path})
+
+
+def get_resolve_script_lib_override() -> str:
+    """Same as get_resolve_script_api_override, for the fusionscript.dll/.so path."""
+    return load_settings().get("resolve_script_lib", "")
+
+
+def set_resolve_script_lib_override(path: str) -> None:
+    save_settings({"resolve_script_lib": path})
+
+
 def is_onboarding_completed() -> bool:
     """Whether the first-run setup panel has been finished or skipped -
     default False so a fresh install shows it on the very first page load."""
