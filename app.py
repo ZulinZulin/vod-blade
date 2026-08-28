@@ -44,6 +44,7 @@ from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_ch
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
     FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod, get_twitch_vod_title,
+    shift_subtitles_to_vod_clock,
 )
 from core.llm_agent import (
     DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError,
@@ -1002,11 +1003,17 @@ def run_pipeline(
     # something downstream actually consumes it (subtitles: AI Arbitration only; chat
     # messages: chat hype detection only - see the dependency notes on chat_enable/
     # llm_judging_enabled's validation above).
+    # source_video_path is virtually always either the Twitch-downloaded VOD itself or a
+    # local recording that aligns with it - never the YouTube upload, which often runs on
+    # a different clock. So subtitles (the one thing actually fetched from YouTube) are
+    # shifted once, right here, onto that same VOD-native clock everything else (chat
+    # messages, audio/sound-event candidates, source_video_path itself) is already
+    # naturally on - see core/fetchers.py's docstring and shift_subtitles_to_vod_clock.
     subtitles = []
     if youtube_source:
         progress(0.05, desc="Fetching subtitles...")
         try:
-            subtitles = fetch_subtitles(youtube_source)
+            subtitles = shift_subtitles_to_vod_clock(fetch_subtitles(youtube_source), chat_offset)
         except FetcherError as exc:
             raise gr.Error(f"Subtitle fetch failed: {exc}")
 
@@ -1017,7 +1024,7 @@ def run_pipeline(
     if chat_enable:
         progress(0.3, desc="Downloading Twitch chat log...")
         try:
-            messages = fetch_twitch_chat(twitch_source, chat_offset_seconds=chat_offset)
+            messages = fetch_twitch_chat(twitch_source)
         except FetcherError as exc:
             raise gr.Error(f"Twitch chat fetch failed: {exc}")
 

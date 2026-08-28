@@ -10,9 +10,15 @@ Three independent input paths feed the rest of the pipeline:
 3. Twitch VOD video file (via TwitchDownloaderCLI)           -> Path (local .mp4)
 
 All three are pure I/O + parsing: they know nothing about hype scoring or LLM
-prompts. `chat_offset_seconds` is applied here, once, as an explicit correction
-step so every downstream module can assume timestamps already share the same
-clock as the source (YouTube) video.
+prompts. The canonical clock for everything downstream (chat messages, audio/
+sound-event candidates, exports) is the local video file's own native clock -
+in practice always either the Twitch-downloaded VOD itself or a local recording
+that aligns with it, never the YouTube upload (which often runs on a different
+clock - trimmed intro, re-encoding, etc). Subtitles are the one exception, since
+they're fetched from that YouTube video specifically - shift_subtitles_to_vod_clock
+below converts them into the same VOD-native clock as everything else, once,
+right after fetching, so no downstream module needs to think about the
+Twitch/YouTube distinction at all.
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ import json
 import logging
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional
 
@@ -379,41 +385,16 @@ class TwitchChatFetcher:
         self.binaries = settings.binaries
         self.cfg = settings.fetcher
 
-    def fetch(
-        self,
-        vod_url_or_id: str,
-        chat_offset_seconds: Optional[float] = None,
-    ) -> List[ChatMessage]:
+    def fetch(self, vod_url_or_id: str) -> List[ChatMessage]:
         """
-        `chat_offset_seconds` corrects for the Twitch VOD clock running ahead
-        of the eventual YouTube video clock, e.g. because the YouTube upload
-        trimmed N seconds off the front of the stream:
-
-            youtube_time = twitch_time - chat_offset_seconds
-
-        Messages that land before youtube_time == 0 are dropped.
+        Timestamps stay exactly as TwitchDownloaderCLI reports them - the Twitch
+        VOD's own native clock, same as source_video_path's (see this module's
+        docstring). No YouTube-clock correction happens here; see
+        shift_subtitles_to_vod_clock for where that conversion actually belongs.
         """
         vod_id = extract_twitch_vod_id(vod_url_or_id)
         json_path = self._download_chat(vod_id)
-        messages = self._parse_chat_json(json_path)
-
-        offset = (
-            chat_offset_seconds if chat_offset_seconds is not None else self.cfg.default_chat_offset_seconds
-        )
-        if offset:
-            shifted = [
-                ChatMessage(
-                    timestamp=msg.timestamp - offset,
-                    username=msg.username,
-                    text=msg.text,
-                    badges=msg.badges,
-                    is_subscriber=msg.is_subscriber,
-                    is_moderator=msg.is_moderator,
-                )
-                for msg in messages
-            ]
-            messages = [msg for msg in shifted if msg.timestamp >= 0]
-        return messages
+        return self._parse_chat_json(json_path)
 
     def _download_chat(self, vod_id: str) -> Path:
         cli_path = self.binaries.twitch_downloader_cli
@@ -625,12 +606,32 @@ def fetch_subtitles(source: str) -> List[SubtitleSegment]:
     return YouTubeSubtitleFetcher().fetch(source)
 
 
-def fetch_twitch_chat(
-    vod_url_or_id: str,
-    chat_offset_seconds: Optional[float] = None,
-) -> List[ChatMessage]:
-    """Fetch and offset-correct a Twitch VOD's chat log."""
-    return TwitchChatFetcher().fetch(vod_url_or_id, chat_offset_seconds=chat_offset_seconds)
+def fetch_twitch_chat(vod_url_or_id: str) -> List[ChatMessage]:
+    """Fetch a Twitch VOD's chat log, timestamps on the VOD's own native clock."""
+    return TwitchChatFetcher().fetch(vod_url_or_id)
+
+
+def shift_subtitles_to_vod_clock(subtitles: List[SubtitleSegment], chat_offset_seconds: float) -> List[SubtitleSegment]:
+    """
+    Converts subtitles (fetched from YouTube, on that video's own clock) onto the
+    Twitch VOD's native clock - the one clock chat messages, audio/sound-event
+    candidates, and source_video_path itself are already all naturally on (see this
+    module's docstring). "Chat offset (s) - Twitch clock minus YouTube clock" in the
+    UI means:
+
+        youtube_time = twitch_time - chat_offset_seconds
+
+    so converting the other way is:
+
+        vod_time = youtube_time + chat_offset_seconds
+
+    A subtitle that lands before this VOD's own start (or after its end) isn't
+    dropped here - it simply won't overlap any candidate window and will never get
+    selected by select_subtitle_window downstream.
+    """
+    if not chat_offset_seconds:
+        return subtitles
+    return [replace(s, start=s.start + chat_offset_seconds, end=s.end + chat_offset_seconds) for s in subtitles]
 
 
 def fetch_twitch_vod(
