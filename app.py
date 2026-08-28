@@ -171,6 +171,7 @@ def build_hype_timeline_figure(
     candidates: List[ClipCandidate],
     audio_timeline_df: Optional[pd.DataFrame] = None,
     audio_candidates: Optional[List[ClipCandidate]] = None,
+    empty_message: str = "No chat data yet - run an analysis to populate this graph.",
 ) -> go.Figure:
     """
     `candidates` is the final, post-merge list (chat/audio/sound_event tags mixed
@@ -189,7 +190,7 @@ def build_hype_timeline_figure(
     """
     fig = go.Figure()
     if timeline_df.empty:
-        fig.update_layout(title="No chat data yet - run an analysis to populate this graph.", template="plotly_dark")
+        fig.update_layout(title=empty_message, template="plotly_dark")
         return fig
 
     def tags(c: ClipCandidate) -> List[str]:
@@ -930,6 +931,7 @@ def run_pipeline(
     llm_model: str,
     llm_api_base: str,
     llm_judging_enabled: bool,
+    chat_enable: bool,
     audio_enable: bool,
     audio_z_threshold: float,
     audio_allow_new: bool,
@@ -954,8 +956,28 @@ def run_pipeline(
     llm_model = llm_model or ""
     llm_api_base = llm_api_base or ""
 
-    if not youtube_source or not twitch_source:
-        raise gr.Error("Please provide both a subtitle source and a Twitch VOD source.")
+    if not source_video_path and not twitch_source:
+        raise gr.Error(
+            "Provide a local source video path or a Twitch VOD URL - at least one is needed "
+            "to run any analysis signal."
+        )
+    if not (chat_enable or audio_enable or sound_event_enable):
+        raise gr.Error("Enable at least one analysis signal: chat hype detection, audio peaks, or sound events.")
+    if chat_enable and not twitch_source:
+        raise gr.Error("Chat hype detection is enabled but no Twitch VOD URL/ID was provided.")
+    # With chat off there's no chat candidate for audio/sound-event to enrich - each one's
+    # "allow new candidates" is the ONLY way either can produce anything on its own, so with
+    # chat off and both left unchecked, this run is guaranteed to end with zero candidates.
+    if not chat_enable and not (
+        (audio_enable and audio_allow_new) or (sound_event_enable and sound_event_allow_new)
+    ):
+        raise gr.Error(
+            "Chat hype detection is off, so audio peaks / sound events need 'allow new candidates' "
+            "checked (in their own settings below) to produce anything by themselves - turn that on, "
+            "or re-enable chat hype detection."
+        )
+    if llm_judging_enabled and not youtube_source:
+        raise gr.Error("AI Arbitration is enabled but no subtitle/transcript source was provided.")
     if z_threshold is None or z_threshold <= 0:
         raise gr.Error("Z-score threshold must be a positive number.")
     if min_gap is None or min_gap < 0 or pre_spike is None or pre_spike < 0 or post_spike is None or post_spike < 0:
@@ -975,38 +997,49 @@ def run_pipeline(
             "existing file - download the VOD first, or disable sound event detection."
         )
 
-    progress(0.05, desc="Fetching subtitles...")
-    try:
-        subtitles = fetch_subtitles(youtube_source)
-    except FetcherError as exc:
-        raise gr.Error(f"Subtitle fetch failed: {exc}")
+    # subtitles/messages both default to "nothing fetched" rather than being fetched
+    # unconditionally - each is a real network round-trip, and neither is needed unless
+    # something downstream actually consumes it (subtitles: AI Arbitration only; chat
+    # messages: chat hype detection only - see the dependency notes on chat_enable/
+    # llm_judging_enabled's validation above).
+    subtitles = []
+    if youtube_source:
+        progress(0.05, desc="Fetching subtitles...")
+        try:
+            subtitles = fetch_subtitles(youtube_source)
+        except FetcherError as exc:
+            raise gr.Error(f"Subtitle fetch failed: {exc}")
 
     _check_aborted(abort_event)
-    progress(0.3, desc="Downloading Twitch chat log...")
-    try:
-        messages = fetch_twitch_chat(twitch_source, chat_offset_seconds=chat_offset)
-    except FetcherError as exc:
-        raise gr.Error(f"Twitch chat fetch failed: {exc}")
+    messages = []
+    candidates: List[ClipCandidate] = []
+    timeline_df = pd.DataFrame()
+    if chat_enable:
+        progress(0.3, desc="Downloading Twitch chat log...")
+        try:
+            messages = fetch_twitch_chat(twitch_source, chat_offset_seconds=chat_offset)
+        except FetcherError as exc:
+            raise gr.Error(f"Twitch chat fetch failed: {exc}")
 
-    _check_aborted(abort_event)
-    progress(0.55, desc="Scoring chat hype...")
-    # Only the spike-detection knobs are overridden here; scoring weights/emote lists/bin
-    # width stay at their config.py defaults (those are stable across streams, unlike
-    # sensitivity, which an editor will want to retune per chat's chattiness).
-    hype_cfg = replace(
-        settings.hype,
-        z_score_threshold=z_threshold,
-        min_seconds_between_spikes=min_gap,
-        pre_spike_seconds=pre_spike,
-        post_spike_seconds=post_spike,
-        max_merged_duration_seconds=max_merged_duration,
-    )
-    candidates, timeline_df = ChatAnalyzer(config=hype_cfg).analyze_with_timeline(messages)
-    if not candidates:
-        gr.Warning(
-            "No chat hype spikes cleared the Z-score threshold. Try lowering the Z-score threshold "
-            "above for a quieter stream, or double check the chat offset."
+        _check_aborted(abort_event)
+        progress(0.55, desc="Scoring chat hype...")
+        # Only the spike-detection knobs are overridden here; scoring weights/emote lists/bin
+        # width stay at their config.py defaults (those are stable across streams, unlike
+        # sensitivity, which an editor will want to retune per chat's chattiness).
+        hype_cfg = replace(
+            settings.hype,
+            z_score_threshold=z_threshold,
+            min_seconds_between_spikes=min_gap,
+            pre_spike_seconds=pre_spike,
+            post_spike_seconds=post_spike,
+            max_merged_duration_seconds=max_merged_duration,
         )
+        candidates, timeline_df = ChatAnalyzer(config=hype_cfg).analyze_with_timeline(messages)
+        if not candidates:
+            gr.Warning(
+                "No chat hype spikes cleared the Z-score threshold. Try lowering the Z-score threshold "
+                "above for a quieter stream, or double check the chat offset."
+            )
 
     audio_timeline_df = None
     audio_candidates: List[ClipCandidate] = []
@@ -1092,7 +1125,14 @@ def run_pipeline(
     kept_count = len(refined_clips) - rejected_count
 
     progress(1.0, desc="Done")
-    fig = build_hype_timeline_figure(timeline_df, candidates, audio_timeline_df, audio_candidates)
+    fig = build_hype_timeline_figure(
+        timeline_df, candidates, audio_timeline_df, audio_candidates,
+        empty_message=(
+            "Chat hype detection is off - no chat timeline to show."
+            if not chat_enable else
+            "No chat data yet - run an analysis to populate this graph."
+        ),
+    )
     audio_note = ""
     if audio_enable:
         audio_only_count = sum(1 for c in refined_clips if "audio" in c.source.split("+") and "chat" not in c.source.split("+"))
@@ -1102,8 +1142,9 @@ def run_pipeline(
     if sound_event_enable:
         event_count = sum(1 for c in refined_clips if c.sound_events)
         sound_event_note = f" ({event_count} with a detected acoustic event)"
+    chat_summary = f"Analyzed {len(messages)} chat messages -> " if chat_enable else ""
     status = (
-        f"Analyzed {len(messages)} chat messages -> {len(candidates)} candidate(s){audio_note}{sound_event_note} -> "
+        f"{chat_summary}{len(candidates)} candidate(s){audio_note}{sound_event_note} -> "
         f"{kept_count} clip(s) kept"
         + (
             f", {rejected_count} rejected (toggle 'Show rejected candidates' to review)."
@@ -1784,12 +1825,22 @@ def _sync_paired_field_if_different(new_value, other_current):
 
 # One ordered list drives both the defaults lookup and each handler's outputs list,
 # so the two can't silently drift out of sync with each other as fields get added.
+# Which real input field each of the four analysis toggles needs non-blank before it can
+# even be turned on - see do_gate_toggle below. Not every key in _ANALYSIS_SETTINGS_KEYS
+# has an entry here; only the four signal/refinement toggles are input-gated.
+_TOGGLE_REQUIRED_INPUT = {
+    "chat_enable": "twitch",
+    "audio_enable": "video",
+    "sound_event_enable": "video",
+    "llm_judging_enabled": "youtube",
+}
+
 _ANALYSIS_SETTINGS_KEYS = [
     "z_threshold", "min_gap", "pre_spike", "post_spike", "max_merged_duration",
     "audio_z_threshold", "audio_allow_new",
     "sound_event_classes", "sound_event_confidence", "sound_event_allow_new",
     "min_viral_score", "system_prompt",
-    "audio_enable", "sound_event_enable", "llm_judging_enabled", "autosave_enabled",
+    "chat_enable", "audio_enable", "sound_event_enable", "llm_judging_enabled", "autosave_enabled",
 ]
 
 
@@ -1811,6 +1862,7 @@ def _analysis_settings_defaults() -> dict:
         "sound_event_allow_new": settings.sound_event.allow_new_candidates,
         "min_viral_score": settings.llm.min_viral_score,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
+        "chat_enable": True,
         "audio_enable": False,
         "sound_event_enable": False,
         "llm_judging_enabled": True,
@@ -1832,12 +1884,39 @@ def _persist_setting(key: str):
     return handler
 
 
-def do_reset_analysis_settings():
+def do_gate_toggle(setting_key: str):
+    """Returns a handler that enables/disables one of the four signal/refinement toggles
+    based on whether its required input field (_TOGGLE_REQUIRED_INPUT) currently has
+    content - the goal is "can't even be turned on without what it needs", not just
+    "errors when you hit Analyze". Wired to that field's .change() event, so it fires on
+    typing, on Load session repopulating the field, and on Download VOD auto-filling the
+    source video path alike - .change() fires on any value change, not just direct typing.
+    Re-applies the persisted last-used preference the moment the field gets content again,
+    rather than leaving the toggle stuck off until manually re-checked."""
+    def handler(field_value):
+        has_input = bool(field_value and str(field_value).strip())
+        if not has_input:
+            return gr.update(interactive=False, value=False)
+        preferred = settings_store.load_settings().get(setting_key, _analysis_settings_defaults()[setting_key])
+        return gr.update(interactive=True, value=preferred)
+    return handler
+
+
+def do_reset_analysis_settings(twitch_source: str, source_video_path: str, youtube_source: str):
     defaults = _analysis_settings_defaults()
     for key in _ANALYSIS_SETTINGS_KEYS:
         settings_store.save_settings({key: defaults[key]})
     gr.Info("All analysis settings reset to default.")
-    return tuple(gr.update(value=defaults[key]) for key in _ANALYSIS_SETTINGS_KEYS)
+    field_by_input = {"twitch": twitch_source, "video": source_video_path, "youtube": youtube_source}
+    updates = []
+    for key in _ANALYSIS_SETTINGS_KEYS:
+        required_input = _TOGGLE_REQUIRED_INPUT.get(key)
+        if required_input is None:
+            updates.append(gr.update(value=defaults[key]))
+            continue
+        has_input = bool(field_by_input[required_input] and field_by_input[required_input].strip())
+        updates.append(gr.update(interactive=has_input, value=defaults[key] and has_input))
+    return tuple(updates)
 
 
 def do_check_onboarding_visibility():
@@ -1878,25 +1957,36 @@ def build_app() -> gr.Blocks:
             with gr.Group(visible=False) as onboarding_page_2:
                 gr.Markdown(
                     "### Analysis features\n"
-                    "Three independent signals feed into finding clip-worthy moments - turn on "
-                    "whichever you want here. You can change these anytime, per run, from the "
-                    "Sources panel."
+                    "Three independent signals feed into finding clip-worthy moments - each only "
+                    "turns on once you've given it what it needs below. AI Arbitration isn't a "
+                    "signal itself - it's an optional refinement step that judges/titles whatever "
+                    "the signals above find, using a local AI model. You can change all of this "
+                    "anytime, per run, from the Sources panel."
+                )
+                onboarding_chat_checkbox = gr.Checkbox(
+                    label="Enable chat hype detection", value=False,
+                    interactive=False,
+                    info="Finds spikes in Twitch chat activity. Needs a Twitch VOD URL/ID - the "
+                         "app's original, most-proven signal, on by default.",
                 )
                 onboarding_audio_checkbox = gr.Checkbox(
-                    label="Enable audio peak analysis", value=_persisted_setting("audio_enable"),
+                    label="Enable audio peak analysis", value=False,
+                    interactive=False,
                     info="Flags loud moments in the VOD's own audio, independent of chat. "
-                         "Needs the VOD's video file.",
+                         "Needs the local video file.",
                 )
                 onboarding_sound_event_checkbox = gr.Checkbox(
-                    label="Enable sound event detection", value=_persisted_setting("sound_event_enable"),
+                    label="Enable sound event detection", value=False,
+                    interactive=False,
                     info="Detects specific sounds (laughter, screams, etc.) with a local audio "
-                         "classifier. Also needs the video file.",
+                         "classifier. Also needs the local video file.",
                 )
                 onboarding_llm_checkbox = gr.Checkbox(
-                    label="Enable AI Arbitration", value=_persisted_setting("llm_judging_enabled"),
+                    label="Enable AI Arbitration", value=False,
+                    interactive=False,
                     info="Uses a local AI model to filter false positives, tighten clip "
-                         "boundaries, and write titles - set up on the next page. Heavy on the "
-                         "GPU. Optional. Nice to have.",
+                         "boundaries, and write titles - set up on the next page. Needs a "
+                         "subtitle/transcript source. Heavy on the GPU. Optional.",
                 )
             with gr.Group(visible=False) as onboarding_page_3:
                 gr.Markdown(
@@ -1911,9 +2001,10 @@ def build_app() -> gr.Blocks:
             with gr.Group(visible=False) as onboarding_page_4:
                 gr.Markdown(
                     "### You're all set\n"
-                    "Provide a subtitle source and a Twitch VOD URL above, then click "
-                    "**Analyze Stream** to find your first clips. You can reopen this setup "
-                    "anytime from the Ollama settings area below."
+                    "Provide whichever of a Twitch VOD URL, a local video file, or a subtitle "
+                    "source you have below - each toggle above turns on automatically once its "
+                    "input is filled in. Then click **Analyze Stream** to find your first clips. "
+                    "You can reopen this setup anytime from the Ollama settings area below."
                 )
 
             with gr.Row():
@@ -1923,7 +2014,11 @@ def build_app() -> gr.Blocks:
 
         with gr.Accordion("Sources & Settings", open=True):
             gr.Markdown("### Sources")
-            gr.Markdown("Please provide subtitles source AND Twitch VOD URL of the same stream.")
+            gr.Markdown(
+                "Provide whichever of these you have - a local video file, a Twitch VOD URL, or "
+                "a subtitle source - to unlock the matching analysis toggles on the right. At "
+                "least one of the local video file or Twitch VOD URL is needed to analyze anything."
+            )
             with gr.Row():
                 with gr.Column():
                     youtube_input = gr.Textbox(
@@ -1944,17 +2039,26 @@ def build_app() -> gr.Blocks:
                     )
                 with gr.Column():
                     with gr.Group() as analysis_features_group:
+                        # value=False (not _persisted_setting) at build time for all four -
+                        # youtube_input/twitch_input/source_video_input always start blank on
+                        # a fresh page load, so per do_gate_toggle's rule nothing they gate can
+                        # start checked; each flips to its persisted preference automatically
+                        # the moment its own field gets content (typed, loaded, or downloaded).
+                        chat_enable_checkbox = gr.Checkbox(
+                            label="Enable chat hype detection", value=False,
+                            interactive=False, elem_classes=["vb-toggle"],
+                        )
                         audio_enable_checkbox = gr.Checkbox(
-                            label="Enable audio peak analysis", value=_persisted_setting("audio_enable"),
-                            elem_classes=["vb-toggle"],
+                            label="Enable audio peak analysis", value=False,
+                            interactive=False, elem_classes=["vb-toggle"],
                         )
                         sound_event_enable_checkbox = gr.Checkbox(
-                            label="Enable sound event detection", value=_persisted_setting("sound_event_enable"),
-                            elem_classes=["vb-toggle"],
+                            label="Enable sound event detection", value=False,
+                            interactive=False, elem_classes=["vb-toggle"],
                         )
                         llm_judging_enabled_checkbox = gr.Checkbox(
-                            label="Enable AI Arbitration", value=_persisted_setting("llm_judging_enabled"),
-                            elem_classes=["vb-toggle"],
+                            label="Enable AI Arbitration", value=False,
+                            interactive=False, elem_classes=["vb-toggle"],
                         )
                     with gr.Group() as download_vod_group:
                         download_vod_btn = gr.Button("Download VOD")
@@ -2286,7 +2390,8 @@ def build_app() -> gr.Blocks:
             audio_z_threshold_input, audio_allow_new_checkbox,
             sound_event_classes_input, sound_event_confidence_input, sound_event_allow_new_checkbox,
             min_viral_score_input, system_prompt_input,
-            audio_enable_checkbox, sound_event_enable_checkbox, llm_judging_enabled_checkbox, autosave_enabled_checkbox,
+            chat_enable_checkbox, audio_enable_checkbox, sound_event_enable_checkbox,
+            llm_judging_enabled_checkbox, autosave_enabled_checkbox,
         ]
         # Sliders/checkboxes/CheckboxGroup persist on every change (a slider's own
         # change event already only fires on release, not per-pixel-drag); the two
@@ -2299,7 +2404,7 @@ def build_app() -> gr.Blocks:
 
         reset_analysis_settings_btn.click(
             fn=do_reset_analysis_settings,
-            inputs=[],
+            inputs=[twitch_input, source_video_input, youtube_input],
             outputs=_analysis_settings_components,
             api_visibility="private",
         )
@@ -2313,6 +2418,7 @@ def build_app() -> gr.Blocks:
                 min_viral_score_input, content_hint_input, system_prompt_input,
                 llm_model_input, llm_api_base_input,
                 llm_judging_enabled_checkbox,
+                chat_enable_checkbox,
                 audio_enable_checkbox, audio_z_threshold_input, audio_allow_new_checkbox,
                 sound_event_enable_checkbox, sound_event_classes_input,
                 sound_event_confidence_input, sound_event_allow_new_checkbox,
@@ -2493,6 +2599,16 @@ def build_app() -> gr.Blocks:
             outputs=[],
             api_visibility="private",
         )
+        onboarding_chat_checkbox.change(
+            fn=_sync_paired_field_if_different,
+            inputs=[onboarding_chat_checkbox, chat_enable_checkbox], outputs=[chat_enable_checkbox],
+            api_visibility="private",
+        )
+        chat_enable_checkbox.change(
+            fn=_sync_paired_field_if_different,
+            inputs=[chat_enable_checkbox, onboarding_chat_checkbox], outputs=[onboarding_chat_checkbox],
+            api_visibility="private",
+        )
         onboarding_audio_checkbox.change(
             fn=_sync_paired_field_if_different,
             inputs=[onboarding_audio_checkbox, audio_enable_checkbox], outputs=[audio_enable_checkbox],
@@ -2523,6 +2639,46 @@ def build_app() -> gr.Blocks:
             inputs=[llm_judging_enabled_checkbox, onboarding_llm_checkbox], outputs=[onboarding_llm_checkbox],
             api_visibility="private",
         )
+
+        # Each of the four analysis toggles only becomes checkable once its own required
+        # input has content - "can't even be turned on without what it needs" rather than
+        # "errors when you hit Analyze". Two separate registrations per field (one per
+        # output) rather than one returning the same gr.update() twice - see
+        # do_browse_downloads_dir_synced's docstring for why that specific shortcut silently
+        # drops the second output.
+        twitch_input.change(
+            fn=do_gate_toggle("chat_enable"), inputs=[twitch_input], outputs=[chat_enable_checkbox],
+            api_visibility="private",
+        )
+        twitch_input.change(
+            fn=do_gate_toggle("chat_enable"), inputs=[twitch_input], outputs=[onboarding_chat_checkbox],
+            api_visibility="private",
+        )
+        source_video_input.change(
+            fn=do_gate_toggle("audio_enable"), inputs=[source_video_input], outputs=[audio_enable_checkbox],
+            api_visibility="private",
+        )
+        source_video_input.change(
+            fn=do_gate_toggle("audio_enable"), inputs=[source_video_input], outputs=[onboarding_audio_checkbox],
+            api_visibility="private",
+        )
+        source_video_input.change(
+            fn=do_gate_toggle("sound_event_enable"), inputs=[source_video_input], outputs=[sound_event_enable_checkbox],
+            api_visibility="private",
+        )
+        source_video_input.change(
+            fn=do_gate_toggle("sound_event_enable"), inputs=[source_video_input], outputs=[onboarding_sound_event_checkbox],
+            api_visibility="private",
+        )
+        youtube_input.change(
+            fn=do_gate_toggle("llm_judging_enabled"), inputs=[youtube_input], outputs=[llm_judging_enabled_checkbox],
+            api_visibility="private",
+        )
+        youtube_input.change(
+            fn=do_gate_toggle("llm_judging_enabled"), inputs=[youtube_input], outputs=[onboarding_llm_checkbox],
+            api_visibility="private",
+        )
+
         onboarding_open_ollama_btn.click(
             fn=lambda: gr.update(open=True),
             inputs=[],
