@@ -361,6 +361,21 @@ class WhisperConfig:
     extraction_timeout_s: int = 1800
     cache_enabled: bool = True
 
+    # How many tokens of the previous window's transcript to prompt the next window
+    # with. whisper-cli's own default is -1 (unlimited), which on multi-hour audio is a
+    # trap: once the model hallucinates a caption, that caption is fed back in as the
+    # next prompt and it can lock into a repetition loop it never escapes. Measured on
+    # a real 5.5-hour VOD, unlimited context produced 2479 consecutive identical cues
+    # from the 4-hour mark to the end - 83 minutes, 27% of the transcript, destroyed.
+    # With 0 the same audio yields no loop at all and 37% MORE transcribed text overall
+    # (266k vs 194k characters), because none of it is lost to the loop.
+    #
+    # Cross-window coherence is what's given up, and it's close to worthless here:
+    # nothing downstream reads the transcript as continuous narrative -
+    # core.llm_agent's select_subtitle_window only ever pulls a short window around
+    # one candidate. Set WHISPER_MAX_CONTEXT=-1 for upstream's default.
+    max_context: int = int(os.getenv("WHISPER_MAX_CONTEXT", "0"))
+
     def validate(self) -> List[str]:
         """Binary-only, matching BinaryConfig's scope - see the class docstring for
         why model presence isn't checked here."""
