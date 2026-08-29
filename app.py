@@ -169,12 +169,51 @@ def _build_skyline_anchors(timeline_df: pd.DataFrame, candidates: List[ClipCandi
     return list(xs), list(ys)
 
 
+def _build_points_only_figure(candidates: List[ClipCandidate]) -> go.Figure:
+    """
+    Fallback for when there's no continuous timeline at all (no chat, no audio) but
+    real candidates still exist - in practice this only happens for sound-event-only
+    runs, since a YAMNet confidence score is a per-event [0, 1] value, not an energy
+    curve sampled continuously over time the way chat volume or audio RMS is. Rather
+    than inventing a fake curve to plot, this draws a plain flat baseline with one
+    marker per candidate at its own spike_time - the point is WHEN something
+    happened, not how strongly, so no y-axis magnitude is shown at all.
+    """
+    fig = go.Figure()
+    spike_times = [c.spike_time for c in candidates]
+    span = max(spike_times) - min(spike_times)
+    pad = max(span * 0.05, 5.0)
+    fig.add_trace(go.Scatter(
+        x=[min(spike_times) - pad, max(spike_times) + pad], y=[0, 0],
+        mode="lines", name="Timeline", line=dict(color="#52525b", width=1.5), hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=spike_times, y=[0] * len(candidates),
+        mode="markers", name="Sound event",
+        marker=dict(color="#c084fc", size=12, symbol="star"),
+        text=[", ".join(c.sound_events.keys()) or "sound event" for c in candidates],
+        hovertemplate="%{text}<br>t=%{x:.0f}s<extra></extra>",
+    ))
+    for c in candidates:
+        fig.add_vrect(x0=c.window_start, x1=c.window_end, fillcolor="#ff4d6d", opacity=0.08, line_width=0)
+    fig.update_layout(
+        title="Detected Moments (no continuous timeline available for this signal)",
+        xaxis_title="Stream time (s)",
+        yaxis=dict(visible=False, range=[-0.3, 1]),
+        template="plotly_dark",
+        height=380,
+        margin=dict(l=40, r=60, t=50, b=40),
+        showlegend=False,
+    )
+    return fig
+
+
 def build_hype_timeline_figure(
     timeline_df: pd.DataFrame,
     candidates: List[ClipCandidate],
     audio_timeline_df: Optional[pd.DataFrame] = None,
     audio_candidates: Optional[List[ClipCandidate]] = None,
-    empty_message: str = "No chat data yet - run an analysis to populate this graph.",
+    empty_message: str = "No timeline data yet - run an analysis, or check that at least one signal found something.",
 ) -> go.Figure:
     """
     `candidates` is the final, post-merge list (chat/audio/sound_event tags mixed
@@ -190,29 +229,48 @@ def build_hype_timeline_figure(
     match on the whole (growing) set of possible source strings - a candidate
     tagged "chat+audio+sound_event" is still fundamentally a chat candidate for
     plotting purposes, just one every detector agrees on.
+
+    Chat is the primary (left) axis whenever it has data, matching its historical
+    role as the app's original signal - audio, when present, overlays on a
+    secondary axis. With chat toggled off (or just producing nothing), audio becomes
+    the ONLY axis instead of a plot with nothing to overlay onto. With NEITHER chat
+    nor audio producing a continuous timeline (a sound-event-only run - YAMNet
+    confidence is a per-event value, not a curve sampled over time), falls back
+    further to _build_points_only_figure: a flat baseline with a marker per
+    candidate, showing only when things happened, not a fabricated magnitude for a
+    signal that was never continuous to begin with. empty_message is the last
+    resort, for when there's truly nothing - not even candidates - to show.
     """
     fig = go.Figure()
-    if timeline_df.empty:
+    chat_has_data = not timeline_df.empty
+    audio_has_data = audio_timeline_df is not None and not audio_timeline_df.empty
+    if not chat_has_data and not audio_has_data:
+        if candidates:
+            return _build_points_only_figure(candidates)
         fig.update_layout(title=empty_message, template="plotly_dark")
         return fig
 
     def tags(c: ClipCandidate) -> List[str]:
         return c.source.split("+")
 
-    chat_line_candidates = [c for c in candidates if "chat" in tags(c)]
-    xs, ys = _build_skyline_anchors(timeline_df, chat_line_candidates)
+    primary_df = timeline_df if chat_has_data else audio_timeline_df
+    primary_line_candidates = [c for c in candidates if "chat" in tags(c)] if chat_has_data else (audio_candidates or [])
+    xs, ys = _build_skyline_anchors(primary_df, primary_line_candidates)
     fig.add_trace(go.Scatter(
         x=xs, y=ys,
-        mode="lines", name="Hype score", line=dict(color="#7c5cff", width=1.5),
+        mode="lines",
+        name="Hype score" if chat_has_data else "Audio energy",
+        line=dict(color="#7c5cff" if chat_has_data else "#2dd4bf", width=1.5),
     ))
 
     # Marker categories so an operator can tell at a glance which detector(s) flagged a
     # given moment: chat-only (pink circle), chat confirmed by a coincident audio peak
     # (gold circle - same shape, since it IS a chat candidate), audio-only (teal diamond,
-    # plotted against the secondary axis below), and a rare sound-event-only candidate
-    # neither chat nor audio-RMS caught (purple star, plotted on the primary axis using
-    # the chat timeline's own value at that time - its real peak_hype_score is a [0, 1]
-    # model confidence, not a chat-scale number, so it can't be plotted at face value).
+    # plotted against the secondary axis below, or the primary one if chat has no data -
+    # see chat_has_data branches below), and a rare sound-event-only candidate neither
+    # chat nor audio-RMS caught (purple star, plotted using the primary timeline's own
+    # value at that time - its real peak_hype_score is a [0, 1] model confidence, not a
+    # chat/audio-scale number, so it can't be plotted at face value).
     chat_only = [c for c in candidates if "chat" in tags(c) and "audio" not in tags(c)]
     chat_and_audio = [c for c in candidates if "chat" in tags(c) and "audio" in tags(c)]
     audio_only = [c for c in candidates if "audio" in tags(c) and "chat" not in tags(c)]
@@ -229,10 +287,19 @@ def build_hype_timeline_figure(
             mode="markers", name="Chat+audio confirmed",
             marker=dict(color="#facc15", size=8, symbol="circle"),
         ))
+    if not chat_has_data and audio_only:
+        # No secondary axis to speak of in this state (nothing else to overlay against,
+        # since chat produced nothing) - audio-only candidates plot directly on the
+        # primary (audio) axis instead of waiting for a y2 that's never added below.
+        fig.add_trace(go.Scatter(
+            x=[c.spike_time for c in audio_only], y=[c.peak_hype_score for c in audio_only],
+            mode="markers", name="Audio-only peak",
+            marker=dict(color="#2dd4bf", size=8, symbol="diamond"),
+        ))
     if sound_event_only:
         fig.add_trace(go.Scatter(
             x=[c.spike_time for c in sound_event_only],
-            y=[_nearest_rolling_mean(timeline_df, c.spike_time) for c in sound_event_only],
+            y=[_nearest_rolling_mean(primary_df, c.spike_time) for c in sound_event_only],
             mode="markers", name="Sound event (unconfirmed)",
             marker=dict(color="#c084fc", size=9, symbol="star"),
         ))
@@ -244,9 +311,13 @@ def build_hype_timeline_figure(
     # existing marker flags this without inventing a new category per combination (chat+
     # event, audio+event, chat+audio+event, ...). Split by axis for the same reason the
     # primary marker groups are: a chat-tagged candidate's peak_hype_score is only valid
-    # on the primary axis, an audio-only one only on the secondary.
+    # on the primary axis, an audio-only one only on the secondary - unless chat has no
+    # data at all, in which case there's no secondary axis and everything collapses onto
+    # the one (audio) axis that exists.
     primary_axis_events = [c for c in candidates if c.sound_events and "chat" in tags(c)]
     secondary_axis_events = [c for c in candidates if c.sound_events and "audio" in tags(c) and "chat" not in tags(c)]
+    if not chat_has_data:
+        primary_axis_events, secondary_axis_events = primary_axis_events + secondary_axis_events, []
     if primary_axis_events:
         fig.add_trace(go.Scatter(
             x=[c.spike_time for c in primary_axis_events], y=[c.peak_hype_score for c in primary_axis_events],
@@ -255,16 +326,16 @@ def build_hype_timeline_figure(
         ))
 
     layout_kwargs = dict(
-        title="Chat Hype Timeline",
+        title="Chat Hype Timeline" if chat_has_data else "Audio Energy Timeline",
         xaxis_title="Stream time (s)",
-        yaxis_title="Hype score",
+        yaxis_title="Hype score" if chat_has_data else "Audio RMS energy",
         template="plotly_dark",
         height=380,
         margin=dict(l=40, r=60, t=50, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
 
-    if audio_timeline_df is not None and not audio_timeline_df.empty:
+    if chat_has_data and audio_has_data:
         audio_xs, audio_ys = _build_skyline_anchors(audio_timeline_df, audio_candidates or [])
         fig.add_trace(go.Scatter(
             x=audio_xs, y=audio_ys, yaxis="y2",
@@ -1139,14 +1210,11 @@ def run_pipeline(
     kept_count = len(refined_clips) - rejected_count
 
     progress(1.0, desc="Done")
-    fig = build_hype_timeline_figure(
-        timeline_df, candidates, audio_timeline_df, audio_candidates,
-        empty_message=(
-            "Chat hype detection is off - no chat timeline to show."
-            if not chat_enable else
-            "No chat data yet - run an analysis to populate this graph."
-        ),
-    )
+    # No per-case message needed here anymore - build_hype_timeline_figure now shows
+    # the audio timeline whenever chat has none, so its default empty_message only
+    # ever surfaces in the genuinely-nothing-to-show case (every enabled signal
+    # found nothing, or none were enabled at all).
+    fig = build_hype_timeline_figure(timeline_df, candidates, audio_timeline_df, audio_candidates)
     audio_note = ""
     if audio_enable:
         audio_only_count = sum(1 for c in refined_clips if "audio" in c.source.split("+") and "chat" not in c.source.split("+"))
