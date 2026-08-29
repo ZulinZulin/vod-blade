@@ -522,6 +522,28 @@ gradio-app {
     }
 }
 
+/* Onboarding's "which signal needs what" reference table - centered and in the app's
+   own pink rather than Gradio's default plain/left-aligned table styling, so it reads
+   as a deliberate, polished reference rather than an afterthought. */
+.vb-onboarding-table table {
+    margin: 0 auto;
+    border-collapse: collapse;
+    border: 2px solid var(--border-color-accent);
+    border-radius: var(--radius-lg, 8px);
+    overflow: hidden;
+}
+.vb-onboarding-table th,
+.vb-onboarding-table td {
+    border: 2px solid var(--border-color-accent);
+    padding: 8px 14px;
+    text-align: center;
+}
+.vb-onboarding-table th {
+    background: color-mix(in srgb, var(--border-color-accent) 25%, transparent);
+    color: var(--border-color-accent);
+    font-weight: 800;
+}
+
 /* "Still working" spinner for VOD downloads - TwitchDownloaderCLI's own output isn't
    currently parsed for a real percentage, and a download can run for many minutes
    with the status text otherwise sitting completely static the whole time, which

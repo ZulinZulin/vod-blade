@@ -2155,38 +2155,25 @@ def build_app() -> gr.Blocks:
                 )
                 onboarding_browse_btn = gr.Button("Browse...", size="sm")
             with gr.Group(visible=False) as onboarding_page_2:
+                # Deliberately no checkboxes here (there used to be four, always disabled -
+                # nothing during onboarding has provided the inputs that would unlock them
+                # yet, so a disabled checkbox was a false affordance: it looks clickable, it
+                # isn't, and no caveat text fully fixes that). A plain reference table asks
+                # nothing of the user and implies nothing false about what's clickable right
+                # now - see the "let's rethink onboarding" design discussion this came from.
                 gr.Markdown(
                     "### Analysis features\n"
-                    "Three independent signals feed into finding clip-worthy moments - each only "
-                    "turns on once you've given it what it needs below. AI Arbitration isn't a "
-                    "signal itself - it's an optional refinement step that judges/titles whatever "
-                    "the signals above find, using a local AI model. You can change all of this "
-                    "anytime, per run, from the Sources panel."
-                )
-                onboarding_chat_checkbox = gr.Checkbox(
-                    label="Enable chat hype detection", value=False,
-                    interactive=False,
-                    info="Finds spikes in Twitch chat activity. Needs a Twitch VOD URL/ID - the "
-                         "app's original, most-proven signal, on by default.",
-                )
-                onboarding_audio_checkbox = gr.Checkbox(
-                    label="Enable audio peak analysis", value=False,
-                    interactive=False,
-                    info="Flags loud moments in the VOD's own audio, independent of chat. "
-                         "Needs the local video file.",
-                )
-                onboarding_sound_event_checkbox = gr.Checkbox(
-                    label="Enable sound event detection", value=False,
-                    interactive=False,
-                    info="Detects specific sounds (laughter, screams, etc.) with a local audio "
-                         "classifier. Also needs the local video file.",
-                )
-                onboarding_llm_checkbox = gr.Checkbox(
-                    label="Enable AI Arbitration", value=False,
-                    interactive=False,
-                    info="Uses a local AI model to filter false positives, tighten clip "
-                         "boundaries, and write titles - set up on the next page. Needs a "
-                         "subtitle/transcript source. Heavy on the GPU. Optional.",
+                    "Four independent signals feed into finding clip-worthy moments - each one "
+                    "turns on by itself once it has what it needs. You'll fill these in on the "
+                    "Sources panel once you're ready to analyze a real stream.\n\n"
+                    "| Signal | Receiver |\n"
+                    "|---|---|\n"
+                    "| Chat hype detection | A Twitch VOD URL |\n"
+                    "| Audio peak analysis | A local video file |\n"
+                    "| Sound event detection | A local video file |\n"
+                    "| AI Arbitration (refines & titles the results - not a signal itself) | "
+                    "A transcript - from YouTube, generated locally, or a file |",
+                    elem_classes=["vb-onboarding-table"],
                 )
             with gr.Group(visible=False) as onboarding_page_3:
                 gr.Markdown(
@@ -2879,59 +2866,15 @@ def build_app() -> gr.Blocks:
             outputs=[],
             api_visibility="private",
         )
-        onboarding_chat_checkbox.change(
-            fn=_sync_paired_field_if_different,
-            inputs=[onboarding_chat_checkbox, chat_enable_checkbox], outputs=[chat_enable_checkbox],
-            api_visibility="private",
-        )
-        chat_enable_checkbox.change(
-            fn=_sync_paired_field_if_different,
-            inputs=[chat_enable_checkbox, onboarding_chat_checkbox], outputs=[onboarding_chat_checkbox],
-            api_visibility="private",
-        )
-        onboarding_audio_checkbox.change(
-            fn=_sync_paired_field_if_different,
-            inputs=[onboarding_audio_checkbox, audio_enable_checkbox], outputs=[audio_enable_checkbox],
-            api_visibility="private",
-        )
-        audio_enable_checkbox.change(
-            fn=_sync_paired_field_if_different,
-            inputs=[audio_enable_checkbox, onboarding_audio_checkbox], outputs=[onboarding_audio_checkbox],
-            api_visibility="private",
-        )
-        onboarding_sound_event_checkbox.change(
-            fn=_sync_paired_field_if_different,
-            inputs=[onboarding_sound_event_checkbox, sound_event_enable_checkbox], outputs=[sound_event_enable_checkbox],
-            api_visibility="private",
-        )
-        sound_event_enable_checkbox.change(
-            fn=_sync_paired_field_if_different,
-            inputs=[sound_event_enable_checkbox, onboarding_sound_event_checkbox], outputs=[onboarding_sound_event_checkbox],
-            api_visibility="private",
-        )
-        onboarding_llm_checkbox.change(
-            fn=_sync_paired_field_if_different,
-            inputs=[onboarding_llm_checkbox, llm_judging_enabled_checkbox], outputs=[llm_judging_enabled_checkbox],
-            api_visibility="private",
-        )
-        llm_judging_enabled_checkbox.change(
-            fn=_sync_paired_field_if_different,
-            inputs=[llm_judging_enabled_checkbox, onboarding_llm_checkbox], outputs=[onboarding_llm_checkbox],
-            api_visibility="private",
-        )
 
         # Each of the four analysis toggles only becomes checkable once its own required
         # input has content - "can't even be turned on without what it needs" rather than
-        # "errors when you hit Analyze". Two separate registrations per field (one per
-        # output) rather than one returning the same gr.update() twice - see
-        # do_browse_downloads_dir_synced's docstring for why that specific shortcut silently
-        # drops the second output.
+        # "errors when you hit Analyze". These are main-panel-only now - the onboarding
+        # wizard dropped its own copies of these toggles entirely (see onboarding_page_2's
+        # comment) rather than showing four permanently-disabled checkboxes with nothing
+        # yet able to unlock them.
         twitch_input.change(
             fn=do_gate_toggle("chat_enable"), inputs=[twitch_input], outputs=[chat_enable_checkbox],
-            api_visibility="private",
-        )
-        twitch_input.change(
-            fn=do_gate_toggle("chat_enable"), inputs=[twitch_input], outputs=[onboarding_chat_checkbox],
             api_visibility="private",
         )
         source_video_input.change(
@@ -2939,23 +2882,11 @@ def build_app() -> gr.Blocks:
             api_visibility="private",
         )
         source_video_input.change(
-            fn=do_gate_toggle("audio_enable"), inputs=[source_video_input], outputs=[onboarding_audio_checkbox],
-            api_visibility="private",
-        )
-        source_video_input.change(
             fn=do_gate_toggle("sound_event_enable"), inputs=[source_video_input], outputs=[sound_event_enable_checkbox],
-            api_visibility="private",
-        )
-        source_video_input.change(
-            fn=do_gate_toggle("sound_event_enable"), inputs=[source_video_input], outputs=[onboarding_sound_event_checkbox],
             api_visibility="private",
         )
         youtube_input.change(
             fn=do_gate_toggle("llm_judging_enabled"), inputs=[youtube_input], outputs=[llm_judging_enabled_checkbox],
-            api_visibility="private",
-        )
-        youtube_input.change(
-            fn=do_gate_toggle("llm_judging_enabled"), inputs=[youtube_input], outputs=[onboarding_llm_checkbox],
             api_visibility="private",
         )
 
