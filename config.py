@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Final, List, Optional
@@ -54,16 +55,32 @@ def _default_twitch_cli_name() -> str:
 def _default_ffmpeg_binary(name: str) -> str:
     """
     Prefers the packaged release's bundled copy (build_release.ps1 puts a static
-    ffmpeg/ffprobe build in bin/) if it's actually there, falling back to a bare
-    command name for a dev checkout to resolve via PATH - bin/ffmpeg.exe only exists
-    in a packaged build, never in a source checkout. Without this, the bundled copy
-    just sits in bin/ unused: a real bug found via a real Windows Sandbox test, where
-    TwitchDownloaderCLI failed outright with "Unable to find FFmpeg" since Sandbox
-    has no system-wide ffmpeg on PATH and nothing pointed it at the bundled one.
+    ffmpeg/ffprobe build in bin/) if it's actually there; otherwise resolves a
+    system install via shutil.which() (Python's own PATH search) to a real absolute
+    path, rather than handing back a bare command name for the consumer to resolve
+    itself.
+
+    That last part matters more than it looks: TwitchDownloaderCLI's own
+    --ffmpeg-path resolves a non-rooted string via something like .NET's
+    Path.GetFullPath() against its OWN process's working directory, NOT a PATH
+    search - a bare "ffmpeg" silently became the literal, nonexistent path
+    "E:\\StreamCutter\\ffmpeg" and crashed with "the system cannot find the file
+    specified" only at the very end of a real multi-hour VOD download (right after
+    Finalizing Video), despite `where ffmpeg`/shutil.which() finding it just fine
+    from Python. core.fetchers passes this value straight through as --ffmpeg-path,
+    so it has to already be a real, resolvable path by the time it gets there -
+    this project can't assume every consumer does its own PATH search the way
+    Python's subprocess does.
+
+    Falls back to the bare name only if shutil.which() also comes up empty (no
+    ffmpeg anywhere), which is no worse than before and lets TwitchDownloaderCLI's
+    own "Unable to find FFmpeg" error surface as originally intended.
     """
     exe_name = f"{name}.exe" if platform.system() == "Windows" else name
     bundled = BIN_DIR / exe_name
-    return str(bundled) if bundled.exists() else name
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which(name) or name
 
 
 # --------------------------------------------------------------------------- #
