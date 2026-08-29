@@ -98,6 +98,11 @@ def _run_whisper_cli(
         str(binary_path), "-m", str(model_path), "-f", str(wav_path),
         "-l", language, "-t", str(threads), "-osrt", "-of", str(out_prefix),
     ]
+    if settings.whisper.max_context >= 0:
+        # See config.WhisperConfig.max_context - unlimited context (whisper-cli's own
+        # default) let a single hallucinated caption on a real 5.5h VOD self-perpetuate
+        # for 83 minutes straight once triggered.
+        cmd.extend(["-mc", str(settings.whisper.max_context)])
     try:
         # encoding="utf-8" explicitly - whisper-cli emits UTF-8 regardless of the
         # system locale, but text=True alone decodes via Python's platform-default
