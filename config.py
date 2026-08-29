@@ -361,6 +361,35 @@ class WhisperConfig:
     extraction_timeout_s: int = 1800
     cache_enabled: bool = True
 
+    # whisper-cli enables flash attention by default (-fa). On the GPU build that is
+    # the most architecture-sensitive code path in ggml, and on a GPU newer than the
+    # kernels this release compiled for (e.g. Blackwell/sm_120, which runs via PTX JIT
+    # of the compute_90 kernels) it produces numerically wrong results: decoding
+    # collapses into a repetition loop that emits the same hallucinated caption for
+    # hours. Measured on an RTX 5070 Ti - the first hour of a real VOD came back as
+    # 1798/1798 identical "[звук зажимов]" cues with -fa, and 0/1452 with -nfa, on the
+    # same audio and binary. Disabling it costs ~35% of the GPU speedup (7.6x -> 4.9x
+    # vs CPU) and is the difference between a usable transcript and a worthless one.
+    # Only applies to the CUDA build; the CPU build is unaffected either way.
+    # Set WHISPER_FLASH_ATTN=1 to re-enable it if a future build/GPU handles it.
+    flash_attention: bool = os.getenv("WHISPER_FLASH_ATTN", "").strip().lower() in {"1", "true", "yes"}
+
+    # How many tokens of the previous window's transcript to prompt the next window
+    # with. whisper-cli's own default is -1 (unlimited), which on multi-hour audio is a
+    # trap: once the model hallucinates a caption, that caption is fed back in as the
+    # next prompt and it can lock into a repetition loop it never escapes. Measured on
+    # a real 5.5-hour VOD, unlimited context produced 2479 consecutive identical cues
+    # from 04:09 to the end - 83 minutes, 27% of the transcript, destroyed. With 0 the
+    # same audio yields no loop at all and 37% MORE transcribed text overall
+    # (266k vs 194k characters), because none of it is lost to the loop.
+    #
+    # Cross-window coherence is what's given up, and it's close to worthless here:
+    # nothing downstream reads the transcript as continuous narrative - core.llm_agent's
+    # select_subtitle_window only ever pulls a short window around one candidate.
+    # Backend-agnostic (the loop is context accumulation, not GPU maths), so this
+    # applies to the CPU build too. Set WHISPER_MAX_CONTEXT=-1 for upstream's default.
+    max_context: int = int(os.getenv("WHISPER_MAX_CONTEXT", "0"))
+
     def validate(self) -> List[str]:
         """Binary-only, matching BinaryConfig's scope - see the class docstring for
         why model presence isn't checked here."""

@@ -28,6 +28,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import zipfile
 from dataclasses import replace
 from datetime import datetime
 from functools import partial
@@ -39,7 +41,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 
-from config import DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SESSIONS_DIR, settings
+from config import BIN_DIR, DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SESSIONS_DIR, settings
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
@@ -1437,88 +1439,186 @@ def _resolve_whisper_language(language: str) -> str:
     return (language or "").strip() or settings.whisper.default_language
 
 
+# Minimum wall-clock gap between UI updates from a streaming handler. whisper-cli on
+# a GPU emits recognized segments ~8x faster than on CPU, and a multi-hour VOD has tens
+# of thousands of them - without a throttle each one becomes its own Gradio queue
+# message. CPU slowness used to be the only thing rate-limiting this.
+_WHISPER_UI_MIN_INTERVAL_S = 0.5
+
+
+def _whisper_btn(visible: bool):
+    """Always re-asserts interactive=True alongside visibility, so a button disabled
+    during a long install can't stay stuck disabled if anything interrupts the run -
+    every refresh is self-healing."""
+    return gr.update(visible=visible, interactive=True)
+
+
 def do_refresh_whisper_setup(model_name: str):
     """Live status check - re-run every time (page load, Refresh click, or right
     after an install/download/remove finishes) rather than trusting a stored flag,
-    same reasoning as do_refresh_ollama_setup."""
+    same reasoning as do_refresh_ollama_setup. Returns the 9-value shape shared by
+    every handler below; see _whisper_status_outputs for the component order."""
     model_name = _resolve_whisper_model_name(model_name)
-    binary_path = settings.whisper.binary_path
-    state = whisper_setup.detect_state(binary_path, model_name)
+    gpu = whisper_setup.check_gpu_info()
+    cpu_installed = whisper_setup.binary_path_for(whisper_setup.WhisperVariant.CPU).exists()
+    cuda_installed = whisper_setup.binary_path_for(whisper_setup.WhisperVariant.CUDA).exists()
+    state = whisper_setup.detect_state(whisper_setup.active_binary_path(), model_name)
+    on_gpu = whisper_setup.active_variant() is whisper_setup.WhisperVariant.CUDA
+
+    if gpu is None:
+        gpu_line = (
+            "No NVIDIA GPU detected - transcription runs on the CPU. That works fine, "
+            "it's just slower."
+        )
+    elif cuda_installed:
+        gpu_line = f"GPU acceleration installed and active ({gpu['name']})."
+    else:
+        gpu_line = (
+            f"{gpu['name']} detected ({gpu['free_mb'] / 1024:.1f}GB VRAM free). Installing the "
+            "GPU build makes transcription several times faster."
+        )
+
+    # The CUDA install is only ever offered when there's actually an NVIDIA GPU to use
+    # it - a 640MB download that provably cannot work shouldn't be a visible option.
+    show_install_cuda = gpu is not None and not cuda_installed
 
     if state == whisper_setup.WhisperState.BINARY_MISSING:
-        vram_mb = whisper_setup.check_gpu_vram_mb()
-        if vram_mb is None:
-            vram_line = "Couldn't detect your GPU's VRAM - a GPU speeds transcription up but isn't required."
-        else:
-            vram_line = f"Your GPU reports ~{vram_mb / 1024:.1f}GB VRAM - CPU-only transcription still works, just slower."
-        status = f"whisper.cpp isn't installed. {vram_line}"
+        status = f"whisper.cpp isn't installed. {gpu_line}"
         return (
             status, gr.update(visible=False),
-            gr.update(visible=True), gr.update(visible=True, value=vram_line),
-            gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
+            _whisper_btn(True), gr.update(visible=True, value=gpu_line),
+            _whisper_btn(False), _whisper_btn(False), _whisper_btn(cpu_installed),
+            _whisper_btn(show_install_cuda), _whisper_btn(cuda_installed),
         )
+    backend = "GPU" if on_gpu else "CPU"
     if state == whisper_setup.WhisperState.MODEL_MISSING:
-        status = f"whisper.cpp is installed, but the `{model_name}` model isn't downloaded yet."
+        status = (
+            f"whisper.cpp is installed ({backend}), but the `{model_name}` model isn't "
+            "downloaded yet."
+        )
         return (
             status, gr.update(visible=False),
-            gr.update(visible=False), gr.update(visible=False),
-            gr.update(visible=True, value=f"Download {model_name}"), gr.update(visible=False), gr.update(visible=False),
+            _whisper_btn(not cpu_installed), gr.update(visible=True, value=gpu_line),
+            _whisper_btn(True), _whisper_btn(False), _whisper_btn(cpu_installed),
+            _whisper_btn(show_install_cuda), _whisper_btn(cuda_installed),
         )
-    status = f"Local transcription ready - `{model_name}` model found."
+    status = f"Local transcription ready - `{model_name}` model found, running on {backend}."
     return (
         status, gr.update(visible=False),
-        gr.update(visible=False), gr.update(visible=False),
-        gr.update(visible=False), gr.update(visible=True), gr.update(visible=True),
+        _whisper_btn(not cpu_installed), gr.update(visible=True, value=gpu_line),
+        _whisper_btn(False), _whisper_btn(True), _whisper_btn(cpu_installed),
+        _whisper_btn(show_install_cuda), _whisper_btn(cuda_installed),
     )
 
 
 # Same reasoning as _NO_OP_STATUS_TAIL above: during a long-running step only
 # progress_md changes, and the final yield re-runs the live status check.
-_WHISPER_NO_OP_STATUS_TAIL = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
+_WHISPER_NO_OP_STATUS_TAIL = tuple(gr.update() for _ in range(7))
 
 
-def do_install_whisper(model_name: str):
-    """Downloads + extracts the whisper.cpp CLI binary. A bug here is never the
-    only path forward - the manual GitHub releases link is always shown alongside
-    this button."""
-    yield ("Downloading whisper.cpp...", gr.update(visible=True), *_WHISPER_NO_OP_STATUS_TAIL)
-    zip_path = Path(tempfile.gettempdir()) / "whisper-cpp-release.zip"
+def _whisper_final_yield(model_name: str):
+    """Re-derives the real post-action state instead of assuming success, and hides the
+    progress line. Indexed rather than name-destructured on purpose: this tuple has
+    grown once already, and a length mismatch here is a runtime Gradio error rather
+    than anything import-time or type-checkable."""
+    final = do_refresh_whisper_setup(model_name)
+    return (final[0], gr.update(visible=False), *final[2:])
+
+
+def _do_install_whisper_variant(model_name: str, variant):
+    """Shared implementation behind both install buttons - the CPU and CUDA builds
+    differ only in which zip is fetched and where it lands."""
+    is_cuda = variant is whisper_setup.WhisperVariant.CUDA
+    label = "the GPU build" if is_cuda else "whisper.cpp"
+    target_dir = whisper_setup.CUDA_BIN_DIR if is_cuda else BIN_DIR
+    dl_mb = whisper_setup._VARIANT_DOWNLOAD_MB[variant]
+    ex_mb = whisper_setup._VARIANT_EXTRACTED_MB[variant]
+
+    # Preflight both volumes before committing to a long download. The zip and the
+    # extracted files can land on different drives, so one check isn't enough.
+    zip_path = Path(tempfile.gettempdir()) / f"whisper-{'cuda' if is_cuda else 'cpu'}-release.zip"
+    for probe, need_mb, what in ((zip_path, dl_mb, "temp folder"), (target_dir, ex_mb, "app folder")):
+        if not whisper_setup.has_free_space(probe, need_mb * 1024 * 1024):
+            yield (
+                f"Not enough free disk space in your {what} - {label} needs about {need_mb}MB there.",
+                gr.update(visible=False), *_WHISPER_NO_OP_STATUS_TAIL,
+            )
+            return
+
+    yield (f"Downloading {label}...", gr.update(visible=True), *_WHISPER_NO_OP_STATUS_TAIL)
     try:
-        for progress in whisper_setup.download_whisper_release_zip(zip_path):
+        last = 0.0
+        for progress in whisper_setup.download_whisper_release_zip(zip_path, variant):
+            now = time.monotonic()
+            if now - last < _WHISPER_UI_MIN_INTERVAL_S:
+                continue
+            last = now
             percent = progress.get("percent")
             text = (
-                f"Downloading whisper.cpp... {percent:.0f}%" if percent is not None
-                else f"Downloading whisper.cpp... {progress['downloaded_mb']:.0f}MB"
+                f"Downloading {label}... {percent:.0f}% of ~{dl_mb}MB" if percent is not None
+                else f"Downloading {label}... {progress['downloaded_mb']:.0f}MB"
             )
             yield (text, gr.update(visible=True, value=text), *_WHISPER_NO_OP_STATUS_TAIL)
 
-        yield ("Extracting whisper.cpp...", gr.update(visible=True, value="Extracting whisper.cpp..."), *_WHISPER_NO_OP_STATUS_TAIL)
-        whisper_setup.install_whisper_binary(zip_path)
-    except (requests.exceptions.RequestException, whisper_setup.WhisperSetupError) as exc:
-        yield (f"Install failed: {exc}. Try the manual link below instead.", gr.update(visible=False), *_WHISPER_NO_OP_STATUS_TAIL)
+        last = 0.0
+        for progress in whisper_setup.install_whisper_binary_streaming(zip_path, target_dir):
+            if progress.get("done"):
+                break
+            now = time.monotonic()
+            if now - last < _WHISPER_UI_MIN_INTERVAL_S:
+                continue
+            last = now
+            text = f"Extracting {label}... {progress['percent']:.0f}% ({progress['name']})"
+            yield (text, gr.update(visible=True, value=text), *_WHISPER_NO_OP_STATUS_TAIL)
+    except (
+        requests.exceptions.RequestException,
+        whisper_setup.WhisperSetupError,
+        zipfile.BadZipFile,   # truncated/corrupt download - realistic at 640MB
+        OSError,              # disk full mid-extract, read-only target
+    ) as exc:
+        yield (
+            f"Install failed: {exc}. Try the manual link below instead.",
+            gr.update(visible=False), *_WHISPER_NO_OP_STATUS_TAIL,
+        )
         return
+    finally:
+        # 640MB is far too much to leave lying in %TEMP% either way.
+        zip_path.unlink(missing_ok=True)
 
-    status, _, install_btn, vram_md, download_btn, remove_btn, remove_bin_btn = do_refresh_whisper_setup(model_name)
-    yield (status, gr.update(visible=False), install_btn, vram_md, download_btn, remove_btn, remove_bin_btn)
+    yield _whisper_final_yield(model_name)
+
+
+def do_install_whisper(model_name: str):
+    """Downloads + extracts the CPU whisper.cpp build. A bug here is never the only
+    path forward - the manual GitHub releases link is always shown alongside."""
+    yield from _do_install_whisper_variant(model_name, whisper_setup.WhisperVariant.CPU)
+
+
+def do_install_whisper_cuda(model_name: str):
+    yield from _do_install_whisper_variant(model_name, whisper_setup.WhisperVariant.CUDA)
 
 
 def do_download_whisper_model(model_name: str):
     model_name = _resolve_whisper_model_name(model_name)
     yield (f"Downloading {model_name}...", gr.update(visible=True), *_WHISPER_NO_OP_STATUS_TAIL)
     try:
+        last = 0.0
         for progress in whisper_setup.download_model(model_name, whisper_setup.model_path_for(model_name)):
+            now = time.monotonic()
+            if now - last < _WHISPER_UI_MIN_INTERVAL_S:
+                continue
+            last = now
             percent = progress.get("percent")
             text = (
                 f"Downloading {model_name}... {percent:.0f}%" if percent is not None
                 else f"Downloading {model_name}... {progress['downloaded_mb']:.0f}MB"
             )
             yield (text, gr.update(visible=True, value=text), *_WHISPER_NO_OP_STATUS_TAIL)
-    except requests.exceptions.RequestException as exc:
+    except (requests.exceptions.RequestException, OSError) as exc:
         yield (f"Download failed: {exc}", gr.update(visible=False), *_WHISPER_NO_OP_STATUS_TAIL)
         return
 
-    status, _, install_btn, vram_md, download_btn, remove_btn, remove_bin_btn = do_refresh_whisper_setup(model_name)
-    yield (status, gr.update(visible=False), install_btn, vram_md, download_btn, remove_btn, remove_bin_btn)
+    yield _whisper_final_yield(model_name)
 
 
 def do_remove_whisper_model(model_name: str):
@@ -1528,7 +1628,12 @@ def do_remove_whisper_model(model_name: str):
 
 
 def do_remove_whisper_binary(model_name: str):
-    whisper_setup.remove_binary(settings.whisper.binary_path)
+    whisper_setup.remove_variant(whisper_setup.WhisperVariant.CPU)
+    return do_refresh_whisper_setup(model_name)
+
+
+def do_remove_whisper_cuda(model_name: str):
+    whisper_setup.remove_variant(whisper_setup.WhisperVariant.CUDA)
     return do_refresh_whisper_setup(model_name)
 
 
@@ -1621,7 +1726,7 @@ def do_generate_transcript_locally(source_video_path: str, model_name: str, lang
         )
     model_name = _resolve_whisper_model_name(model_name)
     language = _resolve_whisper_language(language)
-    state = whisper_setup.detect_state(settings.whisper.binary_path, model_name)
+    state = whisper_setup.detect_state(whisper_setup.active_binary_path(), model_name)
     if state != whisper_setup.WhisperState.READY:
         raise gr.Error(
             "Local transcription isn't set up yet - open 'Local transcription settings' below "
@@ -1637,14 +1742,27 @@ def do_generate_transcript_locally(source_video_path: str, model_name: str, lang
 
     srt_path = None
     try:
+        # Throttled: whisper-cli emits one line per recognized segment, and on a GPU
+        # those arrive ~8x faster than the CPU pace this was originally written
+        # against - on a multi-hour VOD that's tens of thousands of Gradio queue
+        # messages. The backend-report lines from core.transcriber are always let
+        # through, since "Running on GPU (CUDA0)." is the one status here that
+        # actually tells the user something they can't infer from anything else.
+        last = 0.0
         for progress in transcribe_locally(
             source_video_path, whisper_setup.model_path_for(model_name), language=language,
         ):
             if progress.get("done"):
                 srt_path = progress["srt_path"]
                 break
+            status = progress.get("status", "")
+            important = status.startswith(("Running on", "Ran on", "Extracting", "Transcribing"))
+            now = time.monotonic()
+            if not important and now - last < _WHISPER_UI_MIN_INTERVAL_S:
+                continue
+            last = now
             yield (
-                f"Transcribing locally... {progress.get('status', '')}",
+                f"Transcribing locally... {status}",
                 gr.update(interactive=False),
                 gr.update(),
                 gr.update(value='<span class="vb-spinner"></span>', visible=True),
@@ -2438,6 +2556,20 @@ def build_app() -> gr.Blocks:
                     whisper_remove_model_btn = gr.Button("Remove downloaded model", visible=False, size="sm")
                     whisper_remove_binary_btn = gr.Button("Remove whisper.cpp", visible=False, size="sm", variant="stop")
                     whisper_refresh_btn = gr.Button("Refresh", size="sm")
+                with gr.Row():
+                    whisper_install_cuda_btn = gr.Button(
+                        "Install GPU acceleration (NVIDIA)", visible=False, size="sm", variant="primary",
+                    )
+                    whisper_remove_cuda_btn = gr.Button(
+                        "Remove GPU acceleration", visible=False, size="sm", variant="stop",
+                    )
+                gr.Markdown(
+                    "_GPU acceleration is a ~640MB download (~1.1GB on disk) and makes "
+                    "transcription several times faster. The very first transcription after "
+                    "installing it can take a few extra minutes while your graphics driver "
+                    "compiles kernels for your specific GPU - that's one-time, and it repeats "
+                    "only after a driver update. Everything keeps working on the CPU without it._"
+                )
                 gr.Markdown(_WHISPER_MANUAL_FALLBACK_MD)
 
             with gr.Accordion("DaVinci Resolve settings", open=False):
@@ -2820,9 +2952,12 @@ def build_app() -> gr.Blocks:
             outputs=_ollama_status_outputs,
             api_visibility="private",
         )
+        # Order matters - every whisper handler returns a tuple in exactly this shape.
+        # See _whisper_final_yield for why they index rather than name-destructure it.
         _whisper_status_outputs = [
             whisper_status_md, whisper_progress_md, whisper_install_btn,
             whisper_vram_md, whisper_download_model_btn, whisper_remove_model_btn, whisper_remove_binary_btn,
+            whisper_install_cuda_btn, whisper_remove_cuda_btn,
         ]
         whisper_refresh_btn.click(
             fn=do_refresh_whisper_setup,
@@ -2850,6 +2985,18 @@ def build_app() -> gr.Blocks:
         )
         whisper_remove_binary_btn.click(
             fn=do_remove_whisper_binary,
+            inputs=[whisper_model_dropdown],
+            outputs=_whisper_status_outputs,
+            api_visibility="private",
+        )
+        whisper_install_cuda_btn.click(
+            fn=do_install_whisper_cuda,
+            inputs=[whisper_model_dropdown],
+            outputs=_whisper_status_outputs,
+            api_visibility="private",
+        )
+        whisper_remove_cuda_btn.click(
+            fn=do_remove_whisper_cuda,
             inputs=[whisper_model_dropdown],
             outputs=_whisper_status_outputs,
             api_visibility="private",
