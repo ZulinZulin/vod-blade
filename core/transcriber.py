@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from config import CACHE_DIR, settings
+from core import whisper_setup
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,20 @@ _DLL_LOAD_FAILURE_HINT = (
     " This often means the Microsoft Visual C++ Redistributable isn't installed - "
     "get it from https://aka.ms/vs/17/release/vc_redist.x64.exe and try again."
 )
+_CUDA_FAILURE_HINT = (
+    " This looks like a GPU/CUDA problem rather than a problem with the audio. Your GPU "
+    "may be too new or too old for this whisper.cpp build's compiled kernels. Remove the "
+    "GPU build from 'Local transcription settings' to fall back to the CPU one, which "
+    "works on any machine."
+)
+# Markers whisper.cpp prints on stdout/stderr that prove which backend is really in use.
+# Necessary because the releases are built with GGML_BACKEND_DL=ON: a ggml-cuda.dll that
+# fails to load is logged and swallowed, and the run silently continues on CPU. So
+# "the CUDA build is installed" and "the CUDA build is being used" are different claims,
+# and only the second one matters. _CUDA_ACTIVE_MARKER is the strong one - it means the
+# model weights were actually allocated in a CUDA buffer, not merely that a DLL loaded.
+_CUDA_ACTIVE_MARKER = "CUDA0 total size"
+_CUDA_LOADED_MARKER = "loaded CUDA backend"
 # Windows process-crash-style exit codes (STATUS_DLL_NOT_FOUND and friends show up
 # as large/negative returncodes, not a clean nonzero exit) - worth a specific hint
 # rather than a bare "exited with code -1073741515", the same class of dependency
@@ -51,7 +66,15 @@ def _cache_key(video_path: Path, model_path: Path, language: str) -> str:
     """Mirrors core.audio_analyzer.AudioAnalyzer._cache_path exactly (path + size +
     mtime + the params that change the output) - a different model tier or
     language choice invalidates the cache the same way a different bin_seconds
-    invalidates the RMS cache there."""
+    invalidates the RMS cache there.
+
+    Deliberately does NOT include the backend (CPU vs CUDA). Their transcripts are
+    not byte-identical - autoregressive decoding amplifies floating-point
+    differences, so segment boundaries and the odd word vary - but they're
+    quality-equivalent, so keying on backend would only force an expensive
+    re-transcription every time someone installs or removes the GPU build, buying
+    nothing. Reusing an existing transcript across a variant switch is the
+    desirable behaviour here, not a bug."""
     try:
         stat = video_path.stat()
         identity = f"{video_path.resolve()}|{stat.st_size}|{stat.st_mtime}|{model_path.name}|{language}"
@@ -88,7 +111,7 @@ def _extract_wav(video_path: Path, dest_wav: Path, ffmpeg_binary: str, timeout_s
 
 def _run_whisper_cli(
     wav_path: Path, model_path: Path, out_prefix: Path, language: str,
-    binary_path: Path, threads: int, timeout_s: int,
+    binary_path: Path, threads: int, timeout_s: int, use_gpu: bool = True,
 ) -> Iterator[str]:
     """Yields raw stdout lines as live progress text - whisper-cli prints each
     recognized segment with its timestamp as it transcribes, unlike Ollama's
@@ -98,10 +121,23 @@ def _run_whisper_cli(
         str(binary_path), "-m", str(model_path), "-f", str(wav_path),
         "-l", language, "-t", str(threads), "-osrt", "-of", str(out_prefix),
     ]
+    if not use_gpu:
+        # Works on either build: the CUDA build honours -ng and stays on CPU, and the
+        # CPU build accepts the flag as a no-op. So this is a pure runtime switch,
+        # never a reason to reinstall a different variant.
+        cmd.append("-ng")
+    elif whisper_setup.is_cuda_binary(binary_path) and not settings.whisper.flash_attention:
+        # Not optional in practice - with flash attention on, the GPU build silently
+        # produced an entire hour of one repeated hallucinated caption on real audio
+        # that the CPU transcribed correctly. See config.WhisperConfig.flash_attention
+        # for the measurements. Scoped to the CUDA build and to actual GPU runs, so
+        # the CPU path's behaviour is byte-for-byte unchanged.
+        cmd.append("-nfa")
     if settings.whisper.max_context >= 0:
         # See config.WhisperConfig.max_context - unlimited context (whisper-cli's own
         # default) let a single hallucinated caption on a real 5.5h VOD self-perpetuate
-        # for 83 minutes straight once triggered.
+        # from 04:09 to the end of the file. Applies to both backends: the loop was
+        # reproduced identically on CPU on the same audio, so this isn't a GPU-only fix.
         cmd.extend(["-mc", str(settings.whisper.max_context)])
     try:
         # encoding="utf-8" explicitly - whisper-cli emits UTF-8 regardless of the
@@ -135,7 +171,12 @@ def _run_whisper_cli(
     returncode = proc.wait()
     if returncode != 0:
         tail = "\n".join(lines_tail)
-        hint = _DLL_LOAD_FAILURE_HINT if returncode in _DLL_LOAD_FAILURE_CODES else ""
+        if returncode in _DLL_LOAD_FAILURE_CODES:
+            hint = _DLL_LOAD_FAILURE_HINT
+        elif any(m in tail for m in ("CUDA error", "no kernel image", "cuBLAS", "CUBLAS")):
+            hint = _CUDA_FAILURE_HINT
+        else:
+            hint = ""
         raise TranscriptionError(f"whisper-cli exited with code {returncode}:\n{tail}{hint}")
 
 
@@ -147,6 +188,7 @@ def transcribe_locally(
     ffmpeg_binary: Optional[str] = None,
     threads: Optional[int] = None,
     cache_dir: Path = CACHE_DIR,
+    use_gpu: bool = True,
 ) -> Iterator[dict]:
     """
     Yields {'status': str} progress lines; the final yield is
@@ -154,10 +196,15 @@ def transcribe_locally(
     identity, model, language) - see _cache_key - so re-running the same video/
     model/language combo (e.g. after tweaking analysis settings and re-clicking)
     is instant instead of re-transcribing.
+
+    Which binary runs is resolved by whisper_setup.active_binary_path() (the GPU
+    build if it's installed, else the CPU one) unless a caller passes binary_path
+    explicitly. `use_gpu=False` forces CPU on either build via -ng, without needing
+    a different install.
     """
     cfg = settings.whisper
     language = language or cfg.default_language
-    binary_path = binary_path or cfg.binary_path
+    binary_path = binary_path or whisper_setup.active_binary_path()
     ffmpeg_binary = ffmpeg_binary or settings.export.ffmpeg_binary
     threads = threads or cfg.threads
 
@@ -182,10 +229,21 @@ def transcribe_locally(
 
         yield {"status": "Transcribing..."}
         out_prefix = out_srt.with_suffix("")  # whisper-cli appends .srt itself for -osrt
+        # Report the backend actually in use exactly once, as soon as the output
+        # proves it. See _CUDA_ACTIVE_MARKER: with GGML_BACKEND_DL a failed CUDA load
+        # is swallowed and the run continues on CPU, so without this an unusably slow
+        # "GPU" run looks identical to a working one.
+        backend_reported = False
         for line in _run_whisper_cli(
-            wav_path, model_path, out_prefix, language, binary_path, threads, cfg.transcription_timeout_s,
+            wav_path, model_path, out_prefix, language, binary_path, threads,
+            cfg.transcription_timeout_s, use_gpu=use_gpu,
         ):
+            if not backend_reported and _CUDA_ACTIVE_MARKER in line:
+                backend_reported = True
+                yield {"status": "Running on GPU (CUDA0)."}
             yield {"status": line}
+        if not backend_reported:
+            yield {"status": "Ran on CPU."}
 
         if not out_srt.exists():
             raise TranscriptionError(f"whisper-cli finished but produced no output at '{out_srt}'.")

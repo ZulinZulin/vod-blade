@@ -189,15 +189,20 @@ foreach ($rel in $VendorFiles) {
 # whisper-cli.exe + its DLLs (ggml*.dll, whisper.dll, possibly SDL2.dll depending on
 # build variant) - bundled like ffmpeg (a small binary), NOT the ggml-*.bin model,
 # which follows the Ollama precedent instead (fully opt-in, downloaded from inside
-# the app - see core/whisper_setup.py). Asset name below matches
-# core.whisper_setup._WHISPER_RELEASE_ZIP_URL - keep both in sync, and
-# RE-VERIFY against the current release before relying on this: whisper.cpp's
-# Windows asset naming has changed before (CPU vs CUDA/Vulkan build variants),
-# same caveat the ffmpeg step above already carries for BtbN's layout.
+# the app - see core/whisper_setup.py). The optional GPU (CUDA) build is likewise
+# never bundled: at ~640MB it would more than double this release for a feature most
+# users won't enable, so it's download-on-demand from the app.
+#
+# PINNED TAG, deliberately not /releases/latest - must stay in sync with
+# core.whisper_setup._WHISPER_RELEASE_TAG. The CPU build is baked in here at build
+# time while a CUDA build may be downloaded by the user months later; under "latest"
+# those could be different whisper.cpp versions with incompatible ggml backend ABIs,
+# which (with GGML_BACKEND_DL) is a crash path rather than a cosmetic mismatch.
+$WhisperReleaseTag = "b4938"  # whisper.cpp 1.9.3
 $WhisperZipPath = Join-Path $CacheDir "whisper-bin-x64.zip"
 if (-not (Test-Path $WhisperZipPath)) {
-    Write-Host "[build] Downloading whisper.cpp ..."
-    Invoke-WebRequest -Uri "https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip" -OutFile $WhisperZipPath
+    Write-Host "[build] Downloading whisper.cpp ($WhisperReleaseTag) ..."
+    Invoke-WebRequest -Uri "https://github.com/ggml-org/whisper.cpp/releases/download/$WhisperReleaseTag/whisper-bin-x64.zip" -OutFile $WhisperZipPath
 } else {
     Write-Host "[build] Using cached whisper.cpp zip."
 }
