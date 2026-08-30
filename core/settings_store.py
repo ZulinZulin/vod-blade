@@ -59,6 +59,21 @@ def set_downloads_dir_override(path: Path) -> None:
     save_settings({"downloads_dir": str(path)})
 
 
+def get_cache_dir_override() -> Optional[Path]:
+    """The last user-chosen cache folder, or None if never set/blank. Unlike
+    downloads_dir, this one requires an app restart to take effect - config.py's
+    CACHE_DIR-derived constants (THUMBNAILS_DIR, PREVIEWS_DIR, SCRATCH_DIR, etc.)
+    are computed once at import time and used directly across most of core/,
+    not re-read per call the way DOWNLOADS_DIR is. See config.py's own read of
+    this same key for why it can't just import this function directly."""
+    value = load_settings().get("cache_dir", "")
+    return Path(value) if value and value.strip() else None
+
+
+def set_cache_dir_override(path: Path) -> None:
+    save_settings({"cache_dir": str(path)})
+
+
 def get_resolve_script_api_override() -> str:
     """The last user-entered DaVinci Resolve scripting-API folder override, or ""
     if never set - lets someone running a packaged build (no .env available) fix a

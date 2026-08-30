@@ -10,6 +10,7 @@ model and produces FCPXML-only exports until the user configures more.
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -30,7 +31,36 @@ BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 # folder (small state to %LOCALAPPDATA%, large downloads to a visible user folder)
 # without changing what a dev checkout does by default.
 DATA_DIR: Final[Path] = Path(os.getenv("VOD_BLADE_DATA_DIR", str(BASE_DIR / "data")))
-CACHE_DIR: Final[Path] = DATA_DIR / "cache"
+
+
+def _persisted_setting(key: str) -> Optional[str]:
+    """
+    Reads one key directly from data/settings.json, duplicating
+    core.settings_store's tiny read logic rather than importing it -
+    core.settings_store itself imports DATA_DIR from this module, so importing
+    it back here would be circular. Only needed for settings that must be
+    resolved before the rest of the app (and settings_store) exists yet.
+    """
+    settings_path = DATA_DIR / "settings.json"
+    if not settings_path.exists():
+        return None
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = payload.get(key, "") if isinstance(payload, dict) else ""
+    return value if value and value.strip() else None
+
+
+# Unlike DOWNLOADS_DIR below, there's no live per-call override for this - every
+# CACHE_DIR-derived constant here is a Final computed once at import time and used
+# directly across most of core/ (audio_analyzer, sound_event_classifier, preview,
+# transcriber, whisper_setup, fetchers). Making that live would mean converting all
+# of those into something re-read per call instead, a much bigger change. So a
+# chosen override here only takes effect on the next app restart - the UI says so.
+CACHE_DIR: Final[Path] = Path(
+    os.getenv("VOD_BLADE_CACHE_DIR") or _persisted_setting("cache_dir") or str(DATA_DIR / "cache")
+)
 THUMBNAILS_DIR: Final[Path] = CACHE_DIR / "thumbnails"
 AUDIO_RMS_CACHE_DIR: Final[Path] = CACHE_DIR / "audio_rms"
 SOUND_EVENT_CACHE_DIR: Final[Path] = CACHE_DIR / "sound_events"

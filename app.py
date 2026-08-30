@@ -40,7 +40,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 
-from config import BIN_DIR, DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SCRATCH_DIR, SESSIONS_DIR, settings
+from config import BIN_DIR, CACHE_DIR, DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SCRATCH_DIR, SESSIONS_DIR, settings
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
@@ -1968,6 +1968,57 @@ def do_persist_downloads_dir(downloads_dir: str) -> None:
         settings_store.set_downloads_dir_override(Path(downloads_dir.strip()))
 
 
+def do_browse_cache_dir(current_dir: str):
+    """
+    Same native-picker approach as do_browse_downloads_dir. Unlike that one, this
+    has just a single textbox to update (no wizard/main-page pair to keep in sync),
+    so it builds its own gr.update() directly rather than needing a separate
+    _synced wrapper - returning gr.update() (a no-op) rather than a bare None on
+    cancel, so dismissing the dialog leaves the current value alone instead of
+    blanking the field.
+    """
+    initial_dir = current_dir if current_dir and Path(current_dir).is_dir() else str(CACHE_DIR)
+    try:
+        browse = _browse_folder_windows if platform.system() == "Windows" else _browse_folder_tkinter
+        chosen = browse(initial_dir)
+    except Exception as exc:
+        logger.warning("Folder picker unavailable (%s); type the path in manually instead.", exc)
+        raise gr.Error(f"Couldn't open the folder picker ({exc}). Type the path in manually instead.")
+    return gr.update(value=chosen) if chosen else gr.update()
+
+
+def do_open_cache_folder():
+    """Opens the cache folder in the OS's own file browser - same pattern as
+    do_open_downloads_folder/do_open_logs_folder."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise gr.Error(f"Could not create/access '{CACHE_DIR}': {exc}")
+    system = platform.system()
+    try:
+        if system == "Windows":
+            os.startfile(CACHE_DIR)  # noqa: S606 - opening the app's own cache folder
+        elif system == "Darwin":
+            subprocess.run(["open", str(CACHE_DIR)], check=True)
+        else:
+            subprocess.run(["xdg-open", str(CACHE_DIR)], check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise gr.Error(f"Could not open '{CACHE_DIR}' in the file browser: {exc}")
+
+
+def do_persist_cache_dir(cache_dir: str) -> None:
+    """
+    Unlike do_persist_downloads_dir, this can't take effect immediately - see
+    config.py's own comment on CACHE_DIR for why every cache subfolder is a Final
+    computed once at import time rather than re-read per call. Saved for the next
+    restart to pick up, with an explicit status message so this doesn't look like
+    a no-op or a bug when nothing visibly changes right away.
+    """
+    if cache_dir and cache_dir.strip():
+        settings_store.set_cache_dir_override(Path(cache_dir.strip()))
+        gr.Info("Saved. Restart VOD BLADE for the new cache folder to take effect.")
+
+
 def do_persist_resolve_script_api(path: str) -> None:
     settings_store.set_resolve_script_api_override(path.strip())
 
@@ -2564,6 +2615,16 @@ def build_app() -> gr.Blocks:
                     "re-transcribed automatically the next time it's needed. Downloaded "
                     "VODs are never touched here._"
                 )
+                gr.Markdown("Cache folder **(requires restart to take effect)**")
+                with gr.Row():
+                    cache_dir_input = gr.Textbox(
+                        show_label=False,
+                        value=str(settings_store.get_cache_dir_override() or CACHE_DIR),
+                        scale=4,
+                    )
+                    with gr.Column(scale=1, min_width=160):
+                        browse_cache_dir_btn = gr.Button("Browse...", size="sm")
+                        open_cache_folder_btn = gr.Button("Open Cache Folder", size="sm")
                 with gr.Row():
                     clear_previews_btn = gr.Button("Clear preview clips & thumbnails", size="sm")
                     clear_analysis_btn = gr.Button("Clear analysis cache", size="sm")
@@ -3279,6 +3340,21 @@ def build_app() -> gr.Blocks:
         )
         cache_refresh_btn.click(
             fn=do_refresh_cache_status, inputs=[], outputs=[cache_status_md], api_visibility="private",
+        )
+        browse_cache_dir_btn.click(
+            fn=do_browse_cache_dir, inputs=[cache_dir_input], outputs=[cache_dir_input], api_visibility="private",
+        ).then(
+            # Explicit, rather than relying on .blur() below: a folder chosen via
+            # the picker never actually focuses/blurs the textbox, so without this
+            # a restart-and-forget (pick a folder, restart without clicking back
+            # into the box) would silently never persist - worse here than for
+            # downloads_dir, since the whole point of this field is "change it,
+            # then restart" with no reason to touch the textbox again in between.
+            fn=do_persist_cache_dir, inputs=[cache_dir_input], outputs=[], api_visibility="private",
+        )
+        open_cache_folder_btn.click(fn=do_open_cache_folder, inputs=[], outputs=[], api_visibility="private")
+        cache_dir_input.blur(
+            fn=do_persist_cache_dir, inputs=[cache_dir_input], outputs=[], api_visibility="private",
         )
         clear_previews_btn.click(
             fn=do_clear_previews_cache, inputs=[], outputs=[cache_status_md], api_visibility="private",
