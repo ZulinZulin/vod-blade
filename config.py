@@ -34,6 +34,18 @@ CACHE_DIR: Final[Path] = DATA_DIR / "cache"
 THUMBNAILS_DIR: Final[Path] = CACHE_DIR / "thumbnails"
 AUDIO_RMS_CACHE_DIR: Final[Path] = CACHE_DIR / "audio_rms"
 SOUND_EVENT_CACHE_DIR: Final[Path] = CACHE_DIR / "sound_events"
+# Content-addressed, like THUMBNAILS_DIR - a preview of the same (video, start, end)
+# is free to re-open instead of re-running ffmpeg, which also means a repeat click on
+# an already-previewed clip no longer creates a new file. Deliberately cache-shaped,
+# not scratch-shaped: unlike SCRATCH_DIR below, its whole point is to be reused.
+PREVIEWS_DIR: Final[Path] = CACHE_DIR / "previews"
+# Genuinely disposable intermediates that used to live in the OS temp dir (whisper's
+# extracted WAV, an install's downloaded zip/installer) - never meant to be reused,
+# always deleted by the code that created them once it's done. Moved here (under
+# CACHE_DIR, not %TEMP%) purely so they're visible on the user's own disk and covered
+# by the same future cache-folder override/cleanup UI as everything else, instead of
+# living somewhere the app has no way to point at, show, or clean.
+SCRATCH_DIR: Final[Path] = CACHE_DIR / "scratch"
 DOWNLOADS_DIR: Final[Path] = Path(os.getenv("VOD_BLADE_DOWNLOADS_DIR", str(DATA_DIR / "downloads")))
 EXPORTS_DIR: Final[Path] = DATA_DIR / "exports"
 SESSIONS_DIR: Final[Path] = DATA_DIR / "sessions"
@@ -43,6 +55,7 @@ MODELS_DIR: Final[Path] = BIN_DIR / "models"
 
 for _dir in (
     DATA_DIR, CACHE_DIR, THUMBNAILS_DIR, AUDIO_RMS_CACHE_DIR, SOUND_EVENT_CACHE_DIR,
+    PREVIEWS_DIR, SCRATCH_DIR,
     DOWNLOADS_DIR, EXPORTS_DIR, SESSIONS_DIR, LOGS_DIR, BIN_DIR, MODELS_DIR,
 ):
     _dir.mkdir(parents=True, exist_ok=True)

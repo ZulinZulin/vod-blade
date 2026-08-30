@@ -12,12 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import subprocess
-import tempfile
 from pathlib import Path
 
-from config import ExportConfig, THUMBNAILS_DIR, settings
+from config import ExportConfig, PREVIEWS_DIR, THUMBNAILS_DIR, settings
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +31,20 @@ def extract_preview_clip(
     cfg: ExportConfig = None,
 ) -> Path:
     """
-    Extracts [start_time, end_time] from source_video_path into a temp mp4
-    via ffmpeg stream-copy. This is a fast remux, not a re-encode, so it
-    stays near-instant even on a multi-hour VOD - but stream-copy can only
-    cut at the nearest keyframe, so the actual boundaries may drift a
-    second or two from what was asked. That's fine for a quick preview;
-    the real exports compute frame-accurate boundaries against the
-    original file and are unaffected by this.
+    Extracts [start_time, end_time] from source_video_path into a small mp4 via
+    ffmpeg stream-copy. This is a fast remux, not a re-encode, so it stays
+    near-instant even on a multi-hour VOD - but stream-copy can only cut at the
+    nearest keyframe, so the actual boundaries may drift a second or two from
+    what was asked. That's fine for a quick preview; the real exports compute
+    frame-accurate boundaries against the original file and are unaffected by this.
+
+    Content-addressed and cached under data/cache/previews/ (hash of source path +
+    start + end), same pattern as extract_thumbnail below - re-previewing the exact
+    same range is then free instead of re-running ffmpeg and leaking another
+    same-content file. This used to write a brand-new uniquely-named file to the
+    OS temp dir on every single click with no cleanup at all; this both fixes
+    that leak and gets clip reuse for free by construction, rather than needing
+    to remember to delete the previous one.
     """
     cfg = cfg or settings.export
     source_path = Path(source_video_path) if source_video_path else None
@@ -48,9 +53,12 @@ def extract_preview_clip(
     if end_time <= start_time:
         raise PreviewError(f"Invalid clip range: start={start_time}, end={end_time}")
 
-    out_fd, out_path_str = tempfile.mkstemp(suffix=".mp4", prefix="streamcutter_preview_")
-    os.close(out_fd)
-    out_path = Path(out_path_str)
+    key = hashlib.sha1(
+        f"{source_path.resolve()}|{start_time:.3f}|{end_time:.3f}".encode("utf-8")
+    ).hexdigest()[:16]
+    out_path = PREVIEWS_DIR / f"{key}.mp4"
+    if out_path.exists():
+        return out_path
     duration = end_time - start_time
 
     try:

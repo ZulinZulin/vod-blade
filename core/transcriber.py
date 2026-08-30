@@ -23,12 +23,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Iterator, Optional
 
-from config import CACHE_DIR, settings
+from config import CACHE_DIR, SCRATCH_DIR, settings
 from core import whisper_setup
 
 logger = logging.getLogger(__name__)
@@ -222,7 +221,7 @@ def transcribe_locally(
         yield {"done": True, "srt_path": out_srt}
         return
 
-    wav_path = Path(tempfile.gettempdir()) / f"vodblade_whisper_{_cache_key(path, model_path, language)}.wav"
+    wav_path = SCRATCH_DIR / f"vodblade_whisper_{_cache_key(path, model_path, language)}.wav"
     try:
         yield {"status": "Extracting audio..."}
         _extract_wav(path, wav_path, ffmpeg_binary, cfg.extraction_timeout_s)

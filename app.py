@@ -26,7 +26,6 @@ import platform
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import zipfile
@@ -41,7 +40,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 
-from config import BIN_DIR, DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SESSIONS_DIR, settings
+from config import BIN_DIR, DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SCRATCH_DIR, SESSIONS_DIR, settings
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
@@ -1360,7 +1359,7 @@ def do_install_ollama(model_name: str, api_base: str):
     """Downloads + silently installs Ollama. A bug here is never the only path
     forward - the manual ollama.com link is always shown alongside this button."""
     yield ("Downloading the Ollama installer...", gr.update(visible=True), *_NO_OP_STATUS_TAIL)
-    installer_path = Path(tempfile.gettempdir()) / "OllamaSetup.exe"
+    installer_path = SCRATCH_DIR / "OllamaSetup.exe"
     try:
         for progress in ollama_setup.download_ollama_installer(installer_path):
             percent = progress.get("percent")
@@ -1375,6 +1374,11 @@ def do_install_ollama(model_name: str, api_base: str):
     except (requests.exceptions.RequestException, ollama_setup.OllamaSetupError) as exc:
         yield (f"Install failed: {exc}. Try the manual link below instead.", gr.update(visible=False), *_NO_OP_STATUS_TAIL)
         return
+    finally:
+        # Previously never cleaned up at all - a several-hundred-MB installer left
+        # behind by every single Ollama install, forever. Mirrors the same finally
+        # already used for the whisper.cpp release zip below.
+        installer_path.unlink(missing_ok=True)
 
     status, _, install_btn, vram_md, pull_btn, remove_btn, uninstall_btn = do_refresh_ollama_setup(model_name, api_base)
     yield (status, gr.update(visible=False), install_btn, vram_md, pull_btn, remove_btn, uninstall_btn)
@@ -1536,8 +1540,8 @@ def _do_install_whisper_variant(model_name: str, variant):
 
     # Preflight both volumes before committing to a long download. The zip and the
     # extracted files can land on different drives, so one check isn't enough.
-    zip_path = Path(tempfile.gettempdir()) / f"whisper-{'cuda' if is_cuda else 'cpu'}-release.zip"
-    for probe, need_mb, what in ((zip_path, dl_mb, "temp folder"), (target_dir, ex_mb, "app folder")):
+    zip_path = SCRATCH_DIR / f"whisper-{'cuda' if is_cuda else 'cpu'}-release.zip"
+    for probe, need_mb, what in ((zip_path, dl_mb, "cache folder"), (target_dir, ex_mb, "app folder")):
         if not whisper_setup.has_free_space(probe, need_mb * 1024 * 1024):
             yield (
                 f"Not enough free disk space in your {what} - {label} needs about {need_mb}MB there.",
@@ -1582,7 +1586,7 @@ def _do_install_whisper_variant(model_name: str, variant):
         )
         return
     finally:
-        # 640MB is far too much to leave lying in %TEMP% either way.
+        # 640MB is far too much to leave lying in the cache scratch folder either way.
         zip_path.unlink(missing_ok=True)
 
     yield _whisper_final_yield(model_name)
