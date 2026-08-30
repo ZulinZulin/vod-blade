@@ -120,7 +120,7 @@ def _detect_source_fps(source_video_path: Optional[str], cfg: ExportConfig) -> O
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 str(source_path),
             ],
-            capture_output=True, text=True, timeout=15, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning(

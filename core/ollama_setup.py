@@ -95,7 +95,7 @@ def check_gpu_vram_mb() -> Optional[int]:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=True,
         )
         first_line = result.stdout.strip().splitlines()[0]
         return int(first_line.strip())
@@ -133,7 +133,7 @@ def install_ollama_silent(installer_path: Path) -> None:
     deployment - doesn't apply to a normal single-user install like this."""
     result = subprocess.run(
         [str(installer_path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-        capture_output=True, text=True, timeout=300,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
     )
     if result.returncode != 0:
         raise OllamaSetupError(f"Ollama installer exited with code {result.returncode}: {result.stderr}")
@@ -200,6 +200,9 @@ def uninstall_ollama_silent() -> None:
     uninstaller = find_ollama_uninstaller()
     if uninstaller is None:
         raise OllamaSetupError("Could not locate Ollama's uninstaller - remove it from Windows Settings > Apps instead.")
-    result = subprocess.run([str(uninstaller), "/VERYSILENT"], capture_output=True, text=True, timeout=300)
+    result = subprocess.run(
+        [str(uninstaller), "/VERYSILENT"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+    )
     if result.returncode != 0:
         raise OllamaSetupError(f"Ollama uninstaller exited with code {result.returncode}: {result.stderr}")

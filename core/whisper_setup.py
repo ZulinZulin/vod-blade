@@ -193,7 +193,7 @@ def check_gpu_info() -> Optional[dict]:
                 "--query-gpu=name,compute_cap,memory.total,memory.free,driver_version",
                 "--format=csv,noheader,nounits",
             ],
-            capture_output=True, text=True, timeout=10, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=True,
         )
         name, cap, total, free, driver = (p.strip() for p in result.stdout.strip().splitlines()[0].split(","))
         return {

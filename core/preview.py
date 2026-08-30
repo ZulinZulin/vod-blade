@@ -72,7 +72,7 @@ def extract_preview_clip(
                 "-avoid_negative_ts", "make_zero",
                 str(out_path),
             ],
-            capture_output=True, text=True, timeout=30, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PreviewError(f"Could not run ffmpeg ('{cfg.ffmpeg_binary}'): {exc}") from exc
@@ -114,7 +114,7 @@ def extract_thumbnail(source_video_path: str, timestamp: float, cfg: ExportConfi
                 "-q:v", "4",
                 str(out_path),
             ],
-            capture_output=True, text=True, timeout=20, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PreviewError(f"Could not run ffmpeg ('{cfg.ffmpeg_binary}'): {exc}") from exc

@@ -438,6 +438,8 @@ class TwitchChatFetcher:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.cfg.twitch_download_timeout_s,
                 check=False,
             )
@@ -589,6 +591,8 @@ class TwitchVideoFetcher:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.cfg.twitch_video_download_timeout_s,
                 check=False,
             )
