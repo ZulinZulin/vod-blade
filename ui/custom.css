@@ -503,6 +503,25 @@ gradio-app {
     color: var(--body-text-color) !important;
 }
 
+/* Compact square file-picker buttons sitting beside a labeled Textbox in the same
+   Row. Gradio's own Button sizing assumes text content and stretches/pads
+   accordingly, so a bare emoji needs a fixed square size instead. align-self:
+   flex-end matters more than the sizing does: without it the button (no label of
+   its own) sits at the TOP of the row next to the Textbox's label text, not next
+   to the actual input box below it - flex-end pins it to the row's bottom edge,
+   which is where the input box's bottom already lines up regardless of how tall
+   the label above it is. */
+.vb-icon-btn {
+    align-self: flex-end;
+    min-width: 44px !important;
+    width: 44px !important;
+    height: 42px !important;
+    padding: 0 !important;
+    font-size: 1.15rem !important;
+    line-height: 1 !important;
+    flex: none !important;
+}
+
 /* Glows the whole setup panel's own border for as long as it's open (unlike
    .vb-glow-blue below, which points at one specific control for one specific step) -
    people reliably miss that this panel exists at all otherwise. Padding here too,

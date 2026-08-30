@@ -44,8 +44,8 @@ from config import BIN_DIR, CACHE_DIR, DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SCRATC
 from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
-    FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod, get_twitch_vod_title,
-    is_local_subtitle_source, shift_subtitles_to_vod_clock,
+    _LOCAL_SUBTITLE_SUFFIXES, FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod,
+    get_twitch_vod_title, is_local_subtitle_source, shift_subtitles_to_vod_clock,
 )
 from core.llm_agent import (
     DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError,
@@ -1902,6 +1902,116 @@ def _browse_folder_tkinter(initial_dir: str) -> Optional[str]:
         root.destroy()
 
 
+_BROWSE_FILE_PS_SCRIPT = (
+    "Add-Type -AssemblyName System.Windows.Forms\n"
+    "$dialog = New-Object System.Windows.Forms.OpenFileDialog\n"
+    "$dialog.Title = $env:VOD_BLADE_BROWSE_TITLE\n"
+    "$dialog.Filter = $env:VOD_BLADE_BROWSE_FILTER\n"
+    "$initial = $env:VOD_BLADE_BROWSE_INITIAL_DIR\n"
+    "if ($initial -and (Test-Path $initial)) { $dialog.InitialDirectory = $initial }\n"
+    "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {\n"
+    "    Write-Output $dialog.FileName\n"
+    "}\n"
+)
+
+
+def _browse_file_windows(initial_dir: str, filter_str: str, title: str) -> Optional[str]:
+    """
+    Native single-file picker via PowerShell's System.Windows.Forms.OpenFileDialog -
+    same approach and same reasoning as _browse_folder_windows (no bundling, no
+    pywin32 DLL-registration fragility). filter_str is a Windows "Filter" string,
+    e.g. "Video files (*.mp4;*.mkv)|*.mp4;*.mkv|All files (*.*)|*.*" - all three
+    values travel via environment variables rather than interpolated into the
+    script text, so a path/title containing quotes can't break the script.
+    """
+    env = os.environ.copy()
+    env["VOD_BLADE_BROWSE_INITIAL_DIR"] = initial_dir
+    env["VOD_BLADE_BROWSE_FILTER"] = filter_str
+    env["VOD_BLADE_BROWSE_TITLE"] = title
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _BROWSE_FILE_PS_SCRIPT],
+        capture_output=True, text=True, timeout=300, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"powershell.exe exited with code {result.returncode}")
+    return result.stdout.strip() or None
+
+
+def _browse_file_tkinter(initial_dir: str, filetypes: list, title: str) -> Optional[str]:
+    """Fallback for non-Windows platforms, mirroring _browse_folder_tkinter."""
+    import tkinter
+    from tkinter import filedialog
+
+    root = tkinter.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return filedialog.askopenfilename(initialdir=initial_dir, title=title, filetypes=filetypes) or None
+    finally:
+        root.destroy()
+
+
+def _initial_dir_for_file_field(current_value: str, fallback_dir: Path) -> str:
+    """Same fallback shape as do_browse_downloads_dir's initial_dir, but for a field
+    that holds a FILE path rather than a folder - starts the dialog in whichever
+    directory already has something relevant: the current file's own folder if it
+    still exists, else a sensible default (downloads, where fetched VODs/subtitles
+    actually land)."""
+    if current_value:
+        parent = Path(current_value).parent
+        if parent.is_dir():
+            return str(parent)
+    return str(fallback_dir)
+
+
+def do_browse_source_video_file(current_value: str):
+    """Native file picker for 'Local source video path' - see
+    _browse_file_windows/_browse_folder_windows for why this runs in the Python
+    backend rather than the browser. gr.update() (a no-op) on cancel, matching
+    do_browse_cache_dir, so dismissing the dialog leaves the field untouched."""
+    initial_dir = _initial_dir_for_file_field(current_value, DOWNLOADS_DIR)
+    video_filter = (
+        "Video files (*.mp4;*.mkv;*.mov;*.avi;*.webm;*.flv;*.ts;*.m4v)|"
+        "*.mp4;*.mkv;*.mov;*.avi;*.webm;*.flv;*.ts;*.m4v|All files (*.*)|*.*"
+    )
+    try:
+        if platform.system() == "Windows":
+            chosen = _browse_file_windows(initial_dir, video_filter, "Choose a local source video")
+        else:
+            chosen = _browse_file_tkinter(
+                initial_dir,
+                [("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.flv *.ts *.m4v"), ("All files", "*.*")],
+                "Choose a local source video",
+            )
+    except Exception as exc:
+        logger.warning("File picker unavailable (%s); type the path in manually instead.", exc)
+        raise gr.Error(f"Couldn't open the file picker ({exc}). Type the path in manually instead.")
+    return gr.update(value=chosen) if chosen else gr.update()
+
+
+def do_browse_transcript_file(current_value: str):
+    """Native file picker for the transcript half of 'YouTube URL or local
+    .srt/.vtt/.txt transcript path' - the URL half obviously isn't a local file,
+    so this only ever helps when picking an existing local transcript."""
+    initial_dir = _initial_dir_for_file_field(current_value, DOWNLOADS_DIR)
+    suffixes = sorted(_LOCAL_SUBTITLE_SUFFIXES)
+    patterns_semicolon = ";".join(f"*{s}" for s in suffixes)
+    transcript_filter = f"Transcript files ({patterns_semicolon})|{patterns_semicolon}|All files (*.*)|*.*"
+    try:
+        if platform.system() == "Windows":
+            chosen = _browse_file_windows(initial_dir, transcript_filter, "Choose a local transcript file")
+        else:
+            chosen = _browse_file_tkinter(
+                initial_dir,
+                [("Transcript files", " ".join(f"*{s}" for s in suffixes)), ("All files", "*.*")],
+                "Choose a local transcript file",
+            )
+    except Exception as exc:
+        logger.warning("File picker unavailable (%s); type the path in manually instead.", exc)
+        raise gr.Error(f"Couldn't open the file picker ({exc}). Type the path in manually instead.")
+    return gr.update(value=chosen) if chosen else gr.update()
+
+
 def do_browse_downloads_dir(current_dir: str) -> Optional[str]:
     """
     Opens a native OS folder picker - browsers have no API that hands a web page a
@@ -2517,10 +2627,15 @@ def build_app() -> gr.Blocks:
             )
             with gr.Row():
                 with gr.Column():
-                    youtube_input = gr.Textbox(
-                        label="YouTube URL or local .srt/.vtt/.txt transcript path",
-                        placeholder="https://youtube.com/watch?v=... or C:\\path\\to\\transcript.srt",
-                    )
+                    with gr.Row():
+                        youtube_input = gr.Textbox(
+                            label="YouTube URL or local .srt/.vtt/.txt transcript path",
+                            placeholder="https://youtube.com/watch?v=... or C:\\path\\to\\transcript.srt",
+                            scale=1,
+                        )
+                        browse_transcript_file_btn = gr.Button(
+                            "📁", size="sm", scale=0, min_width=44, elem_classes=["vb-icon-btn"],
+                        )
                     with gr.Row():
                         generate_transcript_btn = gr.Button("Generate transcript locally", size="sm")
                         transcript_progress_html = gr.HTML("", visible=False)
@@ -2529,10 +2644,15 @@ def build_app() -> gr.Blocks:
                         label="Twitch VOD URL or ID",
                         placeholder="https://twitch.tv/videos/123456789",
                     )
-                    source_video_input = gr.Textbox(
-                        label="Local source video path (Optional. Used by sound analysis and Resolve exports)",
-                        placeholder=r"C:\path\to\downloaded_video.mp4",
-                    )
+                    with gr.Row():
+                        source_video_input = gr.Textbox(
+                            label="Local source video path (Optional. Used by sound analysis and Resolve exports)",
+                            placeholder=r"C:\path\to\downloaded_video.mp4",
+                            scale=1,
+                        )
+                        browse_source_video_file_btn = gr.Button(
+                            "📁", size="sm", scale=0, min_width=44, elem_classes=["vb-icon-btn"],
+                        )
                     offset_input = gr.Number(
                         label="Chat offset (s) - Twitch clock minus YouTube clock",
                         value=settings.fetcher.default_chat_offset_seconds,
@@ -3165,6 +3285,13 @@ def build_app() -> gr.Blocks:
             fn=do_generate_transcript_locally,
             inputs=[source_video_input, whisper_model_dropdown, whisper_language_dropdown],
             outputs=[transcript_status_md, generate_transcript_btn, youtube_input, transcript_progress_html],
+            api_visibility="private",
+        )
+        browse_transcript_file_btn.click(
+            fn=do_browse_transcript_file, inputs=[youtube_input], outputs=[youtube_input], api_visibility="private",
+        )
+        browse_source_video_file_btn.click(
+            fn=do_browse_source_video_file, inputs=[source_video_input], outputs=[source_video_input],
             api_visibility="private",
         )
 
