@@ -60,7 +60,8 @@ from core import cache_manager
 from core import settings_store
 from core import ollama_setup
 from core import whisper_setup
-from core.transcriber import TranscriptionError, transcribe_locally
+from core.transcriber import TranscriptionCancelled, TranscriptionError, transcribe_locally
+from core import transcriber as transcriber_module
 from core.version import check_for_update, get_version
 from exporters.davinci_api import DavinciAPIError, inject_into_resolve
 from exporters.davinci_api import is_available as resolve_is_available
@@ -1790,6 +1791,12 @@ def do_generate_transcript_locally(source_video_path: str, model_name: str, lang
     with the spinner, the blocking work happens in between, a final yield
     fills youtube_input (which already reactively unlocks AI Arbitration via
     do_gate_toggle - see that function's docstring) and hides the spinner.
+
+    A fifth output controls the Cancel button's own visibility, shown only
+    while this is actually running - see do_cancel_transcript_generation and
+    core.transcriber.cancel_active_transcription for the actual kill mechanism;
+    Gradio's own cancels=[...] on that button only stops this generator from
+    yielding any further UI updates, it isn't what kills the whisper-cli process.
     """
     if not source_video_path or not Path(source_video_path).exists():
         raise gr.Error(
@@ -1810,6 +1817,7 @@ def do_generate_transcript_locally(source_video_path: str, model_name: str, lang
         gr.update(interactive=False),
         gr.update(),
         gr.update(value='<span class="vb-spinner"></span>', visible=True),
+        gr.update(visible=True),
     )
 
     srt_path = None
@@ -1838,15 +1846,44 @@ def do_generate_transcript_locally(source_video_path: str, model_name: str, lang
                 gr.update(interactive=False),
                 gr.update(),
                 gr.update(value='<span class="vb-spinner"></span>', visible=True),
+                gr.update(visible=True),
             )
+    except TranscriptionCancelled:
+        # Already handled by do_cancel_transcript_generation's own reset - this
+        # branch only exists so the generic except below doesn't phrase it as a
+        # scary "failed:" message. No further yield needed; the cancel handler's
+        # click already reset every one of these same outputs itself.
+        return
     except TranscriptionError as exc:
-        yield f"Local transcription failed: {exc}", gr.update(interactive=True), gr.update(), gr.update(visible=False)
+        yield (
+            f"Local transcription failed: {exc}", gr.update(interactive=True),
+            gr.update(), gr.update(visible=False), gr.update(visible=False),
+        )
         return
 
     yield (
         f"Transcript generated: `{srt_path}`. Transcript source above has been filled in automatically.",
         gr.update(interactive=True),
         gr.update(value=str(srt_path)),
+        gr.update(visible=False),
+        gr.update(visible=False),
+    )
+
+
+def do_cancel_transcript_generation():
+    """
+    Kills the actual whisper-cli process (see
+    core.transcriber.cancel_active_transcription) and resets the UI back to its
+    idle state. Wired with cancels=[...] on the Generate button's own click event
+    so that generator also stops yielding further updates - but the kill here
+    doesn't depend on that at all, since a separate Gradio call has no direct
+    reference to the Popen object living inside _run_whisper_cli's local scope.
+    """
+    transcriber_module.cancel_active_transcription()
+    return (
+        "Transcription cancelled.",
+        gr.update(interactive=True),
+        gr.update(visible=False),
         gr.update(visible=False),
     )
 
@@ -2638,6 +2675,9 @@ def build_app() -> gr.Blocks:
                         )
                     with gr.Row():
                         generate_transcript_btn = gr.Button("Generate transcript locally", size="sm")
+                        cancel_transcript_btn = gr.Button(
+                            "Cancel", size="sm", variant="stop", visible=False, scale=0, min_width=80,
+                        )
                         transcript_progress_html = gr.HTML("", visible=False)
                     transcript_status_md = gr.Markdown("")
                     twitch_input = gr.Textbox(
@@ -3281,10 +3321,20 @@ def build_app() -> gr.Blocks:
             fn=do_persist_whisper_language,
             inputs=[whisper_language_dropdown], outputs=[], api_visibility="private",
         )
-        generate_transcript_btn.click(
+        generate_transcript_event = generate_transcript_btn.click(
             fn=do_generate_transcript_locally,
             inputs=[source_video_input, whisper_model_dropdown, whisper_language_dropdown],
-            outputs=[transcript_status_md, generate_transcript_btn, youtube_input, transcript_progress_html],
+            outputs=[
+                transcript_status_md, generate_transcript_btn, youtube_input,
+                transcript_progress_html, cancel_transcript_btn,
+            ],
+            api_visibility="private",
+        )
+        cancel_transcript_btn.click(
+            fn=do_cancel_transcript_generation,
+            inputs=[],
+            outputs=[transcript_status_md, generate_transcript_btn, transcript_progress_html, cancel_transcript_btn],
+            cancels=[generate_transcript_event],
             api_visibility="private",
         )
         browse_transcript_file_btn.click(

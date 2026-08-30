@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Iterator, Optional
@@ -59,6 +60,38 @@ _DLL_LOAD_FAILURE_CODES = {-1073741515, 3221225781}
 
 class TranscriptionError(Exception):
     """Raised when audio extraction or whisper-cli invocation fails."""
+
+
+class TranscriptionCancelled(TranscriptionError):
+    """Raised specifically when cancel_active_transcription() killed a running
+    whisper-cli process - a subclass of TranscriptionError so existing generic
+    error handling still catches it, but callers that want to show a plain
+    'cancelled' message instead of a scary failure one can catch this first."""
+
+
+# Tracks the currently-running whisper-cli process (there's only ever meant to be
+# one at a time - the UI disables the Generate button while one is in flight) so a
+# separate Cancel button click, running as its own independent Gradio call with no
+# direct reference to _run_whisper_cli's local Popen object, can still kill it.
+# This is the actual, guaranteed kill mechanism - it doesn't depend on Gradio's own
+# generator-cancellation semantics (which stop the UI from updating further, but
+# aren't something to rely on alone to prove the child process really died).
+_active_proc_lock = threading.Lock()
+_active_proc: Optional[subprocess.Popen] = None
+_cancel_requested = False
+
+
+def cancel_active_transcription() -> bool:
+    """Kills the currently-running whisper-cli process, if any. Returns whether
+    there was one to kill. Safe to call even if nothing is running."""
+    global _cancel_requested
+    with _active_proc_lock:
+        proc = _active_proc
+        if proc is None or proc.poll() is not None:
+            return False
+        _cancel_requested = True
+    proc.kill()
+    return True
 
 
 def _cache_key(video_path: Path, model_path: Path, language: str) -> str:
@@ -154,20 +187,39 @@ def _run_whisper_cli(
     except OSError as exc:
         raise TranscriptionError(f"Could not run whisper-cli ('{binary_path}'): {exc}") from exc
 
+    global _active_proc, _cancel_requested
+    with _active_proc_lock:
+        _active_proc = proc
+        _cancel_requested = False
+
     deadline = time.monotonic() + timeout_s
     lines_tail: list = []
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            lines_tail.append(line)
-            lines_tail = lines_tail[-20:]
-            yield line
-        if time.monotonic() > deadline:
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                lines_tail.append(line)
+                lines_tail = lines_tail[-20:]
+                yield line
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise TranscriptionError(f"whisper-cli timed out after {timeout_s}s.")
+    finally:
+        # Runs on normal completion, on the timeout raise above, AND if this
+        # generator gets closed out from under us (e.g. cancel_active_transcription
+        # killed proc while we were mid-yield) - proc.poll() is None only in that
+        # last case, since the other two paths already know proc has exited.
+        with _active_proc_lock:
+            was_cancelled = _cancel_requested
+            if _active_proc is proc:
+                _active_proc = None
+        if proc.poll() is None:
             proc.kill()
-            raise TranscriptionError(f"whisper-cli timed out after {timeout_s}s.")
 
     returncode = proc.wait()
+    if was_cancelled:
+        raise TranscriptionCancelled("Transcription cancelled.")
     if returncode != 0:
         tail = "\n".join(lines_tail)
         if returncode in _DLL_LOAD_FAILURE_CODES:
