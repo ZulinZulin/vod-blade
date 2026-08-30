@@ -56,6 +56,7 @@ from core.preview import PreviewError, extract_preview_clip, extract_thumbnail
 from core.session_store import (
     SessionError, delete_session, list_sessions, load_session, purge_sessions, save_session,
 )
+from core import cache_manager
 from core import settings_store
 from core import ollama_setup
 from core import whisper_setup
@@ -941,6 +942,73 @@ def do_delete_session(session_path: Optional[str], armed_path: Optional[str], ac
     return (
         gr.update(value=_DELETE_SESSION_LABEL), None,
         gr.update(choices=_session_choices(), value=None), new_active,
+    )
+
+
+def _format_cache_status() -> str:
+    """One line per category, live-computed - see core.cache_manager.get_breakdown
+    for why nothing here is cached itself."""
+    lines = ["**Disk usage**"]
+    for cat in cache_manager.get_breakdown():
+        size = cache_manager.format_size(cat.size_bytes)
+        lines.append(f"- {cat.label}: **{size}** ({cat.file_count} file(s)) - {cat.note}")
+    return "\n".join(lines)
+
+
+def do_refresh_cache_status():
+    return _format_cache_status()
+
+
+def _do_clear_cache_category(clear_fn, empty_message: str, done_message_tmpl: str):
+    """Shared shape for every 'Clear ...' button below: run the clear, report what
+    actually happened via gr.Info/gr.Warning (same feedback pattern as
+    do_purge_sessions), then return the freshly recomputed status text."""
+    removed = clear_fn()
+    if removed:
+        gr.Info(done_message_tmpl.format(removed=removed))
+    else:
+        gr.Warning(empty_message)
+    return _format_cache_status()
+
+
+def do_clear_previews_cache():
+    return _do_clear_cache_category(
+        cache_manager.clear_previews_and_thumbnails,
+        "No preview clips or thumbnails to clear.",
+        "Cleared {removed} preview/thumbnail file(s).",
+    )
+
+
+def do_clear_analysis_cache():
+    return _do_clear_cache_category(
+        cache_manager.clear_analysis_cache,
+        "No analysis cache to clear.",
+        "Cleared {removed} analysis cache file(s).",
+    )
+
+
+def do_clear_fetch_cache():
+    return _do_clear_cache_category(
+        cache_manager.clear_fetch_cache,
+        "No transcript/subtitle/chat cache to clear.",
+        "Cleared {removed} transcript/subtitle/chat file(s). "
+        "These will be re-fetched or re-transcribed the next time they're needed.",
+    )
+
+
+def do_clear_scratch_cache():
+    return _do_clear_cache_category(
+        cache_manager.clear_scratch,
+        "No leftover temp files to clear.",
+        "Cleared {removed} leftover temp file(s).",
+    )
+
+
+def do_clear_all_caches():
+    return _do_clear_cache_category(
+        cache_manager.clear_all_except_downloads,
+        "Nothing to clear - all caches are already empty.",
+        "Cleared {removed} file(s) across all caches. Downloaded VODs were not touched.",
     )
 
 
@@ -2489,6 +2557,25 @@ def build_app() -> gr.Blocks:
                     )
                     purge_sessions_btn = gr.Button("Purge saves", variant="stop", size="sm")
 
+            with gr.Accordion("Cache & storage", open=False):
+                cache_status_md = gr.Markdown("Checking disk usage...")
+                gr.Markdown(
+                    "_Every button below only clears regenerable cache - re-fetched or "
+                    "re-transcribed automatically the next time it's needed. Downloaded "
+                    "VODs are never touched here._"
+                )
+                with gr.Row():
+                    clear_previews_btn = gr.Button("Clear preview clips & thumbnails", size="sm")
+                    clear_analysis_btn = gr.Button("Clear analysis cache", size="sm")
+                with gr.Row():
+                    clear_fetch_btn = gr.Button("Clear transcripts/subtitles/chat cache", size="sm")
+                    clear_scratch_btn = gr.Button("Clear leftover temp files", size="sm")
+                with gr.Row():
+                    cache_refresh_btn = gr.Button("Refresh", size="sm")
+                    clear_all_caches_btn = gr.Button(
+                        "Clear all caches (keeps downloaded VODs)", variant="stop", size="sm",
+                    )
+
             with gr.Accordion("Ollama settings", open=False, elem_id="ollama_settings_accordion") as ollama_settings_accordion:
                 with gr.Row():
                     llm_model_input = gr.Dropdown(
@@ -3130,6 +3217,7 @@ def build_app() -> gr.Blocks:
             inputs=[whisper_model_dropdown],
             outputs=_whisper_status_outputs,
         )
+        demo.load(fn=do_refresh_cache_status, inputs=[], outputs=[cache_status_md])
         demo.load(fn=None, inputs=None, outputs=None, js=_HIDE_SCREEN_STUDIO_JS)
         demo.load(fn=None, inputs=None, outputs=None, js=_ANALYZE_BTN_SPIN_JS)
         hype_plot.change(fn=None, inputs=None, outputs=None, js=_HYPE_CLICK_BRIDGE_JS)
@@ -3188,6 +3276,24 @@ def build_app() -> gr.Blocks:
             inputs=[session_dropdown, delete_armed_state, session_path_state],
             outputs=[delete_session_btn, delete_armed_state, session_dropdown, session_path_state],
             api_visibility="private",
+        )
+        cache_refresh_btn.click(
+            fn=do_refresh_cache_status, inputs=[], outputs=[cache_status_md], api_visibility="private",
+        )
+        clear_previews_btn.click(
+            fn=do_clear_previews_cache, inputs=[], outputs=[cache_status_md], api_visibility="private",
+        )
+        clear_analysis_btn.click(
+            fn=do_clear_analysis_cache, inputs=[], outputs=[cache_status_md], api_visibility="private",
+        )
+        clear_fetch_btn.click(
+            fn=do_clear_fetch_cache, inputs=[], outputs=[cache_status_md], api_visibility="private",
+        )
+        clear_scratch_btn.click(
+            fn=do_clear_scratch_cache, inputs=[], outputs=[cache_status_md], api_visibility="private",
+        )
+        clear_all_caches_btn.click(
+            fn=do_clear_all_caches, inputs=[], outputs=[cache_status_md], api_visibility="private",
         )
         # .select (fires only on a real user pick) rather than .change (fires on ANY
         # value change, including save/delete/purge above programmatically updating
