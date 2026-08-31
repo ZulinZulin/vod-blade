@@ -1839,6 +1839,13 @@ def do_generate_transcript_locally(source_video_path: str, model_name: str, lang
             "to install whisper.cpp and download a model."
         )
 
+    # Advisory only - see whisper_setup.check_vram_headroom. Warning beats blocking:
+    # a wrong guess here shouldn't stop someone who knows their own GPU state, but
+    # discovering the problem an hour into a multi-hour VOD is genuinely costly.
+    vram_warning = whisper_setup.check_vram_headroom(model_name)
+    if vram_warning:
+        gr.Warning(vram_warning)
+
     yield (
         "Transcribing locally... this can take a while for long VODs.",
         gr.update(interactive=False),

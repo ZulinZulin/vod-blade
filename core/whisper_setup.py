@@ -48,6 +48,20 @@ MODEL_TIERS: List[Tuple[str, str]] = [
     ("large-v3", "~2.9 GB - most accurate"),
 ]
 
+# Rough VRAM needed to run each tier on the GPU build, in MB. The model weights
+# dominate (measured: 'small' reported "CUDA0 total size = 487.01 MB", matching its
+# file size), so these are the weight sizes plus ~35% headroom for activations and
+# the compute buffer. Deliberately approximate and deliberately generous - this only
+# ever drives a non-blocking warning, so over-warning slightly is much cheaper than
+# letting someone start a multi-hour transcription that dies on an OOM partway.
+_MODEL_VRAM_MB: Dict[str, int] = {
+    "tiny": 150,
+    "base": 250,
+    "small": 700,
+    "medium": 2100,
+    "large-v3": 4000,
+}
+
 # Pinned to an exact tag rather than /releases/latest on purpose. The CPU build is
 # bundled into the release zip by build_release.ps1 at build time, while a CUDA build
 # is downloaded by the user later - possibly months later. Under "latest" those two
@@ -213,6 +227,41 @@ def check_gpu_vram_mb() -> Optional[int]:
     check_gpu_info() kept for callers that only need the one number."""
     info = check_gpu_info()
     return info["total_mb"] if info else None
+
+
+def check_vram_headroom(model_name: str) -> Optional[str]:
+    """
+    Returns a human-readable warning if the GPU likely lacks free VRAM for
+    `model_name`, or None if there's enough (or if we can't tell).
+
+    Only meaningful when the CUDA build is what will actually run - on the CPU
+    build VRAM is irrelevant, so this returns None rather than warning about a
+    constraint that doesn't apply.
+
+    Checks FREE VRAM, not total: this app can have a ~9GB Ollama model resident on
+    the same card during AI Arbitration, so total capacity badly overstates what's
+    actually available. Advisory only - never blocks the run, since the user may
+    well know something we don't (Ollama idle-unloaded, another app just closed).
+    """
+    if active_variant() is not WhisperVariant.CUDA:
+        return None
+    needed = _MODEL_VRAM_MB.get(model_name)
+    if needed is None:
+        return None
+    info = check_gpu_info()
+    if info is None:
+        return None
+
+    free = info["free_mb"]
+    if free >= needed:
+        return None
+    return (
+        f"Low GPU memory: the '{model_name}' model needs roughly {needed / 1024:.1f}GB of "
+        f"VRAM but only {free / 1024:.1f}GB is free on your {info['name']} "
+        f"({info['total_mb'] / 1024:.1f}GB total). Transcription may fail or fall back to "
+        "the CPU. Closing other GPU apps - or stopping Ollama if AI Arbitration isn't "
+        "running - would free some up."
+    )
 
 
 def has_free_space(path: Path, need_bytes: int) -> bool:
