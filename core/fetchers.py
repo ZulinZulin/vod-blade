@@ -28,6 +28,7 @@ import html
 import json
 import logging
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -565,6 +566,13 @@ class TwitchVideoFetcher:
                 "Set TWITCH_DOWNLOADER_CLI_PATH in your .env or place the binary in ./bin/."
             )
 
+        # TwitchDownloaderCLI stages every downloaded .ts part - together roughly the
+        # size of the finished .mp4 - in the OS temp folder unless told otherwise, so a
+        # long VOD headed for a roomy E:\ still died on a full C:\. Staging next to the
+        # output keeps the parts on whatever drive has to hold the finished file anyway.
+        temp_path = self.downloads_dir / ".tdl_temp" / vod_id
+        temp_path.mkdir(parents=True, exist_ok=True)
+
         cmd = [
             str(cli_path),
             "videodownload",
@@ -581,6 +589,7 @@ class TwitchVideoFetcher:
             # would make TwitchDownloaderCLI block on an interactive overwrite prompt,
             # which would just hang until our timeout fires instead of failing fast.
             "--collision", "Overwrite",
+            "--temp-path", str(temp_path),
         ]
         logger.info(
             "Downloading Twitch VOD %s at quality '%s' - this can take a while for long streams.",
@@ -602,6 +611,15 @@ class TwitchVideoFetcher:
                 f"(limit {self.cfg.twitch_video_download_timeout_s}s). Increase "
                 "TWITCH_VIDEO_DOWNLOAD_TIMEOUT_S in .env for longer streams or slower connections."
             ) from exc
+        finally:
+            # The CLI only cleans up after itself on success, and names its per-run folder
+            # after the VOD id *plus* a timestamp - so leftovers from a failed run are never
+            # reused, they just quietly pile up gigabytes deep in the downloads folder.
+            shutil.rmtree(temp_path, ignore_errors=True)
+            try:
+                temp_path.parent.rmdir()  # empty unless another VOD is downloading too
+            except OSError:
+                pass
 
         if result.returncode != 0 or not out_path.exists():
             logger.error(
