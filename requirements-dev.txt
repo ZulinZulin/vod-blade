@@ -1,0 +1,12 @@
+# Development-only dependencies.
+#
+# Deliberately separate from requirements.txt: build_release.ps1 installs that file
+# into the packaged embeddable Python, so anything added there ships to every user.
+# Test tooling has no business in a release zip.
+#
+#   .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+#   .venv/Scripts/python.exe -m pytest
+
+-r requirements.txt
+
+pytest>=8.0.0
