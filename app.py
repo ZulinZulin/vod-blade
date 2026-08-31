@@ -487,10 +487,35 @@ def _format_card_markdown(clip: CandidateClip, rank: int) -> str:
         f"{header}\n\n"
         f"{body}\n\n"
         f"**{_format_hms(clip.start_time)} -> {_format_hms(clip.end_time)}**  "
-        f"({clip.duration:.1f}s)  |  Viral score: **{clip.viral_score}/10**\n\n"
+        f"({clip.duration:.1f}s)  |  Viral score: **{clip.viral_score}/10**"
+        f"{_format_enrichment_tags(clip)}\n\n"
         f"{spike_label} at {_format_hms(clip.spike_time)} (z={clip.peak_z_score:.2f})"
         f"{audio_confirm_note}{sound_event_note}"
     )
+
+
+# Only "positive"/"negative" earn a sentiment tag on the card - "neutral" is both the
+# default for un-enriched clips and the least informative answer, so showing it would
+# put a meaningless chip on every older clip.
+_SENTIMENT_LABELS = {"positive": "positive", "negative": "negative", "mixed": "mixed"}
+
+
+def _format_enrichment_tags(clip: CandidateClip) -> str:
+    """Compact ' | category - topic (sentiment)' suffix for the card's stats line.
+
+    Returns "" for anything un-enriched (older sessions, a custom system prompt that
+    omits the fields, a model that dropped them), so those cards look exactly as they
+    did before rather than sprouting empty or default-valued chips.
+    """
+    parts = []
+    if clip.category and clip.category != "other":
+        parts.append(clip.category)
+    if clip.topic:
+        parts.append(clip.topic)
+    label = _SENTIMENT_LABELS.get(clip.sentiment)
+    if label:
+        parts.append(f"({label})")
+    return "  |  " + " · ".join(parts) if parts else ""
 
 
 def _format_card_transcript(clip: CandidateClip) -> str:

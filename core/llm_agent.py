@@ -66,6 +66,15 @@ class OllamaGpuOffloadError(LLMAgentError):
 # --------------------------------------------------------------------------- #
 
 
+# Fixed vocabulary rather than free text, because the whole point of these tags is
+# filtering and grouping: a model left to its own devices returns "funny", "Funny",
+# "humor" and "comedy" for the same clip across four runs, which is unusable as a
+# filter. Kept deliberately short and generic - a taxonomy that tries to cover every
+# genre would be worse at the one job this has.
+CLIP_CATEGORIES = ("funny", "skilled", "dramatic", "informative", "social", "meta", "other")
+CLIP_SENTIMENTS = ("positive", "negative", "neutral", "mixed")
+
+
 class ClipSuggestion(BaseModel):
     """Strict schema the LLM's JSON response must conform to."""
 
@@ -77,10 +86,40 @@ class ClipSuggestion(BaseModel):
     viral_score: int = Field(..., ge=1, le=10)
     summary: str = Field(..., min_length=1, max_length=280)
 
+    # Enrichment fields - OPTIONAL WITH DEFAULTS on purpose, never required. Two
+    # reasons, both real: the system prompt is user-editable from the UI (see the
+    # "System prompt [DANGER ZONE]" panel), so someone running a custom or older
+    # prompt would otherwise have every single clip fail validation; and small local
+    # models drop fields unpredictably. Missing enrichment should cost you a tag, not
+    # the clip.
+    category: str = Field("other", max_length=40)
+    topic: str = Field("", max_length=80)
+    sentiment: str = Field("neutral", max_length=20)
+
     @field_validator("title", "summary", "rejection_reason")
     @classmethod
     def _strip_whitespace(cls, value: Optional[str]) -> Optional[str]:
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("category")
+    @classmethod
+    def _normalise_category(cls, value: str) -> str:
+        """Coerces to the known vocabulary instead of rejecting. A model answering
+        'Funny' or 'comedy' is being useful but sloppy - dropping the whole clip over
+        that would be the wrong trade."""
+        cleaned = (value or "").strip().lower()
+        return cleaned if cleaned in CLIP_CATEGORIES else "other"
+
+    @field_validator("sentiment")
+    @classmethod
+    def _normalise_sentiment(cls, value: str) -> str:
+        cleaned = (value or "").strip().lower()
+        return cleaned if cleaned in CLIP_SENTIMENTS else "neutral"
+
+    @field_validator("topic")
+    @classmethod
+    def _clean_topic(cls, value: str) -> str:
+        return (value or "").strip()
 
     @model_validator(mode="after")
     def _end_after_start(self) -> "ClipSuggestion":
@@ -124,6 +163,13 @@ class CandidateClip:
     audio_peak_time: Optional[float] = None
     sound_events: Dict[str, float] = field(default_factory=dict)
     sound_event_time: Optional[float] = None
+    # LLM enrichment - see ClipSuggestion for why these carry safe defaults rather
+    # than being required. category/sentiment come from a fixed English vocabulary so
+    # they stay filterable regardless of the transcript's language; topic is free text
+    # in the transcript's own language, since it's descriptive rather than a filter key.
+    category: str = "other"
+    topic: str = ""
+    sentiment: str = "neutral"
     # Operator-set highlight, independent of the LLM's own judgment - one of Resolve's
     # own clip-color names ("Red"/"Blue"/"Green"/"Purple") or None for unmarked, so
     # exporters/davinci_api.py can hand it straight to SetClipColor with no lookup
@@ -197,6 +243,16 @@ range - do not inflate scores to sound more decisive than the moment actually wa
 is_clip_worthy=true with a viral_score as low as 3 or 4 if it clears STEP 1's bar but isn't exceptional; \
 "worth keeping" and "amazing" are different questions.
 
+STEP 5 - Tag the clip so it can be filtered later. "category" and "sentiment" MUST be chosen from \
+the exact English words listed below and stay English even for a non-English transcript - they are \
+filter keys, not prose. "topic" is free text naming the specific subject (a game, a person, a theme) \
+and SHOULD be in the transcript's language.
+  category: funny | skilled | dramatic | informative | social | meta | other
+    - "skilled" = impressive play/execution; "dramatic" = tense, shocking or emotional;
+      "informative" = explanation, opinion, teaching; "social" = chat interaction, donations,
+      collabs; "meta" = talking about streaming/the stream itself; "other" = none fit.
+  sentiment: positive | negative | neutral | mixed  (the mood of the moment, not its quality)
+
 Write "title" and "summary" in the SAME language as the transcript (e.g. a Russian transcript gets a \
 Russian title and summary) - never translate them to English unless the transcript itself is in English. \
 All JSON field names and the overall structure must stay exactly as specified below regardless of language.
@@ -209,7 +265,10 @@ Respond with ONLY a single JSON object, no markdown fences, no commentary, match
   "end_time": <float, seconds, absolute video timeline>,
   "title": "<punchy clip title in the transcript's language, <=100 chars>",
   "viral_score": <integer 1-10 per the STEP 4 anchors above - use the full range, not just 7-8>,
-  "summary": "<one or two sentence summary in the transcript's language, <=280 chars>"
+  "summary": "<one or two sentence summary in the transcript's language, <=280 chars>",
+  "category": "<one of: funny, skilled, dramatic, informative, social, meta, other>",
+  "topic": "<short specific subject in the transcript's language, <=80 chars>",
+  "sentiment": "<one of: positive, negative, neutral, mixed>"
 }
 Even when is_clip_worthy is false, still fill in your best-effort start_time/end_time/title/summary \
 (with a low viral_score) instead of omitting them - the caller may still want to review it manually.
@@ -435,6 +494,9 @@ class LLMAgent:
             audio_peak_time=candidate.audio_peak_time,
             sound_events=candidate.sound_events,
             sound_event_time=candidate.sound_event_time,
+            category=suggestion.category,
+            topic=suggestion.topic,
+            sentiment=suggestion.sentiment,
         )
 
     def refine_candidates(
