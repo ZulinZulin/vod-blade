@@ -1032,6 +1032,26 @@ def do_preview_clip(source_video_path: str, start_time: float, end_time: float):
 # --------------------------------------------------------------------------- #
 
 
+class SharedAbortEvent(threading.Event):
+    """
+    A threading.Event that survives gr.State's deepcopy.
+
+    Gradio deepcopies a gr.State's value the first time a session reads it (see
+    state_holder.__getitem__), and a plain threading.Event holds a _thread.lock, which
+    cannot be deepcopied - so every "Analyze Stream" click died with "TypeError: cannot
+    pickle '_thread.lock' object" before the handler ever ran. The failure also left the
+    state uncached, so it repeated on every click rather than only the first.
+
+    Returning self is not merely a way around that: the abort flag has to be the *same*
+    object in the click handler and in the running pipeline. A real copy would mean
+    do_abort_analysis sets a flag that run_pipeline never polls.
+    """
+
+    def __deepcopy__(self, memo: dict) -> "SharedAbortEvent":
+        memo[id(self)] = self
+        return self
+
+
 def _check_aborted(abort_event: threading.Event) -> None:
     """
     Raises the same gr.Error mechanism the pipeline already uses for every other
@@ -3015,7 +3035,7 @@ def build_app() -> gr.Blocks:
                 run_btn = gr.Button("Analyze Stream", variant="primary", elem_id="analyze_stream_btn")
             analyze_quote_md = gr.Markdown("", elem_id="analyze_quote_md")
             abort_btn = gr.Button("Abort analysis", variant="stop", size="sm")
-            abort_event_state = gr.State(threading.Event)
+            abort_event_state = gr.State(SharedAbortEvent)
             status_box = gr.Markdown("")
 
         gr.Markdown(
