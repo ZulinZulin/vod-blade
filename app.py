@@ -1909,6 +1909,13 @@ def do_cancel_transcript_generation():
 
 
 _BROWSE_FOLDER_PS_SCRIPT = (
+    # powershell.exe writes redirected stdout using the console's OEM codepage
+    # (e.g. cp866 on a Russian-locale machine), not UTF-8 - so a folder name with
+    # non-ASCII characters would come back mangled unless we force UTF-8 here and
+    # decode as UTF-8 on the Python side (see the subprocess.run call below).
+    # Both halves are required: setting only the Python side would decode the
+    # console's OEM bytes as UTF-8 and still produce garbage.
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
     "Add-Type -AssemblyName System.Windows.Forms\n"
     "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog\n"
     "$dialog.Description = 'Choose a downloads folder'\n"
@@ -1937,7 +1944,7 @@ def _browse_folder_windows(initial_dir: str) -> Optional[str]:
     env["VOD_BLADE_BROWSE_INITIAL_DIR"] = initial_dir
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _BROWSE_FOLDER_PS_SCRIPT],
-        capture_output=True, text=True, timeout=300, env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=env,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"powershell.exe exited with code {result.returncode}")
@@ -1960,6 +1967,9 @@ def _browse_folder_tkinter(initial_dir: str) -> Optional[str]:
 
 
 _BROWSE_FILE_PS_SCRIPT = (
+    # Same UTF-8 forcing as _BROWSE_FOLDER_PS_SCRIPT above, and for the same reason -
+    # a chosen file path containing non-ASCII characters comes back mangled otherwise.
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
     "Add-Type -AssemblyName System.Windows.Forms\n"
     "$dialog = New-Object System.Windows.Forms.OpenFileDialog\n"
     "$dialog.Title = $env:VOD_BLADE_BROWSE_TITLE\n"
@@ -1987,7 +1997,7 @@ def _browse_file_windows(initial_dir: str, filter_str: str, title: str) -> Optio
     env["VOD_BLADE_BROWSE_TITLE"] = title
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", _BROWSE_FILE_PS_SCRIPT],
-        capture_output=True, text=True, timeout=300, env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=env,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"powershell.exe exited with code {result.returncode}")
