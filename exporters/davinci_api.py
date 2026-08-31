@@ -160,12 +160,9 @@ class DavinciResolveExporter:
         # ~2.5x too small, landing far earlier in the file than intended).
         fps = self._source_clip_frame_rate(pool_item)
 
-        timeline_name = timeline_name or "VOD BLADE Clips"
-        timeline = media_pool.CreateEmptyTimeline(timeline_name)
-        if timeline is None:
-            raise DavinciAPIError(
-                f"Could not create timeline '{timeline_name}' (name may already exist in this project)."
-            )
+        timeline_name, timeline = self._create_unique_timeline(
+            media_pool, timeline_name or "VOD BLADE Clips"
+        )
         # AppendToTimeline appends to whatever timeline is current; make sure that's ours.
         self._project.SetCurrentTimeline(timeline)
 
@@ -197,6 +194,36 @@ class DavinciResolveExporter:
 
     # --- internals -----------------------------------------------------------
 
+    _MAX_TIMELINE_NAME_ATTEMPTS = 100
+
+    def _create_unique_timeline(self, media_pool, base_name: str):
+        """
+        Creates a timeline, appending ' 2', ' 3', ... until Resolve accepts the name.
+
+        CreateEmptyTimeline returns None when a timeline of that name already exists
+        in the project, so without this the SECOND export into the same project
+        always failed - the single most likely thing a real user does after a first
+        successful export. Returns (actual_name, timeline).
+
+        Bounded rather than looping forever: if a hundred attempts all fail, the
+        cause isn't name collision (more likely no project open, or a permissions
+        problem), and an endless loop would hide that.
+        """
+        for attempt in range(1, self._MAX_TIMELINE_NAME_ATTEMPTS + 1):
+            name = base_name if attempt == 1 else f"{base_name} {attempt}"
+            timeline = media_pool.CreateEmptyTimeline(name)
+            if timeline is not None:
+                if attempt > 1:
+                    logger.info(
+                        "Timeline '%s' already existed; created '%s' instead.", base_name, name
+                    )
+                return name, timeline
+        raise DavinciAPIError(
+            f"Could not create a timeline in this project - tried '{base_name}' and "
+            f"{self._MAX_TIMELINE_NAME_ATTEMPTS - 1} numbered variants, and Resolve rejected "
+            "all of them. Check that a project is open and writable."
+        )
+
     def _import_or_reuse_media(self, media_pool, source_video_path: str):
         source_path = Path(source_video_path)
         if not source_path.exists():
@@ -212,18 +239,40 @@ class DavinciResolveExporter:
             raise DavinciAPIError(f"Resolve failed to import media: {source_path}")
         return imported[0]
 
-    @staticmethod
-    def _find_pool_item_by_path(media_pool, source_path: Path):
+    @classmethod
+    def _find_pool_item_by_path(cls, media_pool, source_path: Path):
+        """
+        Searches the whole Media Pool folder tree, not just the root folder.
+
+        Professional editors organise media into bins, so a root-only scan missed
+        the already-imported clip for exactly the users most likely to have one -
+        silently re-importing a duplicate of a multi-GB VOD on every export.
+        """
         root_folder = media_pool.GetRootFolder()
         if root_folder is None:
             return None
-        for item in root_folder.GetClipList() or []:
+        return cls._search_folder_tree(root_folder, source_path)
+
+    @classmethod
+    def _search_folder_tree(cls, folder, source_path: Path, depth: int = 0):
+        # Depth-bounded: Resolve's API hands back live objects, and a malformed or
+        # unexpectedly cyclic tree would otherwise recurse forever inside a UI handler.
+        if depth > 16:
+            logger.warning("Media Pool folder tree deeper than 16 levels; stopping search.")
+            return None
+
+        for item in folder.GetClipList() or []:
             try:
                 clip_path = Path(item.GetClipProperty("File Path"))
             except Exception:
                 continue
             if clip_path == source_path:
                 return item
+
+        for subfolder in folder.GetSubFolderList() or []:
+            found = cls._search_folder_tree(subfolder, source_path, depth + 1)
+            if found is not None:
+                return found
         return None
 
     def _source_clip_frame_rate(self, pool_item) -> float:
