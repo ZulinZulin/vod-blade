@@ -23,7 +23,7 @@ import logging
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -40,6 +40,40 @@ class AudioAnalysisError(Exception):
     """Raised when the audio track can't be extracted or analyzed."""
 
 
+# Single-entry in-memory cache for the decoded waveform, so a pipeline run that has
+# both audio peak analysis AND sound event classification enabled decodes the source
+# once instead of twice - they run back to back on the same file at the same sample
+# rate, producing byte-identical output, so the second decode was pure waste.
+#
+# Deliberately single-entry rather than an lru_cache: at ~230MB/hour a long VOD's
+# waveform is over a gigabyte, so an unbounded memo would be a genuine memory leak
+# dressed up as an optimisation. One entry caps the cost at exactly one waveform, a
+# different video evicts the previous one, and release_cached_waveform() lets the
+# pipeline drop it the moment the audio stages are done.
+_waveform_cache_key: Optional[tuple] = None
+_waveform_cache_value: Optional[np.ndarray] = None
+
+
+def release_cached_waveform() -> None:
+    """Drops the cached waveform. Call once the audio stages of a run are finished -
+    holding a multi-GB array alive for the rest of a long LLM pass is exactly the
+    kind of invisible memory growth this cache must not cause."""
+    global _waveform_cache_key, _waveform_cache_value
+    _waveform_cache_key = None
+    _waveform_cache_value = None
+
+
+def _waveform_identity(path: Path, sample_rate: int) -> Optional[tuple]:
+    """Content identity, matching the (path|size|mtime|params) shape used by every
+    on-disk cache key in this project. None if the file can't be stat'd, which
+    disables caching rather than risking a stale hit."""
+    try:
+        stat = path.stat()
+        return (str(path.resolve()), stat.st_size, stat.st_mtime, sample_rate)
+    except OSError:
+        return None
+
+
 def extract_pcm_waveform(
     video_path: str, sample_rate: int = 16000, ffmpeg_binary: str = "ffmpeg", timeout_s: int = 1800,
 ) -> np.ndarray:
@@ -53,10 +87,19 @@ def extract_pcm_waveform(
     ~230MB/hour, and audio-only decode is fast enough (well under realtime)
     that re-decoding from the source video is cheaper than storing it. What IS
     cached is the much smaller derived RMS timeline - see AudioAnalyzer below.
+    It IS cached in memory for the duration of one run - see the single-entry
+    cache above.
     """
+    global _waveform_cache_key, _waveform_cache_value
+
     path = Path(video_path) if video_path else None
     if not path or not path.exists():
         raise AudioAnalysisError(f"Source video not found: {video_path or '(none set)'}")
+
+    identity = _waveform_identity(path, sample_rate)
+    if identity is not None and identity == _waveform_cache_key and _waveform_cache_value is not None:
+        logger.info("Reusing the already-decoded waveform for '%s'.", path.name)
+        return _waveform_cache_value
 
     try:
         result = subprocess.run(
@@ -75,7 +118,10 @@ def extract_pcm_waveform(
         )
         raise AudioAnalysisError(f"ffmpeg failed to extract audio (exit {result.returncode}): {stderr_tail}")
 
-    return np.frombuffer(result.stdout, dtype=np.float32)
+    waveform = np.frombuffer(result.stdout, dtype=np.float32)
+    if identity is not None:
+        _waveform_cache_key, _waveform_cache_value = identity, waveform
+    return waveform
 
 
 class AudioAnalyzer:

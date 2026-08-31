@@ -41,7 +41,9 @@ import plotly.graph_objects as go
 import requests
 
 from config import BIN_DIR, CACHE_DIR, DATA_DIR, DOWNLOADS_DIR, LOGS_DIR, SCRATCH_DIR, SESSIONS_DIR, settings
-from core.audio_analyzer import AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates
+from core.audio_analyzer import (
+    AudioAnalysisError, AudioAnalyzer, merge_with_chat_candidates, release_cached_waveform,
+)
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
     _LOCAL_SUBTITLE_SUFFIXES, FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod,
@@ -1253,6 +1255,11 @@ def run_pipeline(
             candidates, sound_event_candidates, sound_event_allow_new,
             overlap_tolerance_s=settings.sound_event.overlap_tolerance_s,
         )
+
+    # Both audio stages are done, so drop the shared decoded waveform now rather than
+    # letting a multi-GB array sit resident through the (potentially very long) LLM
+    # pass below. Unconditional: it's a no-op when nothing was cached.
+    release_cached_waveform()
 
     _check_aborted(abort_event)
     if not llm_judging_enabled:
