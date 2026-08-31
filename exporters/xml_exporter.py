@@ -155,6 +155,65 @@ def _detect_source_fps(source_video_path: Optional[str], cfg: ExportConfig) -> O
     return fps
 
 
+def _detect_source_duration(source_video_path: Optional[str], cfg: ExportConfig) -> Optional[float]:
+    """
+    Probes the source file's real duration in seconds, for the FCPXML <asset>
+    declaration. Returns None (caller estimates instead) on any failure, exactly
+    like _detect_source_fps above.
+
+    Worth a real probe rather than an estimate: the asset duration tells the NLE
+    how long the underlying media is, and declaring it SHORTER than reality makes
+    some importers clamp or reject clips that extend past the declared end. The
+    previous fallback - last clip's end time plus 60s - is under-declared for any
+    clip near the end of a long VOD, which is exactly where highlights cluster.
+
+    Deliberately a second ffprobe call rather than folding into _detect_source_fps:
+    export runs once per session, so ~50ms is irrelevant next to keeping a working,
+    carefully-guarded function untouched.
+    """
+    if not source_video_path:
+        return None
+    source_path = Path(source_video_path)
+    if not source_path.exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                cfg.ffprobe_binary, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(source_path),
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Could not run ffprobe to detect the source duration: %s.", exc)
+        return None
+
+    output = result.stdout.strip()
+    if result.returncode != 0 or not output:
+        logger.warning(
+            "ffprobe couldn't detect the duration for '%s' (exit %d).",
+            source_path.name, result.returncode,
+        )
+        return None
+
+    try:
+        duration = float(output)
+    except ValueError:
+        logger.warning("Could not parse ffprobe's duration output %r.", output)
+        return None
+
+    # "N/A" parses as a float in some ffprobe builds' locales; a zero/negative
+    # duration is meaningless here and worse than falling back to the estimate.
+    if duration <= 0:
+        return None
+
+    logger.info("Detected source duration for '%s': %.1fs", source_path.name, duration)
+    return duration
+
+
 # --------------------------------------------------------------------------- #
 # FCPXML
 # --------------------------------------------------------------------------- #
@@ -187,9 +246,13 @@ def generate_fcpxml(
         )
 
     if source_duration_seconds is None:
+        source_duration_seconds = _detect_source_duration(source_video_path, cfg)
+    if source_duration_seconds is None:
+        # Last resort only - see _detect_source_duration for why an under-declared
+        # asset duration can make an NLE clamp or reject end-of-VOD clips.
         source_duration_seconds = max(clip.end_time for clip in clips) + 60.0
         logger.info(
-            "No source_duration_seconds given; estimating asset duration as %.1fs.",
+            "Could not determine the real source duration; estimating asset duration as %.1fs.",
             source_duration_seconds,
         )
 
