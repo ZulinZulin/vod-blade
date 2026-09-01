@@ -30,6 +30,7 @@ import logging
 import re
 import shutil
 import subprocess
+import urllib.parse
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional
@@ -146,6 +147,31 @@ def extract_twitch_vod_id(vod_url_or_id: str) -> str:
         f"Could not extract a Twitch VOD id from '{vod_url_or_id}'. "
         "Expected a twitch.tv/videos/<id> URL or a bare numeric id."
     )
+
+
+# Hosts routed to yt-dlp instead of TwitchDownloaderCLI. Deliberately a small explicit
+# list rather than "anything that isn't Twitch": yt-dlp technically handles hundreds of
+# sites, but this app only makes sense for long-form VODs with a real audio track, and
+# silently accepting an arbitrary URL would turn "unsupported site" into a confusing
+# download failure much later. Twitch stays on TwitchDownloaderCLI - it's the only
+# source with chat, and that CLI handles Twitch's storage quirks better than yt-dlp.
+_YTDLP_VIDEO_HOSTS = ("kick.com", "youtube.com", "youtu.be", "m.youtube.com", "www.youtube.com")
+
+
+def is_ytdlp_video_source(url: str) -> bool:
+    """True if `url` is a video source this app downloads via yt-dlp rather than
+    TwitchDownloaderCLI. Host-based rather than regex-based so a URL carrying query
+    params, timestamps or playlist ids still routes correctly."""
+    candidate = (url or "").strip()
+    if not candidate:
+        return False
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+    try:
+        host = (urllib.parse.urlparse(candidate).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith(f".{h}") for h in _YTDLP_VIDEO_HOSTS)
 
 
 def _parse_timestamp(value: str) -> float:
@@ -677,6 +703,89 @@ def shift_subtitles_to_vod_clock(subtitles: List[SubtitleSegment], chat_offset_s
     return [replace(s, start=s.start + chat_offset_seconds, end=s.end + chat_offset_seconds) for s in subtitles]
 
 
+class GenericVideoFetcher:
+    """
+    Downloads a VOD from a non-Twitch source (Kick, YouTube) via yt-dlp, which is
+    already a dependency here for subtitle fetching.
+
+    Same whole-VOD-only contract as TwitchVideoFetcher: every clip's start/end time
+    is an offset from the file's own t=0, so a trimmed download would desync every
+    exported clip. See that class's docstring.
+
+    Note these sources carry NO Twitch chat, so chat hype detection is unavailable
+    for them - analysis runs on audio RMS, sound events and the LLM only. The app
+    already degrades correctly when chat is absent; this is a real capability
+    difference, not a bug.
+    """
+
+    def __init__(self, downloads_dir: Path = DOWNLOADS_DIR):
+        self.downloads_dir = downloads_dir
+        self.cfg = settings.fetcher
+
+    def fetch(self, url: str, quality: Optional[str] = None) -> Path:
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+
+        # Identify by yt-dlp's own extractor + id rather than by parsing the URL
+        # ourselves, so the cache key is stable across the many URL shapes that point
+        # at the same video (youtu.be short links, ?t= timestamps, playlist context).
+        info = self._probe(url)
+        stem = f"{info['extractor_key'].lower()}_{info['id']}"
+        existing = self._find_existing(stem)
+        if self.cfg.cache_enabled and existing is not None:
+            logger.info("Using already-downloaded video file for %s", stem)
+            return existing
+
+        logger.info("Downloading %s video '%s' via yt-dlp.", info["extractor_key"], info["id"])
+        # bestvideo+bestaudio would need a merge step and can yield exotic codecs; the
+        # mp4-preferring selector keeps output consistent with the Twitch path, which
+        # everything downstream (ffmpeg decode, Resolve import) already handles.
+        opts = {
+            "outtmpl": str(self.downloads_dir / f"{stem}.%(ext)s"),
+            "format": quality or "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except yt_dlp.utils.DownloadError as exc:
+            raise VideoFetchError(f"yt-dlp could not download '{url}': {exc}") from exc
+
+        downloaded = self._find_existing(stem)
+        if downloaded is None:
+            raise VideoFetchError(
+                f"yt-dlp reported success but no output file appeared for '{url}'."
+            )
+        return downloaded
+
+    def _probe(self, url: str) -> dict:
+        """Metadata only, no download - resolves the canonical extractor + id."""
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError as exc:
+            raise VideoFetchError(f"Could not read video info for '{url}': {exc}") from exc
+        if not info or not info.get("id"):
+            raise VideoFetchError(f"Could not identify a video at '{url}'.")
+        # A playlist/channel URL yields entries instead of one video; downloading the
+        # whole thing would be a wildly destructive interpretation of one pasted link.
+        if info.get("_type") == "playlist" or info.get("entries"):
+            raise VideoFetchError(
+                f"'{url}' looks like a playlist or channel, not a single video. "
+                "Paste a link to one specific VOD."
+            )
+        return {"id": info["id"], "extractor_key": info.get("extractor_key") or "video"}
+
+    def _find_existing(self, stem: str) -> Optional[Path]:
+        """yt-dlp picks the container, so match on stem rather than assuming .mp4."""
+        for path in sorted(self.downloads_dir.glob(f"{stem}.*")):
+            if path.is_file() and path.suffix.lower() not in {".part", ".ytdl", ".temp"}:
+                return path
+        return None
+
+
 def fetch_twitch_vod(
     vod_url_or_id: str, quality: Optional[str] = None, downloads_dir: Optional[Path] = None,
 ) -> Path:
@@ -684,3 +793,20 @@ def fetch_twitch_vod(
     downloads_dir overrides config.DOWNLOADS_DIR - lets the UI's "Downloads folder"
     field redirect where a VOD lands without touching the app-wide default."""
     return TwitchVideoFetcher(downloads_dir=downloads_dir or DOWNLOADS_DIR).fetch(vod_url_or_id, quality=quality)
+
+
+def fetch_video(
+    url_or_id: str, quality: Optional[str] = None, downloads_dir: Optional[Path] = None,
+) -> Path:
+    """
+    Downloads a VOD from whichever supported source `url_or_id` points at, routing
+    Twitch to TwitchDownloaderCLI and Kick/YouTube to yt-dlp.
+
+    Single entry point so callers don't have to know which downloader backs which
+    host - the UI just hands over whatever the user pasted.
+    """
+    if is_ytdlp_video_source(url_or_id):
+        return GenericVideoFetcher(downloads_dir=downloads_dir or DOWNLOADS_DIR).fetch(
+            url_or_id, quality=quality
+        )
+    return fetch_twitch_vod(url_or_id, quality=quality, downloads_dir=downloads_dir)

@@ -46,8 +46,9 @@ from core.audio_analyzer import (
 )
 from core.chat_analyzer import ChatAnalyzer, ClipCandidate
 from core.fetchers import (
-    _LOCAL_SUBTITLE_SUFFIXES, FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_twitch_vod,
-    get_twitch_vod_title, is_local_subtitle_source, shift_subtitles_to_vod_clock,
+    _LOCAL_SUBTITLE_SUFFIXES, FetcherError, fetch_subtitles, fetch_twitch_chat, fetch_video,
+    get_twitch_vod_title, is_local_subtitle_source, is_ytdlp_video_source,
+    shift_subtitles_to_vod_clock,
 )
 from core.llm_agent import (
     DEFAULT_SYSTEM_PROMPT, CandidateClip, LLMAgent, OllamaGpuOffloadError,
@@ -1788,11 +1789,12 @@ def do_check_for_app_update():
 
 def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
     """
-    Downloads the full Twitch VOD video file via TwitchDownloaderCLI, so
-    exports have a local source file to reference. This is deliberately NOT
-    part of run_pipeline: analysis only needs subtitles/chat and is fast,
-    while a VOD download can be a multi-GB, multi-hour operation - you may
-    want to review candidates before committing to it.
+    Downloads the full VOD video file so exports have a local source to
+    reference - Twitch via TwitchDownloaderCLI, Kick/YouTube via yt-dlp, routed
+    automatically by core.fetchers.fetch_video. This is deliberately NOT part of
+    run_pipeline: analysis only needs subtitles/chat and is fast, while a VOD
+    download can be a multi-GB, multi-hour operation - you may want to review
+    candidates before committing to it.
 
     A generator so the UI shows an immediate "in progress" state without
     needing real progress-percentage tracking: Gradio renders each yielded
@@ -1803,7 +1805,17 @@ def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
     on our end - it just runs until the second yield replaces it.
     """
     if not twitch_source:
-        raise gr.Error("Please provide a Twitch VOD URL or ID first.")
+        raise gr.Error("Please provide a Twitch VOD URL or ID, or a Kick/YouTube video URL, first.")
+
+    # Chat hype detection is Twitch-only (TwitchDownloaderCLI is what pulls chat), so
+    # say so up front rather than letting someone download a multi-GB Kick VOD and
+    # then discover the toggle they wanted never lights up.
+    if is_ytdlp_video_source(twitch_source):
+        gr.Warning(
+            "Kick/YouTube videos have no Twitch chat, so chat hype detection won't be "
+            "available for this source - audio peaks, sound events and AI Arbitration "
+            "still work."
+        )
 
     yield (
         "Downloading VOD... this can take a while for long streams (the full VOD is downloaded, "
@@ -1815,7 +1827,7 @@ def do_download_vod(twitch_source: str, quality: str, downloads_dir: str):
     )
 
     try:
-        video_path = fetch_twitch_vod(
+        video_path = fetch_video(
             twitch_source, quality=quality or None,
             downloads_dir=Path(downloads_dir) if downloads_dir and downloads_dir.strip() else None,
         )
@@ -2622,6 +2634,12 @@ def do_gate_toggle(setting_key: str):
         has_input = bool(field_value and str(field_value).strip())
         if not has_input:
             return gr.update(interactive=False, value=False)
+        # Chat is Twitch-only - it comes from TwitchDownloaderCLI, and Kick/YouTube
+        # have no equivalent here. Without this, pasting a Kick URL would light the
+        # chat toggle up and then fail at analysis time, which is a worse experience
+        # than the toggle simply staying unavailable.
+        if setting_key == "chat_enable" and is_ytdlp_video_source(field_value):
+            return gr.update(interactive=False, value=False)
         preferred = settings_store.load_settings().get(setting_key, _analysis_settings_defaults()[setting_key])
         return gr.update(interactive=True, value=preferred)
     return handler
@@ -2750,8 +2768,8 @@ def build_app() -> gr.Blocks:
                         transcript_progress_html = gr.HTML("", visible=False)
                     transcript_status_md = gr.Markdown("")
                     twitch_input = gr.Textbox(
-                        label="Twitch VOD URL or ID",
-                        placeholder="https://twitch.tv/videos/123456789",
+                        label="Twitch VOD URL or ID (Kick / YouTube URLs also work, minus chat)",
+                        placeholder="https://twitch.tv/videos/123456789  ·  kick.com/...  ·  youtube.com/watch?v=...",
                     )
                     with gr.Row():
                         source_video_input = gr.Textbox(
